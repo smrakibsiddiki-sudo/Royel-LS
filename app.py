@@ -5,6 +5,7 @@ import contextlib
 import asyncio
 import inspect
 import threading
+import shutil  # <-- ডেটাবেস কপি করার জন্য এই লাইব্রেরি যুক্ত করা হয়েছে
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -13,6 +14,16 @@ os.environ["ROYELLS_KEEPALIVE_HTTP"] = "0"
 
 import royells_media_bot_ready as bot
 
+# ====== নতুন যুক্ত করা অংশ: পুরনো ডেটাবেস ভলিউমে কপি করার লজিক ======
+# Railway-তে GitHub থেকে .db ফাইলটি পার্সিস্টেন্ট ভলিউমে কপি করবে
+src = "/home/user/app/runtime/royells.db"
+dst = "/data/royells_media_bot/runtime/royells.db"
+
+if os.path.exists(src) and not os.path.exists(dst):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src, dst)
+    print("✅ পুরনো royells.db সফলভাবে ভলিউমে কপি করা হয়েছে!")
+# ======================================================================
 
 BOT_STATUS = {
     "started_at": "",
