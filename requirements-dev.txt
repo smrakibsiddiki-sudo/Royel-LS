@@ -1,3 +1,0 @@
-pytest>=8,<9
-fakeredis[lua]>=2.30,<3
-ruff>=0.12,<1
