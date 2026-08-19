@@ -2828,6 +2828,9 @@ def generate_daily_diagnostic_report():
 
 async def send_diagnostic_report_now(client=app, chat_id=None, reset_on_success=False):
     chat_id = chat_id or OWNER_ID
+    if is_target_channel_chat(chat_id):
+        log_event("Diagnostic report document blocked: target channel cannot receive documents.")
+        return False
     report_text = generate_daily_diagnostic_report()
     report_path = RUNTIME_DIR / f"royells_diagnostic_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     report_path.write_text(report_text, encoding="utf-8")
@@ -2859,6 +2862,9 @@ async def diagnostic_report_loop():
 
 
 async def send_backup_document(client, chat_id, archive_path, caption):
+    if is_target_channel_chat(chat_id):
+        log_event("Backup document blocked: target channel cannot receive documents.")
+        return False
     path = Path(archive_path)
     if not path.exists() or path.stat().st_size <= 0:
         raise RuntimeError(f"backup archive missing or empty: {path}")
@@ -5464,6 +5470,15 @@ def normalize_channel_id(cid):
     if text.lstrip("-").isdigit():
         return int(text)
     return text
+
+
+def is_target_channel_chat(chat_id):
+    if chat_id in (None, "") or TARGET_CHAT_ID in (None, ""):
+        return False
+    try:
+        return str(normalize_channel_id(chat_id)) == str(normalize_channel_id(TARGET_CHAT_ID))
+    except Exception:
+        return str(chat_id).strip() == str(TARGET_CHAT_ID).strip()
 
 
 def channel_id_variants(cid):
@@ -9043,6 +9058,33 @@ def target_media_clients():
     return clients or [("userbot", userbot)]
 
 
+def target_message_is_photo_video(message):
+    return bool(getattr(message, "photo", None) or getattr(message, "video", None))
+
+
+async def delete_unwanted_target_messages(client, messages):
+    ids = [
+        getattr(message, "id", None)
+        for message in (messages if isinstance(messages, list) else [messages])
+        if getattr(message, "id", None)
+    ]
+    if not ids:
+        return
+    with contextlib.suppress(Exception):
+        await telegram_gateway_await(
+            "client.delete_messages",
+            lambda: client.delete_messages(TARGET_CHAT_ID, ids),
+        )
+
+
+async def ensure_target_sent_photo_video(client, sent, label):
+    messages = sent if isinstance(sent, list) else [sent]
+    if not messages or any(not target_message_is_photo_video(message) for message in messages):
+        await delete_unwanted_target_messages(client, messages)
+        raise RuntimeError(f"{label} blocked: Telegram returned non-photo/video target media")
+    return sent
+
+
 async def target_send_photo(label, photo, protect_content=True, job=None, messages=None, operation=None):
     last_error = None
     intent_id = ""
@@ -9060,6 +9102,7 @@ async def target_send_photo(label, photo, protect_content=True, job=None, messag
                 client.send_photo(TARGET_CHAT_ID, photo=photo, caption="", protect_content=protect_content),
                 UPLOAD_SEND_TIMEOUT_SECONDS,
             )
+            await ensure_target_sent_photo_video(client, sent, label)
             await update_delivery_intent(intent_id, status="accepted", target_messages=[sent])
             return sent
         except Exception as e:
@@ -9092,6 +9135,7 @@ async def target_send_video(label, video, protect_content=True, job=None, messag
                 client.send_video(TARGET_CHAT_ID, video=video, caption="", protect_content=protect_content, **kwargs),
                 UPLOAD_SEND_TIMEOUT_SECONDS,
             )
+            await ensure_target_sent_photo_video(client, sent, label)
             await update_delivery_intent(intent_id, status="accepted", target_messages=[sent])
             return sent
         except Exception as e:
@@ -9124,6 +9168,7 @@ async def target_send_media_group(label, media, protect_content=True, job=None, 
                 client.send_media_group(TARGET_CHAT_ID, media=media, protect_content=protect_content),
                 UPLOAD_SEND_TIMEOUT_SECONDS,
             )
+            await ensure_target_sent_photo_video(client, sent or [], label)
             await update_delivery_intent(intent_id, status="accepted", target_messages=sent or [])
             return sent
         except Exception as e:
