@@ -5416,9 +5416,21 @@ async def offload_source_media_job_to_worker(job, reason):
 def is_valid_media(msg):
     if not msg:
         return False
-    if msg.animation or msg.document or msg.audio or msg.voice or msg.sticker:
+    if message_has_document_payload(msg):
         return False
     return bool(msg.photo or msg.video)
+
+
+def message_has_document_payload(msg):
+    if not msg:
+        return False
+    return bool(
+        getattr(msg, "document", None)
+        or getattr(msg, "audio", None)
+        or getattr(msg, "voice", None)
+        or getattr(msg, "sticker", None)
+        or getattr(msg, "animation", None)
+    )
 
 
 def is_gif_media(msg):
@@ -9059,7 +9071,29 @@ def target_media_clients():
 
 
 def target_message_is_photo_video(message):
+    if message_has_document_payload(message):
+        return False
     return bool(getattr(message, "photo", None) or getattr(message, "video", None))
+
+
+def media_group_item_is_photo_video(item):
+    return item.__class__.__name__ in {"InputMediaPhoto", "InputMediaVideo"}
+
+
+def assert_target_media_group_is_photo_video(media):
+    media_items = list(media or [])
+    if not media_items:
+        raise RuntimeError("target album blocked: no media items")
+    bad_items = [
+        item.__class__.__name__
+        for item in media_items
+        if not media_group_item_is_photo_video(item)
+    ]
+    if bad_items:
+        raise RuntimeError(
+            "target album blocked: non-photo/video media item(s): "
+            + ", ".join(bad_items[:5])
+        )
 
 
 async def delete_unwanted_target_messages(client, messages):
@@ -9086,6 +9120,8 @@ async def ensure_target_sent_photo_video(client, sent, label):
 
 
 async def target_send_photo(label, photo, protect_content=True, job=None, messages=None, operation=None):
+    if messages and any(message_has_document_payload(message) or not is_valid_media(message) for message in messages):
+        raise RuntimeError("target photo upload blocked: source is not strict photo/video media")
     last_error = None
     intent_id = ""
     if job is not None:
@@ -9119,6 +9155,8 @@ async def target_send_photo(label, photo, protect_content=True, job=None, messag
 
 
 async def target_send_video(label, video, protect_content=True, job=None, messages=None, operation=None, **kwargs):
+    if messages and any(message_has_document_payload(message) or not is_valid_media(message) for message in messages):
+        raise RuntimeError("target video upload blocked: source is not strict photo/video media")
     last_error = None
     intent_id = ""
     if job is not None:
@@ -9152,6 +9190,9 @@ async def target_send_video(label, video, protect_content=True, job=None, messag
 
 
 async def target_send_media_group(label, media, protect_content=True, job=None, messages=None, files=None, operation=None):
+    assert_target_media_group_is_photo_video(media)
+    if messages and any(message_has_document_payload(message) or not is_valid_media(message) for message in messages):
+        raise RuntimeError("target album upload blocked: source contains non-photo/video media")
     last_error = None
     intent_id = ""
     if job is not None:
