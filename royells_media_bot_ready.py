@@ -1,0 +1,17501 @@
+import asyncio
+import concurrent.futures
+import contextlib
+import gc
+import hashlib
+import html
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+import random
+import itertools
+import queue
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import uuid
+import zipfile
+from collections import defaultdict, deque
+from copy import deepcopy
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+BOOT_ID = uuid.uuid4().hex[:8]
+BOOT_STAGE = "init"
+EARLY_KEEPALIVE_HTTP_SERVER = None
+MODULE_IMPORTED_BY_HOST_APP = __name__ != "__main__"
+FORCE_INTERNAL_HTTP = os.getenv("ROYELLS_FORCE_INTERNAL_HTTP", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+INTERNAL_HTTP_CAN_BIND_PORT = (not MODULE_IMPORTED_BY_HOST_APP) or FORCE_INTERNAL_HTTP
+
+
+def bootstrap_log(message):
+    global BOOT_STAGE
+    BOOT_STAGE = str(message)[:180]
+    print(f"[ROYELLS BOOT {BOOT_ID}] {message}", flush=True)
+
+
+bootstrap_log("python process started; stdlib imports loaded")
+
+
+class EarlyKeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/health", "/ping"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        if self.path == "/":
+            body = (
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                "<title>Royells Bot</title></head>"
+                "<body style='font-family:system-ui,Arial,sans-serif;margin:32px'>"
+                "<h1>Royells Bot</h1>"
+                "<p>Status: booting</p>"
+                f"<p>Boot ID: {html.escape(BOOT_ID)}</p>"
+                f"<p>Stage: {html.escape(BOOT_STAGE)}</p>"
+                "<p>Health: <a href='/health'>/health</a></p>"
+                "</body></html>"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        body = json.dumps(
+            {
+                "ok": True,
+                "service": "royells",
+                "status": "booting",
+                "boot_id": BOOT_ID,
+                "stage": BOOT_STAGE,
+                "time": datetime.now().replace(microsecond=0).isoformat(),
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        self.send_response(503)
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        return
+
+
+def start_early_keepalive_http_server():
+    global EARLY_KEEPALIVE_HTTP_SERVER
+    if not INTERNAL_HTTP_CAN_BIND_PORT:
+        bootstrap_log("early health server skipped: host app owns the public web port")
+        return
+    raw_enabled = os.getenv("ROYELLS_KEEPALIVE_HTTP", "1").strip().lower()
+    if raw_enabled in ("0", "false", "no", "off"):
+        return
+    try:
+        port = int(os.getenv("PORT", os.getenv("ROYELLS_KEEPALIVE_PORT", "7860")))
+        EARLY_KEEPALIVE_HTTP_SERVER = ThreadingHTTPServer(("0.0.0.0", port), EarlyKeepAliveHandler)
+        thread = threading.Thread(target=EARLY_KEEPALIVE_HTTP_SERVER.serve_forever, name="royells-early-health-http", daemon=True)
+        thread.start()
+        bootstrap_log(f"early health server ready on port {port}")
+    except Exception as e:
+        bootstrap_log(f"early health server failed: {e}")
+
+
+start_early_keepalive_http_server()
+
+os.environ.setdefault("TZ", "Asia/Dhaka")
+with contextlib.suppress(Exception):
+    time.tzset()
+
+import requests
+try:
+    from PIL import Image
+    import imagehash
+except Exception:
+    Image = None
+    imagehash = None
+from pyrogram import Client, filters, idle
+from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
+)
+
+bootstrap_log("third-party imports loaded")
+
+# ================================================================
+# ROYELLS PURE MEDIA MIRROR v19.4.3-ui
+# Persistent state + crash recovery
+# ================================================================
+
+APP_VERSION = "19.4.3-ui"
+RUNTIME_CHECKPOINT_SCHEMA_VERSION = 2
+RUNTIME_CHECKPOINT_MIN_SCHEMA_VERSION = 1
+
+def env_bool(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def env_bool_any(names, default=False):
+    """Read the first configured boolean from a list of backwards-compatible env names."""
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None:
+            return raw.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(default)
+
+
+def env_int(name, default):
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return int(default)
+    return int(str(raw).strip())
+
+
+def env_chat_id(name, default="0"):
+    """Read Telegram chat/channel IDs from env and accept IDs pasted without -100."""
+    value = env_int(name, default)
+    text = str(abs(value))
+    if value > 0 and len(text) >= 10:
+        return int(f"-100{text}")
+    return value
+
+
+def normalize_env_url(value):
+    """Accept raw URLs or Markdown links pasted into environment variables."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    markdown_match = re.search(r"\((https?://[^)\s]+)\)", text)
+    if markdown_match:
+        text = markdown_match.group(1)
+    else:
+        url_match = re.search(r"https?://[^\s\])>]+", text)
+        if url_match:
+            text = url_match.group(0)
+    return text.strip().strip("<>[]()'\"").rstrip("/")
+
+
+def env_url_list(*names):
+    urls = []
+    for name in names:
+        for raw in os.getenv(name, "").split(","):
+            url = normalize_env_url(raw)
+            if url and url not in urls:
+                urls.append(url)
+    return urls
+
+
+E2_MICRO_SAFE_PROFILE = env_bool("ROYELLS_E2_MICRO_PROFILE", False)
+IS_HUGGINGFACE_SPACE = (
+    not E2_MICRO_SAFE_PROFILE
+) and (
+    env_bool("ROYELLS_HUGGINGFACE_SPACE")
+    or bool(os.getenv("SPACE_ID") or os.getenv("SPACE_HOST"))
+)
+
+# Sensitive values must come from environment variables or Hugging Face Secrets.
+API_ID = env_int("ROYELLS_API_ID", "0")
+API_HASH = os.getenv("ROYELLS_API_HASH", "").strip()
+BOT_TOKEN = os.getenv("ROYELLS_BOT_TOKEN", "").strip()
+OWNER_ID = env_int("ROYELLS_OWNER_ID", "0")
+TARGET_CHAT_ID = env_chat_id("ROYELLS_TARGET_CHAT_ID", "0")
+SOURCE_LINK_REPORT_CHAT_ID = env_chat_id("ROYELLS_SOURCE_LINK_REPORT_CHAT_ID", "-1004345299792")
+SUPPORT_CHAT_ID = env_chat_id("ROYELLS_SUPPORT_CHAT_ID", str(SOURCE_LINK_REPORT_CHAT_ID or 0))
+SUPPORT_COOLDOWN_SECONDS = max(0, env_int("ROYELLS_SUPPORT_COOLDOWN_SECONDS", "1800"))
+SUPPORT_TICKET_TTL_SECONDS = max(3600, env_int("ROYELLS_SUPPORT_TICKET_TTL_SECONDS", "86400"))
+SUPPORT_DELETE_INCOMING = env_bool("ROYELLS_SUPPORT_DELETE_INCOMING", True)
+OWNER_STATE_TTL_SECONDS = max(60, int(os.getenv("ROYELLS_OWNER_STATE_TTL_SECONDS", "300")))
+ADD_CHANNEL_RESOLVE_TIMEOUT_SECONDS = max(30, int(os.getenv("ROYELLS_ADD_CHANNEL_RESOLVE_TIMEOUT_SECONDS", "90")))
+MAX_BULK_SOURCE_CHANNELS = max(1, min(500, env_int("ROYELLS_MAX_BULK_SOURCE_CHANNELS", "100")))
+BULK_SOURCE_RESOLVE_TIMEOUT_SECONDS = max(
+    15,
+    min(ADD_CHANNEL_RESOLVE_TIMEOUT_SECONDS, env_int("ROYELLS_BULK_SOURCE_RESOLVE_TIMEOUT_SECONDS", "45")),
+)
+TARGET_JOIN_LINK = os.getenv("ROYELLS_JOIN_LINK", "").strip()
+# Stability-first build: AI/Gemini hot-patching is intentionally disabled.
+GEMINI_API_KEY = ""
+
+DEFAULT_CHANNELS = []
+ACTIVE_CHANNELS = set()
+RESOLVED_ALIAS_STATUS = "resolved_alias"
+
+DEFAULT_BOT_WORKERS = "2" if IS_HUGGINGFACE_SPACE else "1"
+DEFAULT_DOWNLOAD_WORKERS = "1" if E2_MICRO_SAFE_PROFILE else "5"
+DEFAULT_UPLOAD_WORKERS = "1" if E2_MICRO_SAFE_PROFILE else "5"
+DEFAULT_API_CONCURRENCY = "1"
+
+POST_DELAY = int(os.getenv("ROYELLS_POST_DELAY", "1" if IS_HUGGINGFACE_SPACE else "2"))
+ALBUM_WAIT = int(os.getenv("ROYELLS_ALBUM_WAIT", "5"))
+WORKERS = int(os.getenv("ROYELLS_BOT_HANDLER_WORKERS", DEFAULT_BOT_WORKERS))
+DOWNLOAD_WORKERS = int(os.getenv("ROYELLS_DOWNLOAD_WORKERS", DEFAULT_DOWNLOAD_WORKERS))
+UPLOAD_WORKERS = int(os.getenv("ROYELLS_UPLOAD_WORKERS", DEFAULT_UPLOAD_WORKERS))
+LINK_WORKERS = int(os.getenv("ROYELLS_LINK_WORKERS", "1"))
+BUTTON_WORKERS = int(os.getenv("ROYELLS_BUTTON_WORKERS", "3" if IS_HUGGINGFACE_SPACE else "2"))
+if IS_HUGGINGFACE_SPACE and not env_bool("ROYELLS_ALLOW_AGGRESSIVE_MAIN_WORKERS", True):
+    DOWNLOAD_WORKERS = min(DOWNLOAD_WORKERS, 1)
+    UPLOAD_WORKERS = min(UPLOAD_WORKERS, 1)
+    LINK_WORKERS = min(LINK_WORKERS, 1)
+if E2_MICRO_SAFE_PROFILE:
+    DOWNLOAD_WORKERS = 1
+    UPLOAD_WORKERS = 1
+    LINK_WORKERS = 1
+    BUTTON_WORKERS = max(1, min(2, BUTTON_WORKERS))
+CACHE_LIMIT = int(os.getenv("ROYELLS_CACHE_LIMIT", "5000"))
+MAX_RETRIES = int(os.getenv("ROYELLS_MAX_RETRIES", "3"))
+SOURCE_JOB_MAX_RETRIES = max(MAX_RETRIES, int(os.getenv("ROYELLS_SOURCE_JOB_MAX_RETRIES", "8" if IS_HUGGINGFACE_SPACE else "5")))
+SOURCE_PERMANENT_RETRY_ENABLED = env_bool("ROYELLS_SOURCE_PERMANENT_RETRY", True)
+SOURCE_FAILED_RETRY_DELAY_SECONDS = int(os.getenv("ROYELLS_SOURCE_FAILED_RETRY_DELAY_SECONDS", "600"))
+MAIN_LOCAL_QUEUE_SOFT_LIMIT = int(os.getenv("ROYELLS_MAIN_LOCAL_QUEUE_SOFT_LIMIT", "16" if E2_MICRO_SAFE_PROFILE else "1500"))
+MAIN_LOCAL_QUEUE_HARD_LIMIT = int(os.getenv("ROYELLS_MAIN_LOCAL_QUEUE_HARD_LIMIT", "24" if E2_MICRO_SAFE_PROFILE else "2500"))
+if IS_HUGGINGFACE_SPACE and not env_bool("ROYELLS_ALLOW_AGGRESSIVE_MAIN_WORKERS", True):
+    MAIN_LOCAL_QUEUE_SOFT_LIMIT = min(MAIN_LOCAL_QUEUE_SOFT_LIMIT, 8)
+    MAIN_LOCAL_QUEUE_HARD_LIMIT = min(MAIN_LOCAL_QUEUE_HARD_LIMIT, 18)
+if E2_MICRO_SAFE_PROFILE:
+    MAIN_LOCAL_QUEUE_SOFT_LIMIT = min(MAIN_LOCAL_QUEUE_SOFT_LIMIT, 16)
+    MAIN_LOCAL_QUEUE_HARD_LIMIT = min(MAIN_LOCAL_QUEUE_HARD_LIMIT, 24)
+SOURCE_PRESSURE_OFFLOAD_ENABLED = env_bool("ROYELLS_SOURCE_PRESSURE_OFFLOAD", True)
+SOURCE_GUARD_PAUSE_ON_LOCAL_PRESSURE = env_bool("ROYELLS_SOURCE_GUARD_PAUSE_ON_LOCAL_PRESSURE", True)
+SOURCE_GUARD_PRESSURE_SLEEP_SECONDS = int(os.getenv("ROYELLS_SOURCE_GUARD_PRESSURE_SLEEP_SECONDS", "20" if IS_HUGGINGFACE_SPACE else "30"))
+AUTO_SYNC_ENABLED = os.getenv("ROYELLS_AUTO_SYNC", "1").lower() not in ("0", "false", "no", "off")
+AUTO_SYNC_LIMIT = int(os.getenv("ROYELLS_AUTO_SYNC_LIMIT", "100" if IS_HUGGINGFACE_SPACE else "300"))
+AUTO_SYNC_INTERVAL_SECONDS = int(os.getenv("ROYELLS_AUTO_SYNC_INTERVAL_SECONDS", "1800"))
+AUTO_SYNC_START_DELAY_SECONDS = int(os.getenv("ROYELLS_AUTO_SYNC_START_DELAY_SECONDS", "900"))
+AUTO_SYNC_MAX_QUEUE = int(os.getenv("ROYELLS_AUTO_SYNC_MAX_QUEUE", "10" if IS_HUGGINGFACE_SPACE else "5"))
+AUTO_SYNC_CHANNEL_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_AUTO_SYNC_CHANNEL_TIMEOUT_SECONDS", "120"))
+AUTO_SYNC_CHANNEL_CONCURRENCY = int(os.getenv("ROYELLS_AUTO_SYNC_CHANNEL_CONCURRENCY", "1"))
+AUTO_SYNC_CHANNELS_PER_RUN = max(1, int(os.getenv("ROYELLS_AUTO_SYNC_CHANNELS_PER_RUN", "4" if IS_HUGGINGFACE_SPACE else "9999")))
+AUTO_SYNC_HEALTH_CHECK_ENABLED = env_bool("ROYELLS_AUTO_SYNC_HEALTH_CHECK", False if IS_HUGGINGFACE_SPACE else True)
+SOURCE_GUARD_ENABLED = os.getenv("ROYELLS_SOURCE_GUARD", "1").lower() not in ("0", "false", "no", "off")
+SOURCE_GUARD_INTERVAL_SECONDS = int(os.getenv("ROYELLS_SOURCE_GUARD_INTERVAL_SECONDS", "20" if IS_HUGGINGFACE_SPACE else "10"))
+SOURCE_GUARD_START_DELAY_SECONDS = int(os.getenv("ROYELLS_SOURCE_GUARD_START_DELAY_SECONDS", "60"))
+SOURCE_GUARD_LOOKBACK = int(os.getenv("ROYELLS_SOURCE_GUARD_LOOKBACK", "20" if IS_HUGGINGFACE_SPACE else "80"))
+SOURCE_GUARD_CATCHUP_LIMIT = int(os.getenv("ROYELLS_SOURCE_GUARD_CATCHUP_LIMIT", "500"))
+SOURCE_GUARD_CHANNEL_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_SOURCE_GUARD_CHANNEL_TIMEOUT_SECONDS", "120" if IS_HUGGINGFACE_SPACE else "90"))
+SOURCE_GUARD_CHANNELS_PER_TICK = int(os.getenv("ROYELLS_SOURCE_GUARD_CHANNELS_PER_TICK", "1"))
+SOURCE_GUARD_BACKOFF_MAX_SECONDS = int(os.getenv("ROYELLS_SOURCE_GUARD_BACKOFF_MAX_SECONDS", "300"))
+SOURCE_GUARD_ACCESS_BACKOFF_SECONDS = int(os.getenv("ROYELLS_SOURCE_GUARD_ACCESS_BACKOFF_SECONDS", "3600"))
+SOURCE_GUARD_TIMEOUT_RECONNECT = env_bool("ROYELLS_SOURCE_GUARD_TIMEOUT_RECONNECT", False)
+CHANNEL_HEALTH_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_CHANNEL_HEALTH_TIMEOUT_SECONDS", "35"))
+CHANNEL_HEALTH_START_DELAY_SECONDS = int(os.getenv("ROYELLS_CHANNEL_HEALTH_START_DELAY_SECONDS", "600"))
+CHANNEL_AUTO_RETIRE_DELETED_SOURCES = env_bool("ROYELLS_CHANNEL_AUTO_RETIRE_DELETED_SOURCES", True)
+CHANNEL_HARD_DELETE_CONFIRMATIONS = max(2, int(os.getenv("ROYELLS_CHANNEL_HARD_DELETE_CONFIRMATIONS", "2")))
+CHANNEL_SOFT_DELETE_CONFIRMATIONS = max(CHANNEL_HARD_DELETE_CONFIRMATIONS, int(os.getenv("ROYELLS_CHANNEL_SOFT_DELETE_CONFIRMATIONS", "12")))
+CHANNEL_RETIRE_ON_SOFT_MISSING = env_bool("ROYELLS_CHANNEL_RETIRE_ON_SOFT_MISSING", False)
+CHANNEL_RETIRE_PEER_INVALID_AFTER = max(2, int(os.getenv("ROYELLS_CHANNEL_RETIRE_PEER_INVALID_AFTER", "2")))
+CHANNEL_RETIRE_ON_PEER_INVALID = env_bool("ROYELLS_CHANNEL_RETIRE_ON_PEER_INVALID", False)
+CHANNEL_PEER_INVALID_BACKOFF_SECONDS = max(900, int(os.getenv("ROYELLS_CHANNEL_PEER_INVALID_BACKOFF_SECONDS", "21600")))
+FORCE_SOURCE_VIDEO_FIX = os.getenv("ROYELLS_FORCE_SOURCE_VIDEO_FIX", "0" if (IS_HUGGINGFACE_SPACE or E2_MICRO_SAFE_PROFILE) else "1").lower() not in ("0", "false", "no", "off")
+VIDEO_FIX_PRESET = os.getenv("ROYELLS_VIDEO_FIX_PRESET", "ultrafast" if IS_HUGGINGFACE_SPACE else "veryfast")
+VIDEO_FIX_CRF = os.getenv("ROYELLS_VIDEO_FIX_CRF", "20" if IS_HUGGINGFACE_SPACE else "18")
+FFMPEG_THREADS = int(os.getenv("ROYELLS_FFMPEG_THREADS", "1" if IS_HUGGINGFACE_SPACE else "2"))
+CONTENT_FILTER_ENABLED = False  # permanently removed from production UI/pipeline
+TELEGRAM_LINK_BYPASS_CONTENT_FILTER = env_bool("ROYELLS_TELEGRAM_LINK_BYPASS_CONTENT_FILTER", True)
+CONTENT_FILTER_THRESHOLD = max(0, int(os.getenv("ROYELLS_CONTENT_FILTER_THRESHOLD", "12")))
+CONTENT_FILTER_VIDEO_FRAME_SECONDS = max(0.0, float(os.getenv("ROYELLS_CONTENT_FILTER_VIDEO_FRAME_SECONDS", "1")))
+CONTENT_FILTER_HASH_CACHE_SECONDS = max(5, int(os.getenv("ROYELLS_CONTENT_FILTER_HASH_CACHE_SECONDS", "30")))
+VIDEO_META_PROBE_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_VIDEO_META_PROBE_TIMEOUT_SECONDS", "6" if IS_HUGGINGFACE_SPACE else "10"))
+TELEGRAM_API_CONCURRENCY = int(os.getenv("ROYELLS_TELEGRAM_API_CONCURRENCY", DEFAULT_API_CONCURRENCY))
+if IS_HUGGINGFACE_SPACE and not env_bool("ROYELLS_ALLOW_AGGRESSIVE_MAIN_WORKERS", True):
+    TELEGRAM_API_CONCURRENCY = min(TELEGRAM_API_CONCURRENCY, 1)
+TELEGRAM_CALL_RETRIES = int(os.getenv("ROYELLS_TELEGRAM_CALL_RETRIES", "5"))
+TELEGRAM_CALL_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_TELEGRAM_CALL_TIMEOUT_SECONDS", "90" if IS_HUGGINGFACE_SPACE else "120"))
+SUB_PROFILE_CACHE_SECONDS = max(60, env_int("ROYELLS_SUB_PROFILE_CACHE_SECONDS", "900"))
+SUB_PROFILE_REFRESH_LIMIT = max(1, env_int("ROYELLS_SUB_PROFILE_REFRESH_LIMIT", "60"))
+TELEGRAM_RECONNECT_COOLDOWN_SECONDS = int(os.getenv("ROYELLS_TELEGRAM_RECONNECT_COOLDOWN_SECONDS", "300" if IS_HUGGINGFACE_SPACE else "120"))
+TELEGRAM_RECONNECT_DEFER_ON_PIPELINE = env_bool("ROYELLS_TELEGRAM_RECONNECT_DEFER_ON_PIPELINE", False)
+TELEGRAM_RECONNECT_DEFER_MAX_SECONDS = int(os.getenv("ROYELLS_TELEGRAM_RECONNECT_DEFER_MAX_SECONDS", "300"))
+FLOOD_WAIT_BACKOFF_MULTIPLIER = float(os.getenv("ROYELLS_FLOOD_WAIT_BACKOFF_MULTIPLIER", "1.5"))
+FLOOD_WAIT_JITTER_SECONDS = float(os.getenv("ROYELLS_FLOOD_WAIT_JITTER_SECONDS", "3"))
+FLOOD_WAIT_BACKOFF_CAP_SECONDS = int(os.getenv("ROYELLS_FLOOD_WAIT_BACKOFF_CAP_SECONDS", "900"))
+ZERO_BYTE_RETRY_SECONDS = int(os.getenv("ROYELLS_ZERO_BYTE_RETRY_SECONDS", "8"))
+ZERO_BYTE_ITEM_MAX_RETRIES = max(1, min(5, env_int("ROYELLS_ZERO_BYTE_ITEM_MAX_RETRIES", "3")))
+DOWNLOAD_MEDIA_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_DOWNLOAD_MEDIA_TIMEOUT_SECONDS", "420" if IS_HUGGINGFACE_SPACE else "900"))
+UPLOAD_PREPARE_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_UPLOAD_PREPARE_TIMEOUT_SECONDS", "180" if IS_HUGGINGFACE_SPACE else "600"))
+UPLOAD_SEND_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_UPLOAD_SEND_TIMEOUT_SECONDS", "300" if IS_HUGGINGFACE_SPACE else "900"))
+TELEGRAM_MEDIA_CALL_HARD_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_TELEGRAM_MEDIA_CALL_HARD_TIMEOUT_SECONDS", "300" if IS_HUGGINGFACE_SPACE else "900"))
+MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("ROYELLS_MAX_CONCURRENT_TRANSMISSIONS", "1" if IS_HUGGINGFACE_SPACE else "2"))
+if IS_HUGGINGFACE_SPACE and not env_bool("ROYELLS_ALLOW_AGGRESSIVE_MAIN_WORKERS", True):
+    MAX_CONCURRENT_TRANSMISSIONS = min(MAX_CONCURRENT_TRANSMISSIONS, 1)
+WORKER_QUEUE_GROUP_ID = 0
+WORKER_QUEUE_SECRET = ""
+WORKER_BOT_USERNAME = ""
+QUEUE_WORKER_MODE = False
+OFFLOAD_TELEGRAM_LINKS = False
+WORKER_QUEUE_SEND_VIA_USERBOT = False
+WORKER_QUEUE_SEND_VIA_BOT = False
+WORKER_QUEUE_REQUIRE_HEARTBEAT = False
+# Worker split is removed in this main-bot-only build. Keep constants literal so
+# old Space variables cannot accidentally re-enable external queue behavior.
+WORKER_QUEUE_HEARTBEAT_SECONDS = 120
+WORKER_QUEUE_PING_SECONDS = 300
+WORKER_HTTP_URLS = []
+WORKER_HTTP_TIMEOUT_SECONDS = 25
+WORKER_HAS_SOURCE_ACCESS = False
+
+DEFAULT_BOT_SESSION = "royells_bot"
+DEFAULT_USER_SESSION = "royells_user"
+DEFAULT_DATA_FOLDER_NAME = "royells_media_bot"
+SESSION_NAME = os.getenv("ROYELLS_BOT_SESSION", DEFAULT_BOT_SESSION)
+USER_SESSION = os.getenv("ROYELLS_USER_SESSION", DEFAULT_USER_SESSION)
+USER_SESSION_STRING = os.getenv("ROYELLS_USER_SESSION_STRING", "").strip()
+DATA_FOLDER_NAME = os.getenv("ROYELLS_FOLDER_NAME", DEFAULT_DATA_FOLDER_NAME)
+
+MEMBER_FETCH_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_MEMBER_FETCH_TIMEOUT_SECONDS", "45"))
+MEMBER_FETCH_LIMIT = int(os.getenv("ROYELLS_MEMBER_FETCH_LIMIT", "500"))
+DEEP_CLEAN_DELETE_BATCH = int(os.getenv("ROYELLS_DEEP_CLEAN_DELETE_BATCH", "10"))
+DEEP_CLEAN_HISTORY_PAGE_LIMIT = int(os.getenv("ROYELLS_DEEP_CLEAN_HISTORY_PAGE_LIMIT", "50"))
+WATCHDOG_CHECK_SECONDS = int(os.getenv("ROYELLS_WATCHDOG_CHECK_SECONDS", "300"))
+GUARD_STALE_SECONDS = int(os.getenv("ROYELLS_GUARD_STALE_SECONDS", "900"))
+WATCHDOG_RESCUE_SYNC_SECONDS = int(os.getenv("ROYELLS_WATCHDOG_RESCUE_SYNC_SECONDS", "900"))
+AUTO_RECOVERY_ENABLED = os.getenv("ROYELLS_AUTO_RECOVERY", "1").lower() not in ("0", "false", "no", "off")
+AUTO_RECOVERY_INTERVAL_SECONDS = int(os.getenv("ROYELLS_AUTO_RECOVERY_INTERVAL_SECONDS", "900"))
+AUTO_RECOVERY_START_DELAY_SECONDS = int(os.getenv("ROYELLS_AUTO_RECOVERY_START_DELAY_SECONDS", "900"))
+AUTO_RECOVERY_LIMIT = int(os.getenv("ROYELLS_AUTO_RECOVERY_LIMIT", "150"))
+QUEUE_HEALER_ENABLED = env_bool("ROYELLS_QUEUE_HEALER", True)
+QUEUE_HEALER_INTERVAL_SECONDS = max(120, int(os.getenv("ROYELLS_QUEUE_HEALER_INTERVAL_SECONDS", "300")))
+QUEUE_STALE_SECONDS = max(300, int(os.getenv("ROYELLS_QUEUE_STALE_SECONDS", "900")))
+WORKER_STALL_SECONDS = max(300, int(os.getenv("ROYELLS_WORKER_STALL_SECONDS", "900" if IS_HUGGINGFACE_SPACE else "1200")))
+SOURCE_CIRCUIT_BREAKER_ENABLED = env_bool("ROYELLS_SOURCE_CIRCUIT_BREAKER", True)
+SOURCE_CIRCUIT_FAILURE_THRESHOLD = max(2, int(os.getenv("ROYELLS_SOURCE_CIRCUIT_FAILURE_THRESHOLD", "3")))
+SOURCE_CIRCUIT_COOLDOWN_SECONDS = max(600, int(os.getenv("ROYELLS_SOURCE_CIRCUIT_COOLDOWN_SECONDS", "3600")))
+SOURCE_CIRCUIT_MAX_COOLDOWN_SECONDS = max(SOURCE_CIRCUIT_COOLDOWN_SECONDS, int(os.getenv("ROYELLS_SOURCE_CIRCUIT_MAX_COOLDOWN_SECONDS", "21600")))
+STARTUP_SCAN_LIMIT = int(os.getenv("ROYELLS_STARTUP_SCAN_LIMIT", "300" if IS_HUGGINGFACE_SPACE else "500"))
+TRY_COPY_MESSAGE = True
+PRESERVE_ALBUMS = env_bool("ROYELLS_PRESERVE_ALBUMS", True)
+TRY_COPY_ALBUM_ITEMS = env_bool("ROYELLS_TRY_COPY_ALBUM_ITEMS", False) and not PRESERVE_ALBUMS
+SOURCE_FAST_COPY_ENABLED = True
+COPY_MESSAGE_WITH_BOT = False
+COPY_MESSAGE_WITH_USERBOT = True
+COPY_RESTRICTED_CACHE_TTL_SECONDS = int(os.getenv("ROYELLS_COPY_RESTRICTED_CACHE_TTL_SECONDS", "21600"))
+TARGET_MEDIA_WITH_BOT = env_bool("ROYELLS_TARGET_MEDIA_WITH_BOT", True)
+TARGET_MEDIA_WITH_USERBOT = env_bool("ROYELLS_TARGET_MEDIA_WITH_USERBOT", True)
+TELEGRAM_LINK_FORCE_UPLOAD = env_bool("ROYELLS_TELEGRAM_LINK_FORCE_UPLOAD", True)
+TELEGRAM_LINK_FORCE_UPLOAD_FOR_ALL = env_bool("ROYELLS_TELEGRAM_LINK_FORCE_UPLOAD_FOR_ALL", False)
+DEAD_MEDIA_FAILURE_THRESHOLD = max(1, int(os.getenv("ROYELLS_DEAD_MEDIA_FAILURE_THRESHOLD", "2")))
+DEAD_MEDIA_SKIP_AFTER_ATTEMPTS = max(1, int(os.getenv("ROYELLS_DEAD_MEDIA_SKIP_AFTER_ATTEMPTS", "2")))
+SOURCE_ACCESS_FAILURE_RETIRE_ENABLED = env_bool("ROYELLS_RETIRE_ACCESS_FAILURES", False)
+SOURCE_MAX_FAILURES_BEFORE_RETIRE = max(2, int(os.getenv("ROYELLS_SOURCE_MAX_FAILURES_BEFORE_RETIRE", "8")))
+SOURCE_MEDIA_WORKER_FALLBACK = False
+SOURCE_BRAIN_ENABLED = False
+# Brain/discovery is intentionally offline for stability-first production mode.
+# Literal defaults keep old environment variables from changing scan behavior.
+SOURCE_BRAIN_MIN_SCAN_DELAY_SECONDS = 20
+SOURCE_BRAIN_QUIET_BASE_DELAY_SECONDS = 180
+SOURCE_BRAIN_MAX_SCAN_DELAY_SECONDS = 1800
+SOURCE_BRAIN_BAD_COOLDOWN_SECONDS = 1800
+SOURCE_BRAIN_FAIL_STREAK_BAD = 4
+BRAIN_DICTIONARY_ENABLED = False
+BRAIN_DISCOVERY_ENABLED = False
+BRAIN_AUTO_JOIN_ENABLED = False
+BRAIN_DISCOVERY_INTERVAL_SECONDS = 21600
+BRAIN_DISCOVERY_SEARCHES_PER_RUN = 5
+BRAIN_DISCOVERY_RESULTS_LIMIT = 15
+BRAIN_VALIDATION_MESSAGE_LIMIT = 15
+BRAIN_RELEVANCE_THRESHOLD = 0.5
+BRAIN_MEDIA_PROFILE_THRESHOLD = 0.72
+BRAIN_MEDIA_PROFILE_WEIGHT = 0.75
+BRAIN_MEDIA_PROFILE_REFRESH_SECONDS = 43200
+BRAIN_SEMANTIC_ENABLED = False
+BRAIN_SEMANTIC_WEIGHT = 0.55
+BRAIN_SEMANTIC_THRESHOLD = 0.58
+BRAIN_RECOMMENDATION_CACHE_SECONDS = 21600
+BRAIN_JOIN_LIMIT_PER_HOUR = 3
+BRAIN_PENDING_PROCESS_INTERVAL_SECONDS = 900
+BRAIN_KEYWORDS_ENV = ""
+BRAIN_HASHTAGS_ENV = ""
+DIAGNOSTIC_REPORT_ENABLED = env_bool("ROYELLS_DIAGNOSTIC_REPORT_ENABLED", True)
+DIAGNOSTIC_REPORT_INTERVAL_SECONDS = max(3600, int(os.getenv("ROYELLS_DIAGNOSTIC_REPORT_INTERVAL_SECONDS", "86400")))
+SOURCE_LINK_DISCOVERY_ENABLED = env_bool("ROYELLS_SOURCE_LINK_DISCOVERY", True)
+SOURCE_LINK_LIVE_CHECK_ENABLED = env_bool("ROYELLS_SOURCE_LINK_LIVE_CHECK", True)
+SOURCE_LINK_JOIN_PROBE_ENABLED = False
+SOURCE_LINK_JOIN_PROBE_LEAVE_AFTER = True
+SOURCE_LINK_CHECK_CACHE_SECONDS = max(300, int(os.getenv("ROYELLS_SOURCE_LINK_CHECK_CACHE_SECONDS", "21600")))
+SOURCE_ALBUM_INDIVIDUAL_FALLBACK = (
+    env_bool("ROYELLS_SOURCE_ALBUM_INDIVIDUAL_FALLBACK", True)
+)
+SOURCE_ALBUM_GROUP_FAILURE_INDIVIDUAL_FALLBACK = (
+    env_bool("ROYELLS_SOURCE_ALBUM_GROUP_FAILURE_INDIVIDUAL_FALLBACK", True)
+)
+SOURCE_ALBUM_SEND_ATTEMPTS = max(1, min(5, env_int("ROYELLS_SOURCE_ALBUM_SEND_ATTEMPTS", "2")))
+COPY_MESSAGE_ITEM_DELAY = float(os.getenv("ROYELLS_COPY_MESSAGE_ITEM_DELAY", "0.15"))
+STARTUP_CATCHUP_ENABLED = os.getenv("ROYELLS_STARTUP_CATCHUP", "1").lower() not in ("0", "false", "no", "off")
+STARTUP_CATCHUP_MEDIA_LIMIT = int(os.getenv("ROYELLS_STARTUP_CATCHUP_MEDIA_LIMIT", "200"))
+STARTUP_CATCHUP_HISTORY_LIMIT = int(os.getenv("ROYELLS_STARTUP_CATCHUP_HISTORY_LIMIT", str(max(STARTUP_CATCHUP_MEDIA_LIMIT * 12, 1200))))
+STARTUP_CATCHUP_CHANNEL_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_STARTUP_CATCHUP_CHANNEL_TIMEOUT_SECONDS", "180"))
+STARTUP_CATCHUP_DELAY_SECONDS = int(os.getenv("ROYELLS_STARTUP_CATCHUP_DELAY_SECONDS", "120" if IS_HUGGINGFACE_SPACE else "30"))
+IMMEDIATE_RESCUE_SCAN_LIMIT = max(1, int(os.getenv("ROYELLS_IMMEDIATE_RESCUE_SCAN_LIMIT", "200")))
+IMMEDIATE_RESCUE_HISTORY_LIMIT = int(os.getenv("ROYELLS_IMMEDIATE_RESCUE_HISTORY_LIMIT", str(max(IMMEDIATE_RESCUE_SCAN_LIMIT * 12, 1200))))
+IMMEDIATE_RESCUE_SCAN_DELAY_SECONDS = max(5, int(os.getenv("ROYELLS_IMMEDIATE_RESCUE_SCAN_DELAY_SECONDS", "20")))
+IMMEDIATE_RESCUE_ENABLED = env_bool("ROYELLS_IMMEDIATE_RESCUE_ENABLED", False)
+ADAPTIVE_INTAKE_ENABLED = env_bool("ROYELLS_ADAPTIVE_INTAKE", True)
+ADAPTIVE_INTAKE_START_DELAY_SECONDS = max(5, env_int("ROYELLS_ADAPTIVE_INTAKE_START_DELAY_SECONDS", "45"))
+ADAPTIVE_INTAKE_INTERVAL_SECONDS = max(5, env_int("ROYELLS_ADAPTIVE_INTAKE_INTERVAL_SECONDS", "20"))
+ADAPTIVE_INTAKE_TIMEOUT_SECONDS = max(30, env_int("ROYELLS_ADAPTIVE_INTAKE_TIMEOUT_SECONDS", "120"))
+STARTUP_HOT_SCAN_LIMIT = max(1, env_int("ROYELLS_STARTUP_HOT_SCAN_LIMIT", "500"))
+STARTUP_HOT_SCAN_HISTORY_LIMIT = max(STARTUP_HOT_SCAN_LIMIT, env_int("ROYELLS_STARTUP_HOT_SCAN_HISTORY_LIMIT", "2500"))
+STARTUP_HOT_SCAN_NEW_PASS_TOKEN = os.getenv("ROYELLS_STARTUP_HOT_SCAN_NEW_PASS_TOKEN", "").strip()[:120]
+HISTORICAL_BACKFILL_ENABLED = env_bool("ROYELLS_HISTORICAL_BACKFILL", False if E2_MICRO_SAFE_PROFILE else True)
+HISTORICAL_BACKFILL_BATCH_IDS = max(20, min(200, env_int("ROYELLS_HISTORICAL_BACKFILL_BATCH_IDS", "100")))
+HISTORICAL_BACKFILL_PRESSURE_TARGET = max(10, env_int("ROYELLS_HISTORICAL_BACKFILL_PRESSURE_TARGET", "1200"))
+HISTORICAL_BACKFILL_PAUSE_SECONDS = max(2, env_int("ROYELLS_HISTORICAL_BACKFILL_PAUSE_SECONDS", "5"))
+SCAN_PREFETCH_PRESSURE_TARGET = max(
+    10,
+    min(
+        MAIN_LOCAL_QUEUE_SOFT_LIMIT,
+        HISTORICAL_BACKFILL_PRESSURE_TARGET,
+        env_int("ROYELLS_SCAN_PREFETCH_PRESSURE_TARGET", "100"),
+    ),
+)
+KEEPALIVE_HTTP_ENABLED = (
+    INTERNAL_HTTP_CAN_BIND_PORT
+    and os.getenv("ROYELLS_KEEPALIVE_HTTP", "1" if IS_HUGGINGFACE_SPACE else "0").lower()
+    not in ("0", "false", "no", "off")
+)
+KEEPALIVE_HTTP_PORT = int(os.getenv("PORT", os.getenv("ROYELLS_KEEPALIVE_PORT", "7860" if IS_HUGGINGFACE_SPACE else "8080")))
+KEEPALIVE_PING_URLS = env_url_list("ROYELLS_KEEPALIVE_PING_URLS", "ROYELLS_KEEPALIVE_URLS")
+KEEPALIVE_PING_INTERVAL_SECONDS = int(os.getenv("ROYELLS_KEEPALIVE_PING_INTERVAL_SECONDS", "240"))
+DIALOG_REFRESH_INTERVAL_SECONDS = int(os.getenv("ROYELLS_DIALOG_REFRESH_INTERVAL_SECONDS", "900"))
+SOURCE_PEER_RESOLVE_COOLDOWN_SECONDS = max(
+    300 if E2_MICRO_SAFE_PROFILE else 1800,
+    int(os.getenv("ROYELLS_SOURCE_PEER_RESOLVE_COOLDOWN_SECONDS", "300" if E2_MICRO_SAFE_PROFILE else "1800")),
+)
+DOWNLOAD_STORAGE_LIMIT_MB = int(os.getenv("ROYELLS_DOWNLOAD_STORAGE_LIMIT_MB", "20480" if IS_HUGGINGFACE_SPACE else "4096"))
+MIN_FREE_STORAGE_MB = int(os.getenv("ROYELLS_MIN_FREE_STORAGE_MB", "2048" if IS_HUGGINGFACE_SPACE else "1024"))
+STORAGE_MONITOR_INTERVAL_SECONDS = int(os.getenv("ROYELLS_STORAGE_MONITOR_INTERVAL_SECONDS", "300"))
+MEMORY_GC_INTERVAL_SECONDS = int(os.getenv("ROYELLS_MEMORY_GC_INTERVAL_SECONDS", "300"))
+HARD_WATCHDOG_ENABLED = env_bool("ROYELLS_HARD_WATCHDOG", True)
+HARD_WATCHDOG_FORCE_RESTART = env_bool("ROYELLS_HARD_WATCHDOG_FORCE_RESTART", False)
+HARD_WATCHDOG_HEARTBEAT_SECONDS = int(os.getenv("ROYELLS_HARD_WATCHDOG_HEARTBEAT_SECONDS", "15"))
+HARD_WATCHDOG_STALL_SECONDS = int(os.getenv("ROYELLS_HARD_WATCHDOG_STALL_SECONDS", "900" if IS_HUGGINGFACE_SPACE else "420"))
+HARD_WATCHDOG_STARTUP_GRACE_SECONDS = int(os.getenv("ROYELLS_HARD_WATCHDOG_STARTUP_GRACE_SECONDS", "600"))
+HARD_WATCHDOG_EXIT_CODE = int(os.getenv("ROYELLS_HARD_WATCHDOG_EXIT_CODE", "75"))
+MEMORY_RESTART_LIMIT_MB = int(os.getenv("ROYELLS_MEMORY_RESTART_LIMIT_MB", "12000" if IS_HUGGINGFACE_SPACE else "0"))
+WORKER_STALL_FORCE_RESTART = env_bool("ROYELLS_WORKER_STALL_FORCE_RESTART", False)
+AUTO_RESTART_MAX_PER_WINDOW = max(0, env_int("ROYELLS_AUTO_RESTART_MAX_PER_WINDOW", "0"))
+AUTO_RESTART_WINDOW_SECONDS = max(300, env_int("ROYELLS_AUTO_RESTART_WINDOW_SECONDS", "21600"))
+STATE_BACKUP_INTERVAL_SECONDS = int(os.getenv("ROYELLS_STATE_BACKUP_INTERVAL_SECONDS", "900"))
+STATE_BACKUP_KEEP = int(os.getenv("ROYELLS_STATE_BACKUP_KEEP", "3"))
+DB_RECOVERY_ARTIFACT_KEEP = max(1, env_int("ROYELLS_DB_RECOVERY_ARTIFACT_KEEP", "3"))
+TELEGRAM_BACKUP_ENABLED = os.getenv("ROYELLS_TELEGRAM_BACKUP", "1").lower() not in ("0", "false", "no", "off")
+TELEGRAM_BACKUP_INTERVAL_SECONDS = int(os.getenv("ROYELLS_TELEGRAM_BACKUP_INTERVAL_SECONDS", "86400"))
+BACKUP_ZIP_COMPRESSLEVEL = max(1, min(9, int(os.getenv("ROYELLS_BACKUP_ZIP_COMPRESSLEVEL", "9"))))
+RESTORE_RELOAD_TARGET_INDEX = env_bool("ROYELLS_RESTORE_RELOAD_TARGET_INDEX", True)
+LIVE_DASHBOARD_ENABLED = env_bool("ROYELLS_LIVE_DASHBOARD", False if E2_MICRO_SAFE_PROFILE else True)
+LIVE_DASHBOARD_INTERVAL_SECONDS = int(os.getenv("ROYELLS_LIVE_DASHBOARD_INTERVAL_SECONDS", "300" if E2_MICRO_SAFE_PROFILE else "5"))
+DB_JOURNAL_MODE = os.getenv("ROYELLS_DB_JOURNAL_MODE", "WAL").strip().upper()
+DB_SYNCHRONOUS = os.getenv("ROYELLS_DB_SYNCHRONOUS", "NORMAL").strip().upper()
+JSON_FSYNC_ENABLED = os.getenv("ROYELLS_JSON_FSYNC", "0").lower() not in ("0", "false", "no", "off")
+RUNTIME_CHECKPOINT_ENABLED = env_bool("ROYELLS_RUNTIME_CHECKPOINT", True)
+RUNTIME_CHECKPOINT_INTERVAL_SECONDS = max(
+    5,
+    env_int("ROYELLS_RUNTIME_CHECKPOINT_INTERVAL_SECONDS", "15"),
+)
+RUNTIME_CHECKPOINT_CONFIRM_HISTORY_LIMIT = max(
+    100,
+    min(5000, env_int("ROYELLS_RUNTIME_CHECKPOINT_CONFIRM_HISTORY_LIMIT", "1000")),
+)
+RUNTIME_CHECKPOINT_MAX_AGE_DAYS = max(
+    1,
+    env_int("ROYELLS_RUNTIME_CHECKPOINT_MAX_AGE_DAYS", "30"),
+)
+TARGET_MEDIA_INDEX_ENABLED = env_bool("ROYELLS_TARGET_MEDIA_INDEX", True)
+TARGET_MEDIA_INDEX_START_DELAY_SECONDS = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_START_DELAY_SECONDS", "1800" if IS_HUGGINGFACE_SPACE else "180"))
+TARGET_MEDIA_INDEX_INTERVAL_SECONDS = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_INTERVAL_SECONDS", "86400"))
+TARGET_MEDIA_INDEX_PAGE_LIMIT = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_PAGE_LIMIT", str(DEEP_CLEAN_HISTORY_PAGE_LIMIT)))
+TARGET_MEDIA_INDEX_MAX_HISTORY = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_MAX_HISTORY", "0"))
+TARGET_MEDIA_INDEX_DELETE_DUPLICATES = env_bool("ROYELLS_TARGET_MEDIA_INDEX_DELETE_DUPLICATES", True)
+SOURCE_UPLOAD_AS_DOCUMENT = env_bool("ROYELLS_SOURCE_UPLOAD_AS_DOCUMENT", True if E2_MICRO_SAFE_PROFILE else False)
+SOURCE_VIDEO_UPLOAD_AS_DOCUMENT = env_bool("ROYELLS_SOURCE_VIDEO_UPLOAD_AS_DOCUMENT", SOURCE_UPLOAD_AS_DOCUMENT)
+SOURCE_PHOTO_UPLOAD_AS_DOCUMENT = env_bool("ROYELLS_SOURCE_PHOTO_UPLOAD_AS_DOCUMENT", SOURCE_UPLOAD_AS_DOCUMENT)
+QUEUE_RECOVERY_BATCH_LIMIT = max(1, env_int("ROYELLS_QUEUE_RECOVERY_BATCH_LIMIT", "50"))
+QUEUE_RECOVERY_PRESSURE_TARGET = max(
+    1,
+    min(MAIN_LOCAL_QUEUE_SOFT_LIMIT, env_int("ROYELLS_QUEUE_RECOVERY_PRESSURE_TARGET", "100")),
+)
+QUEUE_RECOVERY_ITEM_DELAY_SECONDS = max(0.0, float(os.getenv("ROYELLS_QUEUE_RECOVERY_ITEM_DELAY_SECONDS", "0.1")))
+QUEUE_RECOVERY_RETRY_SECONDS = max(1.0, float(os.getenv("ROYELLS_QUEUE_RECOVERY_RETRY_SECONDS", "3")))
+
+class ThreadSafeSet:
+    def __init__(self, values=None):
+        self._lock = threading.RLock()
+        self._values = set(values or ())
+
+    def add(self, value):
+        with self._lock:
+            self._values.add(value)
+
+    def discard(self, value):
+        with self._lock:
+            self._values.discard(value)
+
+    def clear(self):
+        with self._lock:
+            self._values.clear()
+
+    def update(self, values):
+        with self._lock:
+            self._values.update(values)
+
+    def __contains__(self, value):
+        with self._lock:
+            return value in self._values
+
+    def __len__(self):
+        with self._lock:
+            return len(self._values)
+
+    def __iter__(self):
+        with self._lock:
+            return iter(tuple(self._values))
+
+
+class ThreadSafeTTLSet(ThreadSafeSet):
+    def __init__(self, ttl_seconds):
+        self._lock = threading.RLock()
+        self._values = {}
+        self.ttl_seconds = max(60, int(ttl_seconds))
+
+    def add(self, value):
+        with self._lock:
+            self._values[value] = time.monotonic()
+
+    def discard(self, value):
+        with self._lock:
+            self._values.pop(value, None)
+
+    def clear(self):
+        with self._lock:
+            self._values.clear()
+
+    def __contains__(self, value):
+        with self._lock:
+            created = self._values.get(value)
+            if created is None:
+                return False
+            if time.monotonic() - created > self.ttl_seconds:
+                self._values.pop(value, None)
+                return False
+            return True
+
+    def __len__(self):
+        with self._lock:
+            return len(self._values)
+
+    def prune(self):
+        cutoff = time.monotonic() - self.ttl_seconds
+        with self._lock:
+            stale = [key for key, created in self._values.items() if created < cutoff]
+            for key in stale:
+                self._values.pop(key, None)
+            return len(stale)
+
+    def checkpoint_snapshot(self):
+        now_mono = time.monotonic()
+        now_epoch = time.time()
+        with self._lock:
+            return {
+                str(key): now_epoch + max(0.0, self.ttl_seconds - (now_mono - created))
+                for key, created in self._values.items()
+                if now_mono - created <= self.ttl_seconds
+            }
+
+    def restore_checkpoint_snapshot(self, values):
+        now_mono = time.monotonic()
+        now_epoch = time.time()
+        restored = 0
+        with self._lock:
+            for key, expires_at in (values or {}).items():
+                remaining = float(expires_at or 0) - now_epoch
+                if remaining <= 0:
+                    continue
+                age = max(0.0, self.ttl_seconds - min(float(self.ttl_seconds), remaining))
+                self._values[str(key)] = now_mono - age
+                restored += 1
+        return restored
+
+
+class ThreadSafeReservationMap:
+    """Own persisted media keys until their original queue job is safely staged or terminal."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._owners = {}
+        self._keys_by_owner = defaultdict(set)
+        self._owner_rank = {}
+        self._next_rank = 0
+
+    def reserve(self, owner, keys):
+        owner = str(owner or "")
+        if not owner:
+            return 0
+        added = 0
+        with self._lock:
+            if owner not in self._owner_rank:
+                self._owner_rank[owner] = self._next_rank
+                self._next_rank += 1
+            for key in {str(value) for value in keys if value}:
+                owners = self._owners.setdefault(key, [])
+                if not owners:
+                    added += 1
+                if owner not in owners:
+                    owners.append(owner)
+                self._keys_by_owner[owner].add(key)
+        return added
+
+    def blocks(self, key, owner=None):
+        with self._lock:
+            owners = self._owners.get(str(key), [])
+            if not owners:
+                return False
+            owner = str(owner or "")
+            if not owner:
+                return True
+            first_owner = min(
+                owners,
+                key=lambda value: self._owner_rank.get(value, float("inf")),
+            )
+            return first_owner != owner
+
+    def release(self, owner):
+        owner = str(owner or "")
+        with self._lock:
+            keys = self._keys_by_owner.pop(owner, set())
+            for key in keys:
+                owners = self._owners.get(key, [])
+                with contextlib.suppress(ValueError):
+                    owners.remove(owner)
+                if not owners:
+                    self._owners.pop(key, None)
+            self._owner_rank.pop(owner, None)
+            return len(keys)
+
+    def clear(self):
+        with self._lock:
+            self._owners.clear()
+            self._keys_by_owner.clear()
+            self._owner_rank.clear()
+            self._next_rank = 0
+
+    def owner_count(self):
+        with self._lock:
+            return len(self._keys_by_owner)
+
+    def key_count(self):
+        with self._lock:
+            return len(self._owners)
+
+
+EXECUTOR_POOLS = {
+    "db": concurrent.futures.ThreadPoolExecutor(max_workers=max(1, env_int("ROYELLS_DB_EXECUTOR_WORKERS", "1")), thread_name_prefix="royells-db"),
+    "persistence": concurrent.futures.ThreadPoolExecutor(max_workers=max(1, env_int("ROYELLS_PERSISTENCE_EXECUTOR_WORKERS", "2")), thread_name_prefix="royells-persist"),
+    "media": concurrent.futures.ThreadPoolExecutor(max_workers=max(1, env_int("ROYELLS_MEDIA_EXECUTOR_WORKERS", "2")), thread_name_prefix="royells-media"),
+    "control": concurrent.futures.ThreadPoolExecutor(max_workers=max(1, env_int("ROYELLS_CONTROL_EXECUTOR_WORKERS", "2")), thread_name_prefix="royells-control"),
+    "cpu": concurrent.futures.ThreadPoolExecutor(max_workers=max(1, env_int("ROYELLS_CPU_EXECUTOR_WORKERS", "1")), thread_name_prefix="royells-cpu"),
+}
+EXECUTOR_INFLIGHT = {name: 0 for name in EXECUTOR_POOLS}
+EXECUTOR_LOCK = threading.RLock()
+
+
+async def run_blocking(pool_name, func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    pool = EXECUTOR_POOLS[pool_name]
+    with EXECUTOR_LOCK:
+        EXECUTOR_INFLIGHT[pool_name] += 1
+    try:
+        call = lambda: func(*args, **kwargs)
+        return await loop.run_in_executor(pool, call)
+    finally:
+        with EXECUTOR_LOCK:
+            EXECUTOR_INFLIGHT[pool_name] = max(0, EXECUTOR_INFLIGHT[pool_name] - 1)
+
+
+def executor_diagnostics():
+    with EXECUTOR_LOCK:
+        return {
+            name: {
+                "inflight": EXECUTOR_INFLIGHT.get(name, 0),
+                "threads": len(getattr(pool, "_threads", ())),
+                "queued": getattr(getattr(pool, "_work_queue", None), "qsize", lambda: 0)(),
+            }
+            for name, pool in EXECUTOR_POOLS.items()
+        }
+
+
+def shutdown_executors(wait=True):
+    for pool in EXECUTOR_POOLS.values():
+        pool.shutdown(wait=wait, cancel_futures=True)
+
+
+owner_states = {}
+live_dashboard_tasks = {}
+live_log_tasks = {}
+support_ticket_map = {}
+support_last_message_time = {}
+console_logs = deque(maxlen=40)
+RUNTIME_METRICS_LOCK = threading.RLock()
+RUNTIME_METRICS = {
+    "event_loop_lag_seconds": 0.0,
+    "event_loop_lag_peak_seconds": 0.0,
+    "slow_db_operations": 0,
+    "slow_api_operations": 0,
+    "slow_media_operations": 0,
+    "queue_wait_peak_seconds": {"download": 0.0, "upload": 0.0, "link": 0.0, "button": 0.0},
+}
+
+
+def metric_increment(name, amount=1):
+    with RUNTIME_METRICS_LOCK:
+        RUNTIME_METRICS[name] = int(RUNTIME_METRICS.get(name) or 0) + amount
+        return RUNTIME_METRICS[name]
+
+
+def metric_set(name, value):
+    with RUNTIME_METRICS_LOCK:
+        RUNTIME_METRICS[name] = value
+
+
+def metric_set_peak(group, key, value):
+    with RUNTIME_METRICS_LOCK:
+        bucket = RUNTIME_METRICS.setdefault(group, {})
+        bucket[key] = max(float(bucket.get(key) or 0), float(value))
+
+
+def runtime_metrics_snapshot():
+    with RUNTIME_METRICS_LOCK:
+        return deepcopy(RUNTIME_METRICS)
+
+
+diagnostic_stats = {
+    "period_started_at": datetime.now().replace(microsecond=0).isoformat(),
+    "error_counts": {},
+    "max_queue": 0,
+    "sources_retired": [],
+    "dead_media_added": 0,
+    "uploads": 0,
+    "duplicates_deleted": 0,
+    "restore_events": [],
+    "recent_errors": [],
+}
+MEMBERS_CACHE = {"data": [], "time": 0}
+processing_cache = ThreadSafeTTLSet(env_int("ROYELLS_PROCESSING_CACHE_TTL_SECONDS", "86400"))
+persisted_queue_reservations = ThreadSafeReservationMap()
+dead_media_uids = {}
+target_media_full_index = ThreadSafeSet()
+active_download_files = set()
+copy_restricted_cache = {}
+content_filter_cache = {"loaded_at": 0, "items": []}
+queue_health_cache = {"loaded_at": 0, "stale": 0}
+active_worker_jobs = {}
+active_worker_jobs_lock = threading.RLock()
+automatic_restart_lock = threading.RLock()
+source_pressure_log_cache = {}
+source_link_check_cache = {}
+brain_join_window = deque()
+ai_suggested_fixes = {}
+
+
+class ObservedRLock:
+    """RLock wrapper that reports cross-thread lock contention without changing semantics."""
+
+    def __init__(self, name, slow_seconds=None):
+        self.name = name
+        self._lock = threading.RLock()
+        self.slow_seconds = float(slow_seconds or os.getenv("ROYELLS_SLOW_LOCK_SECONDS", "0.25"))
+
+    def __enter__(self):
+        started = time.monotonic()
+        self._lock.acquire()
+        waited = time.monotonic() - started
+        if waited >= self.slow_seconds:
+            message = f"Slow lock acquisition: {self.name} waited {waited:.3f}s thread={threading.current_thread().name}"
+            if "log_event" in globals():
+                log_event(message)
+            else:
+                print(message, flush=True)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._lock.release()
+        return False
+
+    def acquire(self, blocking=True, timeout=-1):
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self):
+        return self._lock.release()
+
+
+db_mutex = ObservedRLock("sqlite")
+state_mutex = ObservedRLock("state")
+DB_JOURNAL_INITIALIZED = False
+DB_REQUIRES_TARGET_REINDEX = False
+DB_DIAGNOSTIC_WRITES_DISABLED = False
+DB_DEGRADED = False
+DB_PENDING_SALVAGE_SOURCES = []
+STATE_SAVE_QUEUE = queue.Queue()
+STATE_SAVE_THREAD = None
+STATE_SAVE_STOP = threading.Event()
+STATE_SAVE_CONDITION = threading.Condition(threading.RLock())
+STATE_SAVE_REQUESTED = {}
+STATE_SAVE_PERSISTED = {}
+STATE_SAVE_QUEUED = set()
+STATE_SAVE_INFLIGHT = {}
+MAIN_LOOP_THREAD_ID = None
+ASYNC_TASK_SNAPSHOT = []
+ASYNC_TASK_META = {}
+ASYNC_DIAGNOSTICS_ENABLED = env_bool("ROYELLS_ASYNC_DIAGNOSTICS", False)
+ASYNC_DIAGNOSTIC_THRESHOLDS = (30, 120, 600)
+album_buffer = defaultdict(list)
+album_tasks = {}
+album_lock = asyncio.Lock()
+auto_album_buffer = defaultdict(list)
+auto_album_tasks = {}
+auto_album_lock = asyncio.Lock()
+auto_album_deadlines = {}
+EVENT_LOOP_HEARTBEAT_TS = time.time()
+HARD_WATCHDOG_STARTED = False
+deep_clean_lock = asyncio.Lock()
+target_index_lock = asyncio.Lock()
+STARTUP_HOT_SCAN_COMPLETE = asyncio.Event()
+QUEUE_RECOVERY_READY = asyncio.Event()
+PIPELINE_SCAN_STATUS = {"phase": "boot", "hot_done": 0, "hot_total": 0, "backfill_done": 0, "backfill_total": 0, "last_source": "", "queued": 0}
+BOT_START = datetime.now()
+uploaded_count = 0
+auto_count = 0
+ai_model = bool(GEMINI_API_KEY and GEMINI_API_KEY != "Hide")
+last_auto_sync = {"status": "waiting", "time": "", "queued": 0}
+last_source_guard = {"status": "starting", "time": "", "queued": 0}
+JOIN_LINK_CACHE = {"link": "", "time": 0}
+BOT_LOCK_HANDLE = None
+source_guard_index = 0
+auto_sync_index = 0
+SOURCE_DIALOG_CACHE_BY_ID = {}
+SOURCE_DIALOG_CACHE_BY_USERNAME = {}
+SOURCE_PEER_RESOLVE_NEXT_AT = {}
+sync_scan_lock = asyncio.Lock()
+source_guard_lock = asyncio.Lock()
+queue_recovery_lock = asyncio.Lock()
+telegram_api_semaphore = asyncio.Semaphore(max(1, TELEGRAM_API_CONCURRENCY))
+telegram_control_semaphore = asyncio.Semaphore(max(2, env_int("ROYELLS_TELEGRAM_CONTROL_CONCURRENCY", "4")))
+telegram_media_semaphore = asyncio.Semaphore(1)
+source_link_check_semaphore = asyncio.Semaphore(1)
+telegram_reconnect_lock = asyncio.Lock()
+media_admission_lock = asyncio.Lock()
+last_telegram_reconnect = 0
+TELEGRAM_TRANSPORT_GENERATION = 0
+TELEGRAM_FLOOD_UNTIL = 0.0
+TELEGRAM_FLOOD_LOCK = asyncio.Lock()
+TELEGRAM_INFLIGHT = {}
+TELEGRAM_INFLIGHT_LOCK = threading.RLock()
+DELIVERY_INTENTS = {}
+DELIVERY_INTENTS_LOCK = threading.RLock()
+RUNTIME_CHECKPOINT_SEQUENCE = 0
+RUNTIME_CHECKPOINT_LAST_WRITTEN = 0.0
+RUNTIME_CHECKPOINT_LAST_REASON = ""
+RUNTIME_CHECKPOINT_DIRTY = True
+RUNTIME_CHECKPOINT_LOADED = {}
+RUNTIME_CHECKPOINT_LOADED_SOURCE = ""
+RUNTIME_CHECKPOINT_RESTORED_QUEUE_JOB_IDS = set()
+RUNTIME_CHECKPOINT_RESTORED_LINK_KEYS = set()
+RUNTIME_CHECKPOINT_LOOP = None
+RUNTIME_CHECKPOINT_LOCK = asyncio.Lock()
+RUNTIME_CHECKPOINT_WAKE = asyncio.Event()
+SHUTDOWN_REQUESTED = False
+last_watchdog_rescue_sync = 0
+last_successful_queue_time = time.time()
+last_session_warning = 0
+SESSION_AUTH_INVALID = False
+SESSION_AUTH_INVALID_REASON = ""
+SESSION_AUTH_PAUSE_SECONDS = int(os.getenv("ROYELLS_SESSION_AUTH_PAUSE_SECONDS", "300"))
+last_dialog_cache_refresh = 0
+KEEPALIVE_HTTP_SERVER = EARLY_KEEPALIVE_HTTP_SERVER
+HTTP_TASK_HANDLER = None
+
+
+def now_iso():
+    return datetime.now().replace(microsecond=0).isoformat()
+
+
+def parse_iso_timestamp(value):
+    try:
+        return datetime.fromisoformat(str(value or ""))
+    except Exception:
+        return None
+
+
+def bengali_daypart(dt):
+    hour = dt.hour
+    if 4 <= hour < 11:
+        return "সকাল"
+    if 11 <= hour < 15:
+        return "দুপুর"
+    if 15 <= hour < 18:
+        return "বিকাল"
+    if 18 <= hour < 20:
+        return "সন্ধ্যা"
+    return "রাত"
+
+
+def parse_display_datetime(value=None):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value)
+    if not value:
+        return datetime.now()
+    text = str(value).strip()
+    for parser in (
+        lambda v: datetime.fromisoformat(v),
+        lambda v: datetime.strptime(v, "%Y-%m-%d %H:%M:%S"),
+        lambda v: datetime.strptime(v, "%Y-%m-%d %I:%M %p"),
+    ):
+        try:
+            return parser(text)
+        except Exception as e:
+            continue
+    return datetime.now()
+
+
+def format_display_date(value=None):
+    dt = parse_display_datetime(value)
+    return f"{dt.strftime('%B')} - {dt.day}, {dt.year}"
+
+
+def format_display_time(value=None, seconds=False):
+    dt = parse_display_datetime(value)
+    fmt = "%I:%M:%S" if seconds else "%I:%M"
+    return f"{bengali_daypart(dt)} {dt.strftime(fmt)}"
+
+
+def format_display_datetime(value=None, seconds=False):
+    dt = parse_display_datetime(value)
+    return f"{format_display_date(dt)} | {format_display_time(dt, seconds=seconds)}"
+
+
+def stable_uid(prefix, *parts):
+    raw = "|".join(str(p) for p in parts if p is not None)
+    return f"{prefix}_{hashlib.sha1(raw.encode('utf-8', 'ignore')).hexdigest()[:24]}"
+
+
+def acquire_single_instance_lock():
+    global BOT_LOCK_HANDLE
+    lock_path = RUNTIME_DIR / "bot.lock"
+    BOT_LOCK_HANDLE = lock_path.open("w", encoding="utf-8")
+    try:
+        import fcntl
+
+        fcntl.flock(BOT_LOCK_HANDLE, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        BOT_LOCK_HANDLE.seek(0)
+        BOT_LOCK_HANDLE.truncate()
+        BOT_LOCK_HANDLE.write(str(os.getpid()))
+        BOT_LOCK_HANDLE.flush()
+    except BlockingIOError:
+        raise RuntimeError("Another Royells bot instance is already running. Stop old bot process first.")
+    except ImportError:
+        # Windows/local syntax checks do not have fcntl.
+        pass
+
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/health", "/ping"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            runtime_total, runtime_used, runtime_free = shutil.disk_usage(str(RUNTIME_DIR))
+            data_total, data_used, data_free = shutil.disk_usage(str(DATA_DIR))
+            disk = {
+                "runtime_free_mb": runtime_free // (1024 * 1024),
+                "runtime_used_mb": runtime_used // (1024 * 1024),
+                "runtime_total_mb": runtime_total // (1024 * 1024),
+                "data_free_mb": data_free // (1024 * 1024),
+                "data_used_mb": data_used // (1024 * 1024),
+                "data_total_mb": data_total // (1024 * 1024),
+            }
+        except Exception:
+            disk = {}
+        with contextlib.suppress(Exception):
+            subs, posted = get_db_stats()
+        body_obj = {
+            "ok": True,
+            "name": "royells",
+            "target": "huggingface" if IS_HUGGINGFACE_SPACE else "local",
+            "uptime": uptime(),
+            "memory_mb": current_memory_mb(),
+            "cpu_cores": os.getenv("CPU_CORES", ""),
+            "workers": {
+                "bot": WORKERS,
+                "download": DOWNLOAD_WORKERS,
+                "upload": UPLOAD_WORKERS,
+                "link": LINK_WORKERS,
+                "telegram_api_concurrency": TELEGRAM_API_CONCURRENCY,
+            },
+            "queue": {
+                "download": channel_download_queue.qsize(),
+                "upload": upload_queue.qsize(),
+                "link": link_process_queue.qsize(),
+            },
+            "disk": disk,
+            "guard": last_source_guard,
+            "sync": last_auto_sync,
+            "posts": {
+                "runtime_uploaded": auto_count,
+                "db_posted": locals().get("posted", 0),
+                "subscribers": locals().get("subs", 0),
+            },
+        }
+        if self.path == "/":
+            html_body = (
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                "<title>Royells Bot</title></head>"
+                "<body style='font-family:system-ui,Arial,sans-serif;margin:32px'>"
+                "<h1>Royells Bot</h1>"
+                "<p>Status: running</p>"
+                f"<p>Uptime: {html.escape(str(body_obj.get('uptime', '')))}</p>"
+                f"<p>Queue: D{body_obj['queue']['download']} U{body_obj['queue']['upload']} L{body_obj['queue']['link']}</p>"
+                f"<p>Guard: {html.escape(str(body_obj.get('guard', {}).get('status', '')))}</p>"
+                "<p>Health JSON: <a href='/health'>/health</a></p>"
+                "</body></html>"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html_body)))
+            self.end_headers()
+            self.wfile.write(html_body)
+            return
+        body = json.dumps(
+            body_obj,
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path not in ("/queue", "/task"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        if HTTP_TASK_HANDLER is None:
+            self._send_json(503, {"ok": False, "error": "queue handler not registered"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except Exception:
+            length = 0
+        if length <= 0 or length > 128 * 1024:
+            self._send_json(413, {"ok": False, "error": "invalid request size"})
+            return
+        try:
+            raw_body = self.rfile.read(length)
+            payload = json.loads(raw_body.decode("utf-8"))
+        except Exception as e:
+            self._send_json(400, {"ok": False, "error": f"invalid json: {str(e)[:120]}"})
+            return
+        if WORKER_QUEUE_SECRET:
+            provided = self.headers.get("X-Royells-Secret") or payload.get("secret")
+            if provided != WORKER_QUEUE_SECRET:
+                self._send_json(403, {"ok": False, "error": "invalid queue secret"})
+                return
+        try:
+            result = HTTP_TASK_HANDLER(payload, self.headers)
+            if not isinstance(result, dict):
+                result = {"ok": bool(result)}
+            self._send_json(200 if result.get("ok", True) else 409, result)
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)[:500]})
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        return
+
+
+def start_keepalive_http_server():
+    global KEEPALIVE_HTTP_SERVER
+    if not INTERNAL_HTTP_CAN_BIND_PORT:
+        log_event("Keepalive HTTP server skipped: host app owns the public web port.")
+        return
+    if not KEEPALIVE_HTTP_ENABLED or KEEPALIVE_HTTP_SERVER:
+        return
+    try:
+        KEEPALIVE_HTTP_SERVER = ThreadingHTTPServer(("0.0.0.0", KEEPALIVE_HTTP_PORT), KeepAliveHandler)
+        thread = threading.Thread(target=KEEPALIVE_HTTP_SERVER.serve_forever, name="royells-health-http", daemon=True)
+        thread.start()
+        log_event(f"Keepalive HTTP server ready on port {KEEPALIVE_HTTP_PORT}.")
+    except Exception as e:
+        log_event(f"Keepalive HTTP server failed: {e}")
+
+
+def stop_keepalive_http_server():
+    global KEEPALIVE_HTTP_SERVER
+    if not KEEPALIVE_HTTP_SERVER:
+        return
+    with contextlib.suppress(Exception):
+        KEEPALIVE_HTTP_SERVER.shutdown()
+        KEEPALIVE_HTTP_SERVER.server_close()
+    KEEPALIVE_HTTP_SERVER = None
+
+
+async def wait_for_shutdown_signal():
+    """Keep Pyrogram alive without installing signal handlers from a host thread."""
+    if threading.current_thread() is threading.main_thread():
+        await idle()
+        return
+    log_event("Background host thread detected; using asyncio wait instead of Pyrogram idle signal handlers.")
+    await asyncio.Event().wait()
+
+
+def choose_data_dir():
+    candidates = []
+    env_dir = os.getenv("ROYELLS_DATA_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+    if IS_HUGGINGFACE_SPACE:
+        candidates.append(Path("/data") / DATA_FOLDER_NAME)
+
+    # Visible in Android file managers when shared storage is mounted.
+    candidates.append(Path.home() / "storage" / "shared" / DATA_FOLDER_NAME)
+    candidates.append(Path.cwd() / DATA_FOLDER_NAME)
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            test_file = candidate / ".write_test"
+            test_file.write_text("ok", encoding="utf-8")
+            test_file.unlink(missing_ok=True)
+            return candidate
+        except Exception as e:
+            continue
+
+    fallback = Path.cwd() / DATA_FOLDER_NAME
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def choose_runtime_dir():
+    env_dir = os.getenv("ROYELLS_RUNTIME_DIR")
+    candidates = []
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+    if IS_HUGGINGFACE_SPACE:
+        candidates.append(Path("/data") / DATA_FOLDER_NAME / "runtime")
+
+    # Keep SQLite/session runtime away from Android shared storage.
+    # /storage/shared often breaks SQLite file locking.
+    candidates.append(Path.home() / ".royells_media_bot_runtime")
+    candidates.append(Path.cwd() / ".royells_media_bot_runtime")
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            test_file = candidate / ".write_test"
+            test_file.write_text("ok", encoding="utf-8")
+            test_file.unlink(missing_ok=True)
+            return candidate
+        except Exception:
+            continue
+
+    fallback = Path.cwd() / ".royells_media_bot_runtime"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+DATA_DIR = choose_data_dir()
+RUNTIME_DIR = choose_runtime_dir()
+DOWNLOAD_DIR = RUNTIME_DIR / "downloads"
+STATE_DIR = RUNTIME_DIR / "state"
+LOG_FILE = RUNTIME_DIR / "bot.log"
+DB_FILE = RUNTIME_DIR / "royells.db"
+RUNTIME_CHECKPOINT_FILE = RUNTIME_DIR / "runtime_checkpoint.json"
+RUNTIME_CHECKPOINT_PREVIOUS_FILE = RUNTIME_DIR / "runtime_checkpoint.previous.json"
+DELIVERY_INTENT_FILE = RUNTIME_DIR / "delivery_intents.json"
+DELIVERY_INTENT_PREVIOUS_FILE = RUNTIME_DIR / "delivery_intents.previous.json"
+LEGACY_SHARED_DB_FILE = DATA_DIR / "royells.db"
+BACKUP_DIR = DATA_DIR / "backups"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+bootstrap_log(f"runtime folders ready: {RUNTIME_DIR}")
+
+
+def purge_local_session_files(reason="startup"):
+    """Remove restored userbot session files when env credentials are authoritative.
+
+    Bot-token sessions are intentionally preserved by default. Deleting the bot
+    session on every Hugging Face restart forces Telegram auth.ImportBotAuthorization
+    repeatedly and can trigger multi-minute FloodWait loops.
+    """
+    if not env_bool("ROYELLS_PURGE_RESTORED_SESSION_FILES", True):
+        return 0
+    if not (USER_SESSION_STRING or IS_HUGGINGFACE_SPACE):
+        return 0
+    purge_bot_session = env_bool("ROYELLS_PURGE_BOT_SESSION_FILES", False)
+    removed = 0
+    for root in (RUNTIME_DIR, DATA_DIR):
+        with contextlib.suppress(Exception):
+            for path in root.glob("*.session*"):
+                if path.is_file():
+                    name = path.name
+                    if not purge_bot_session and name.startswith(f"{SESSION_NAME}.session"):
+                        continue
+                    if USER_SESSION_STRING and not name.startswith(f"{USER_SESSION}.session") and not purge_bot_session:
+                        continue
+                    path.unlink(missing_ok=True)
+                    removed += 1
+    if removed:
+        bootstrap_log(f"purged {removed} restored session file(s) before Telegram start: {reason}")
+    return removed
+
+
+purge_local_session_files("pre-client")
+
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+if not any(isinstance(handler, RotatingFileHandler) for handler in _root_logger.handlers):
+    _rotating_handler = RotatingFileHandler(
+        str(LOG_FILE),
+        maxBytes=max(1, env_int("ROYELLS_LOG_MAX_MB", "20")) * 1024 * 1024,
+        backupCount=max(1, env_int("ROYELLS_LOG_BACKUP_COUNT", "5")),
+        encoding="utf-8",
+    )
+    _rotating_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    _root_logger.addHandler(_rotating_handler)
+
+bootstrap_log("creating Telegram client objects")
+
+app = Client(
+    SESSION_NAME,
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workers=WORKERS,
+    workdir=str(RUNTIME_DIR),
+    ipv6=False,
+    max_concurrent_transmissions=MAX_CONCURRENT_TRANSMISSIONS,
+)
+
+bootstrap_log("Telegram client objects created")
+userbot = Client(
+    USER_SESSION,
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=USER_SESSION_STRING or None,
+    workdir=str(RUNTIME_DIR),
+    ipv6=False,
+    max_concurrent_transmissions=MAX_CONCURRENT_TRANSMISSIONS,
+)
+
+class FairJobQueue:
+    """Bounded weighted-fair queue; late healthy sources can overtake a source backlog."""
+
+    def __init__(self, maxsize, name="fair"):
+        self.name = str(name or "fair")
+        self.maxsize = max(1, int(maxsize))
+        self._queue = asyncio.PriorityQueue(maxsize=self.maxsize)
+        self._source_finish = {}
+        self._served_floor = 0.0
+        self._sequence = itertools.count()
+
+    @staticmethod
+    def _source_key(job):
+        source = str((job or {}).get("source") or "unknown")
+        messages = (job or {}).get("messages") or []
+        chat_id = ""
+        if messages:
+            chat_id = str(getattr(getattr(messages[0], "chat", None), "id", "") or "")
+        return f"{source}:{chat_id or (job or {}).get('ch_name', '')}"
+
+    @staticmethod
+    def _cost(job):
+        count = max(1, len((job or {}).get("messages") or []))
+        source = str((job or {}).get("source") or "")
+        weight = 4.0 if source == "telegram_link" else 1.0
+        return min(10.0, float(count)) / weight
+
+    def _entry(self, job):
+        key = self._source_key(job)
+        finish = max(float(self._source_finish.get(key, 0.0)), self._served_floor) + self._cost(job)
+        self._source_finish[key] = finish
+        return finish, next(self._sequence), job
+
+    async def put(self, job):
+        await self._queue.put(self._entry(job))
+        mark_runtime_checkpoint_dirty(f"{self.name} queue put")
+
+    def put_nowait(self, job):
+        self._queue.put_nowait(self._entry(job))
+        mark_runtime_checkpoint_dirty(f"{self.name} queue put")
+
+    async def get(self):
+        finish, _sequence, job = await self._queue.get()
+        self._served_floor = max(self._served_floor, float(finish))
+        if len(self._source_finish) > 10000:
+            cutoff = self._served_floor - 100.0
+            self._source_finish = {key: value for key, value in self._source_finish.items() if value >= cutoff}
+        mark_runtime_checkpoint_dirty(f"{self.name} queue get")
+        return job
+
+    def qsize(self):
+        return self._queue.qsize()
+
+    def empty(self):
+        return self._queue.empty()
+
+    def full(self):
+        return self._queue.full()
+
+    def task_done(self):
+        self._queue.task_done()
+
+    async def join(self):
+        await self._queue.join()
+
+    def job_ids(self):
+        return {
+            str((entry[2] or {}).get("job_id") or "")
+            for entry in list(self._queue._queue)
+            if len(entry) >= 3 and (entry[2] or {}).get("job_id")
+        }
+
+    def checkpoint_entries(self):
+        return [
+            {
+                "finish": float(entry[0]),
+                "sequence": int(entry[1]),
+                "job": serialize_runtime_job(entry[2]),
+            }
+            for entry in sorted(list(self._queue._queue), key=lambda item: (item[0], item[1]))
+            if len(entry) >= 3 and isinstance(entry[2], dict)
+        ]
+
+    def restore_checkpoint_entry(self, job, finish=None, sequence=None):
+        if self.full():
+            raise asyncio.QueueFull
+        if finish is None or sequence is None:
+            self.put_nowait(job)
+            return
+        finish = float(finish)
+        sequence = int(sequence)
+        self._queue.put_nowait((finish, sequence, job))
+        self._source_finish[self._source_key(job)] = max(
+            float(self._source_finish.get(self._source_key(job), 0.0)),
+            finish,
+        )
+        self._served_floor = max(self._served_floor, finish)
+        self._sequence = itertools.count(max(sequence + 1, next(self._sequence)))
+        mark_runtime_checkpoint_dirty(f"{self.name} queue checkpoint restore")
+
+
+channel_download_queue = FairJobQueue(maxsize=max(1, env_int("ROYELLS_DOWNLOAD_QUEUE_LIMIT", str(MAIN_LOCAL_QUEUE_HARD_LIMIT))), name="download")
+upload_queue = FairJobQueue(maxsize=max(1, env_int("ROYELLS_UPLOAD_QUEUE_LIMIT", "4" if E2_MICRO_SAFE_PROFILE else str(MAIN_LOCAL_QUEUE_HARD_LIMIT))), name="upload")
+button_queue = asyncio.Queue(maxsize=max(10, env_int("ROYELLS_BUTTON_QUEUE_LIMIT", "200")))
+link_process_queue = asyncio.Queue(maxsize=max(10, env_int("ROYELLS_LINK_QUEUE_LIMIT", "100")))
+job_state_db_queue = asyncio.Queue(maxsize=max(100, env_int("ROYELLS_JOB_STATE_DB_QUEUE_LIMIT", "5000")))
+critical_db_write_queue = asyncio.Queue(maxsize=max(100, env_int("ROYELLS_CRITICAL_DB_WRITE_QUEUE_LIMIT", "5000")))
+DB_WRITE_BATCH_SIZE = max(1, min(500, env_int("ROYELLS_DB_WRITE_BATCH_SIZE", "100")))
+retry_admission_queue = asyncio.PriorityQueue(maxsize=max(100, env_int("ROYELLS_RETRY_QUEUE_LIMIT", "5000")))
+RETRY_SEQUENCE = itertools.count()
+RETRY_GENERATIONS = {}
+RETRY_LOCK = asyncio.Lock()
+
+
+def retry_key(queue_name, job):
+    return f"{queue_name}:{(job or {}).get('job_id') or (job or {}).get('url') or id(job)}"
+
+
+def schedule_queue_retry(queue_name, job, delay_seconds=0, reason=""):
+    key = retry_key(queue_name, job)
+    generation = int(RETRY_GENERATIONS.get(key, 0)) + 1
+    RETRY_GENERATIONS[key] = generation
+    due = time.monotonic() + max(0, float(delay_seconds))
+    entry = (due, next(RETRY_SEQUENCE), key, generation, queue_name, job, str(reason)[:300])
+    try:
+        retry_admission_queue.put_nowait(entry)
+        mark_runtime_checkpoint_dirty(f"retry scheduled {key}")
+        return True
+    except asyncio.QueueFull:
+        RETRY_GENERATIONS.pop(key, None)
+        log_event(f"Retry admission full; persisted for recovery: {key}")
+        return False
+
+
+async def retry_scheduler_loop():
+    while True:
+        entry = await retry_admission_queue.get()
+        try:
+            due, _seq, key, generation, queue_name, job, reason = entry
+            while True:
+                remaining = due - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(1.0, remaining))
+            if RETRY_GENERATIONS.get(key) != generation:
+                continue
+            if queue_name == "download":
+                target = channel_download_queue
+            elif queue_name == "link":
+                target = link_process_queue
+            else:
+                target = upload_queue
+            if target.full():
+                # Never block a worker or this scheduler on a full bounded queue.
+                retry_admission_queue.put_nowait((time.monotonic() + 2.0, next(RETRY_SEQUENCE), key, generation, queue_name, job, reason))
+                continue
+            stamp_queue_job(job, queue_name)
+            target.put_nowait(job)
+            RETRY_GENERATIONS.pop(key, None)
+            mark_runtime_checkpoint_dirty(f"retry admitted {key}")
+            log_event(f"Retry admitted: {key} reason={reason[:120]}")
+        except asyncio.CancelledError:
+            raise
+        except asyncio.QueueFull:
+            await asyncio.sleep(1)
+            with contextlib.suppress(asyncio.QueueFull):
+                retry_admission_queue.put_nowait(entry)
+        except Exception as exc:
+            log_event(f"Retry scheduler error: {exc}")
+        finally:
+            retry_admission_queue.task_done()
+            await asyncio.sleep(0)
+
+
+def default_state(name):
+    base = {"version": 2, "created_at": now_iso(), "updated_at": now_iso()}
+    if name == "channel_manager":
+        base.update({"channels": {}, "events": []})
+    elif name == "manage_subscribe":
+        base.update({"users": {}, "events": []})
+    elif name == "sync_source_manager":
+        base.update({"runs": {}, "items": {}, "cursors": {}, "guard_events": [], "startup_hot_scan": {}})
+    elif name == "download_queue":
+        base.update({"items": {}})
+    elif name == "upload_queue":
+        base.update({"items": {}})
+    elif name == "total_auto_upload":
+        base.update({"total_uploaded": 0, "items": {}, "events": []})
+    elif name == "subscriptions_list":
+        base.update({"active": {}, "expired": {}, "banned": {}, "removed": {}})
+    elif name == "clean_duplicate":
+        base.update({"items": {}, "target_messages": {}, "events": []})
+    elif name == "target_media_index":
+        base.update({"items": {}, "target_messages": {}, "events": [], "last_full_scan": ""})
+    elif name == "dead_media":
+        base.update({"items": {}, "source_counts": {}, "events": []})
+    elif name == "worker_queue":
+        base.update({"items": {}, "events": []})
+    elif name == "runtime_config":
+        base.update({"workers": {}, "queue": {}, "control": {}, "events": []})
+    return base
+
+
+STATE_FILES = {
+    "channel_manager": STATE_DIR / "channel_manager.json",
+    "manage_subscribe": STATE_DIR / "manage_subscribe.json",
+    "sync_source_manager": STATE_DIR / "sync_source_manager.json",
+    "download_queue": STATE_DIR / "download_queue.json",
+    "upload_queue": STATE_DIR / "upload_queue.json",
+    "total_auto_upload": STATE_DIR / "total_auto_upload.json",
+    "subscriptions_list": STATE_DIR / "subscriptions_list.json",
+    "clean_duplicate": STATE_DIR / "clean_duplicate.json",
+    "target_media_index": STATE_DIR / "target_media_index.json",
+    "dead_media": STATE_DIR / "dead_media.json",
+    "worker_queue": STATE_DIR / "worker_queue.json",
+    "runtime_config": STATE_DIR / "runtime_config.json",
+}
+STATE = {}
+
+
+def atomic_json_save(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    last_error = None
+    for _ in range(3):
+        try:
+            with tmp.open("w", encoding="utf-8", newline="\n") as f:
+                json.dump(data, f, ensure_ascii=True, separators=(",", ":"))
+                f.write("\n")
+                f.flush()
+                if JSON_FSYNC_ENABLED:
+                    os.fsync(f.fileno())
+            os.replace(tmp, path)
+            return
+        except OSError as e:
+            last_error = e
+            with contextlib.suppress(Exception):
+                tmp.unlink(missing_ok=True)
+            time.sleep(0.2)
+    raise last_error
+
+
+def canonical_json_bytes(data):
+    return json.dumps(
+        data,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _fsync_directory(path):
+    if os.name == "nt":
+        return
+    with contextlib.suppress(Exception):
+        fd = os.open(str(Path(path).parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def atomic_checkpoint_save(path, payload, sequence, previous_path=None):
+    """Write a checksummed generation without exposing a partial checkpoint."""
+    path = Path(path)
+    previous_path = Path(previous_path) if previous_path else None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    envelope = {
+        "schema_version": RUNTIME_CHECKPOINT_SCHEMA_VERSION,
+        "app_version": APP_VERSION,
+        "sequence": int(sequence),
+        "created_at": now_iso(),
+        "payload": payload,
+    }
+    envelope["checksum"] = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+    encoded = canonical_json_bytes(envelope) + b"\n"
+    if previous_path and path.exists():
+        try:
+            previous = load_checkpoint_envelope(path)
+            if previous is not None:
+                previous_path.parent.mkdir(parents=True, exist_ok=True)
+                previous_tmp = previous_path.with_suffix(previous_path.suffix + ".tmp")
+                with previous_tmp.open("wb") as handle:
+                    handle.write(path.read_bytes())
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(previous_tmp, previous_path)
+                _fsync_directory(previous_path)
+        except Exception:
+            pass
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with tmp.open("wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _fsync_directory(path)
+    finally:
+        with contextlib.suppress(Exception):
+            tmp.unlink(missing_ok=True)
+    return envelope
+
+
+def load_checkpoint_envelope(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(envelope, dict):
+            raise ValueError("checkpoint root is not an object")
+        schema = int(envelope.get("schema_version") or 0)
+        if not (RUNTIME_CHECKPOINT_MIN_SCHEMA_VERSION <= schema <= RUNTIME_CHECKPOINT_SCHEMA_VERSION):
+            raise ValueError(f"unsupported checkpoint schema {schema}")
+        payload = envelope.get("payload")
+        checksum = str(envelope.get("checksum") or "")
+        if not isinstance(payload, dict) or not checksum:
+            raise ValueError("checkpoint payload/checksum is missing")
+        actual = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+        if checksum != actual:
+            raise ValueError("checkpoint checksum mismatch")
+        created_at = parse_iso_timestamp(envelope.get("created_at"))
+        if created_at:
+            max_age = timedelta(days=max(1, int(RUNTIME_CHECKPOINT_MAX_AGE_DAYS)))
+            if datetime.now() - created_at > max_age:
+                raise ValueError("checkpoint is older than allowed retention")
+        return envelope
+    except Exception as exc:
+        if "log_event" in globals():
+            log_event(f"Runtime checkpoint rejected {path.name}: {str(exc)[:180]}")
+        else:
+            print(f"Runtime checkpoint rejected {path.name}: {exc}", flush=True)
+        return None
+
+
+def load_checkpoint_with_fallback(primary_path, previous_path):
+    primary = load_checkpoint_envelope(primary_path)
+    if primary is not None:
+        return primary, "primary"
+    previous = load_checkpoint_envelope(previous_path)
+    if previous is not None:
+        return previous, "previous"
+    return None, ""
+
+
+def load_json_state(name):
+    path = STATE_FILES[name]
+    default = default_state(name)
+    legacy_path = DATA_DIR / path.name
+    if not path.exists() and legacy_path.exists() and legacy_path.resolve() != path.resolve():
+        with contextlib.suppress(Exception):
+            shutil.copy2(str(legacy_path), str(path))
+            log_event(f"Migrated {name} state from shared storage to runtime state folder.")
+    if not path.exists():
+        atomic_json_save(path, default)
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("state root is not an object")
+        changed = False
+        for key, value in default.items():
+            if key not in data:
+                data[key] = value
+                changed = True
+        if changed:
+            atomic_json_save(path, data)
+        return data
+    except Exception:
+        bad_path = path.with_suffix(path.suffix + f".bad_{int(time.time())}")
+        with contextlib.suppress(Exception):
+            path.rename(bad_path)
+        snapshot = latest_backup_dir()
+        backup_path = snapshot / backup_relative_path(path) if snapshot else None
+        if backup_path and backup_path.exists():
+            try:
+                with backup_path.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    atomic_json_save(path, data)
+                    log_event(f"Restored JSON state backup for {name}.")
+                    return data
+            except Exception as e:
+                log_event(f"JSON backup restore failed for {name}: {e}")
+        atomic_json_save(path, default)
+        return default
+
+
+def init_state_files():
+    with state_mutex:
+        for name in STATE_FILES:
+            STATE[name] = load_json_state(name)
+
+
+def _write_state_snapshot(name, snapshot):
+    atomic_json_save(STATE_FILES[name], snapshot)
+
+
+def snapshot_state_for_writer(name):
+    """Capture large index maps briefly, then deepcopy outside the shared lock."""
+    with state_mutex:
+        current = STATE[name]
+        if name not in {"target_media_index", "clean_duplicate"}:
+            return deepcopy(current)
+        header = {key: deepcopy(value) for key, value in current.items() if key not in {"items", "target_messages"}}
+        item_pairs = list(current.get("items", {}).items())
+        target_pairs = list(current.get("target_messages", {}).items())
+    header["items"] = {key: deepcopy(value) for key, value in item_pairs}
+    header["target_messages"] = dict(target_pairs)
+    return header
+
+
+def _queue_state_name_locked(name):
+    if name in STATE_SAVE_QUEUED or name in STATE_SAVE_INFLIGHT:
+        return
+    STATE_SAVE_QUEUED.add(name)
+    STATE_SAVE_QUEUE.put_nowait(name)
+
+
+def _state_save_worker():
+    global STATE_SAVE_THREAD
+    try:
+        while True:
+            try:
+                name = STATE_SAVE_QUEUE.get(timeout=0.5)
+            except queue.Empty:
+                if STATE_SAVE_STOP.is_set():
+                    with STATE_SAVE_CONDITION:
+                        if not STATE_SAVE_QUEUED and not STATE_SAVE_INFLIGHT:
+                            break
+                continue
+            if name is None:
+                STATE_SAVE_QUEUE.task_done()
+                if STATE_SAVE_STOP.is_set():
+                    break
+                continue
+            with STATE_SAVE_CONDITION:
+                STATE_SAVE_QUEUED.discard(name)
+                target_version = int(STATE_SAVE_REQUESTED.get(name, 0))
+                STATE_SAVE_INFLIGHT[name] = target_version
+            snapshot = None
+            last_error = None
+            for attempt in range(8):
+                try:
+                    # Snapshot in the persistence thread under the state lock. This prevents
+                    # dictionary-size races while keeping deepcopy/JSON I/O off the event loop.
+                    snapshot = snapshot_state_for_writer(name)
+                    last_error = None
+                    break
+                except (RuntimeError, KeyError) as exc:
+                    last_error = exc
+                    time.sleep(min(0.25, 0.01 * (attempt + 1)))
+            try:
+                if snapshot is None:
+                    raise RuntimeError(f"state snapshot failed for {name}: {last_error}")
+                _write_state_snapshot(name, snapshot)
+                with STATE_SAVE_CONDITION:
+                    STATE_SAVE_PERSISTED[name] = max(int(STATE_SAVE_PERSISTED.get(name, 0)), target_version)
+            except Exception as exc:
+                log_event(f"State writer failed for {name} v{target_version}: {exc}")
+            finally:
+                with STATE_SAVE_CONDITION:
+                    STATE_SAVE_INFLIGHT.pop(name, None)
+                    if int(STATE_SAVE_REQUESTED.get(name, 0)) > int(STATE_SAVE_PERSISTED.get(name, 0)):
+                        _queue_state_name_locked(name)
+                    STATE_SAVE_CONDITION.notify_all()
+                STATE_SAVE_QUEUE.task_done()
+    finally:
+        with STATE_SAVE_CONDITION:
+            STATE_SAVE_THREAD = None
+            STATE_SAVE_CONDITION.notify_all()
+
+
+def start_state_save_worker():
+    global STATE_SAVE_THREAD
+    previous = None
+    with STATE_SAVE_CONDITION:
+        if STATE_SAVE_THREAD and STATE_SAVE_THREAD.is_alive() and not STATE_SAVE_STOP.is_set():
+            return True
+        previous = STATE_SAVE_THREAD if STATE_SAVE_THREAD and STATE_SAVE_THREAD.is_alive() else None
+        STATE_SAVE_STOP.clear()
+    if previous:
+        previous.join(timeout=5)
+    with STATE_SAVE_CONDITION:
+        if STATE_SAVE_THREAD and STATE_SAVE_THREAD.is_alive():
+            return True
+        STATE_SAVE_THREAD = threading.Thread(target=_state_save_worker, name="royells-state-writer", daemon=False)
+        STATE_SAVE_THREAD.start()
+        for name in STATE_SAVE_REQUESTED:
+            if int(STATE_SAVE_REQUESTED.get(name, 0)) > int(STATE_SAVE_PERSISTED.get(name, 0)):
+                _queue_state_name_locked(name)
+    return True
+
+
+def flush_state_saves(timeout=30):
+    deadline = time.monotonic() + max(0.1, timeout)
+    with STATE_SAVE_CONDITION:
+        while True:
+            complete = (
+                all(int(STATE_SAVE_PERSISTED.get(name, 0)) >= int(version) for name, version in STATE_SAVE_REQUESTED.items())
+                and not STATE_SAVE_QUEUED
+                and not STATE_SAVE_INFLIGHT
+            )
+            if complete:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            STATE_SAVE_CONDITION.wait(timeout=min(0.25, remaining))
+
+
+def stop_state_save_worker(timeout=30):
+    global STATE_SAVE_THREAD
+    flushed = flush_state_saves(timeout=max(1, timeout * 0.75))
+    with STATE_SAVE_CONDITION:
+        STATE_SAVE_STOP.set()
+        thread = STATE_SAVE_THREAD
+    STATE_SAVE_QUEUE.put_nowait(None)
+    if thread:
+        thread.join(timeout=max(1, timeout * 0.25))
+    with STATE_SAVE_CONDITION:
+        stopped = not (STATE_SAVE_THREAD and STATE_SAVE_THREAD.is_alive())
+    return bool(flushed and stopped)
+
+
+def save_state(name):
+    # O(1) event-loop path: mutation version only. Snapshot and JSON I/O are writer-thread work.
+    with state_mutex:
+        STATE[name]["updated_at"] = now_iso()
+    mark_runtime_checkpoint_dirty(f"state {name}")
+    with STATE_SAVE_CONDITION:
+        version = int(STATE_SAVE_REQUESTED.get(name, 0)) + 1
+        STATE_SAVE_REQUESTED[name] = version
+        if not (STATE_SAVE_THREAD and STATE_SAVE_THREAD.is_alive() and not STATE_SAVE_STOP.is_set()):
+            start_needed = True
+        else:
+            start_needed = False
+            _queue_state_name_locked(name)
+    if start_needed:
+        start_state_save_worker()
+        with STATE_SAVE_CONDITION:
+            _queue_state_name_locked(name)
+    return version
+
+
+def is_backup_excluded_file(path):
+    p = Path(path)
+    name = p.name.lower()
+    parts = {part.lower() for part in p.parts}
+    if name == "bot.log" or ".session" in name:
+        return True
+    if name.endswith((".tmp", ".temp", ".cache", ".lock", "-journal", "-wal", "-shm")):
+        return True
+    if "downloads" in parts or "__pycache__" in parts:
+        return True
+    return False
+
+
+def managed_state_files():
+    files = set(STATE_FILES.values())
+    files.update(
+        {
+            DB_FILE,
+            RUNTIME_CHECKPOINT_FILE,
+            RUNTIME_CHECKPOINT_PREVIOUS_FILE,
+            DELIVERY_INTENT_FILE,
+            DELIVERY_INTENT_PREVIOUS_FILE,
+        }
+    )
+    return [
+        p
+        for p in files
+        if p
+        and p.exists()
+        and p.is_file()
+        and not is_backup_excluded_file(p)
+    ]
+
+
+def managed_archive_files():
+    """Return essential non-DB files for portable restore archives; logs/downloads are intentionally excluded."""
+    files = set(STATE_FILES.values())
+    files.update(
+        {
+            RUNTIME_CHECKPOINT_FILE,
+            RUNTIME_CHECKPOINT_PREVIOUS_FILE,
+            DELIVERY_INTENT_FILE,
+            DELIVERY_INTENT_PREVIOUS_FILE,
+        }
+    )
+    return [
+        p
+        for p in files
+        if p
+        and p.exists()
+        and p.is_file()
+        and not is_backup_excluded_file(p)
+    ]
+
+
+def backup_relative_path(path):
+    path = Path(path).resolve()
+    for root_name, root in (("runtime", RUNTIME_DIR.resolve()), ("data", DATA_DIR.resolve())):
+        with contextlib.suppress(ValueError):
+            return Path(root_name) / path.relative_to(root)
+    return Path("misc") / path.name
+
+
+def copy_file_atomic(src, dst):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    shutil.copy2(str(src), str(tmp))
+    os.replace(tmp, dst)
+
+
+def sqlite_sidecar_paths(path):
+    """Return transient SQLite files that must never survive a DB replacement."""
+    db_path = Path(path)
+    return [Path(str(db_path) + suffix) for suffix in ("-wal", "-shm", "-journal")]
+
+
+def remove_sqlite_sidecars(path):
+    removed = 0
+    for sidecar in sqlite_sidecar_paths(path):
+        try:
+            if sidecar.exists():
+                sidecar.unlink()
+                removed += 1
+        except Exception as exc:
+            log_event(f"SQLite sidecar cleanup failed for {sidecar.name}: {str(exc)[:140]}")
+    return removed
+
+
+def sqlite_integrity_status(path):
+    db_path = Path(path)
+    if not db_path.exists():
+        return "missing"
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=30.0)
+        result = conn.execute("PRAGMA integrity_check;").fetchone()
+        return str(result[0]) if result else "unknown"
+    except Exception as exc:
+        return f"error: {str(exc)[:120]}"
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+
+
+def sqlite_integrity_ok(path):
+    return sqlite_integrity_status(path) == "ok"
+
+
+def is_sqlite_corruption_error(error):
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "database disk image is malformed",
+            "database corruption",
+            "database corrupt",
+            "file is not a database",
+            "malformed database schema",
+        )
+    )
+
+
+def restore_file_tree(snapshot_dir):
+    restored = 0
+    for root_name, root in (("runtime", RUNTIME_DIR), ("data", DATA_DIR)):
+        source_root = snapshot_dir / root_name
+        if not source_root.exists():
+            continue
+        for src in source_root.rglob("*"):
+            if not src.is_file():
+                continue
+            if is_backup_excluded_file(src):
+                continue
+            dst = root / src.relative_to(source_root)
+            if dst.exists():
+                continue
+            with contextlib.suppress(Exception):
+                if dst == DB_FILE:
+                    remove_sqlite_sidecars(DB_FILE)
+                copy_file_atomic(src, dst)
+                restored += 1
+    return restored
+
+
+def latest_backup_dir():
+    latest = BACKUP_DIR / "latest"
+    if latest.exists():
+        return latest
+    snapshots = sorted([p for p in BACKUP_DIR.glob("snapshot_*") if p.is_dir()])
+    return snapshots[-1] if snapshots else None
+
+
+def restore_state_backup_if_needed():
+    snapshot = latest_backup_dir()
+    if not snapshot:
+        return 0
+    return restore_file_tree(snapshot)
+
+
+def db_integrity_ok():
+    if not DB_FILE.exists():
+        return True
+    return sqlite_integrity_ok(DB_FILE)
+
+
+def db_integrity_status():
+    return sqlite_integrity_status(DB_FILE)
+
+
+def log_db_startup_status():
+    size_mb = 0.0
+    with contextlib.suppress(Exception):
+        size_mb = DB_FILE.stat().st_size / (1024 * 1024)
+    counts = {}
+    try:
+        with db_mutex:
+            conn = db_connect()
+            for table in ("posted", "target_media", "target_media_full_index", "channels", "subscriptions", "dead_media", "media_job_state"):
+                with contextlib.suppress(Exception):
+                    counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            conn.close()
+    except Exception as e:
+        counts["error"] = str(e)[:120]
+    log_event(
+        "DB startup status: "
+        f"path={DB_FILE} | size={size_mb:.2f} MB | integrity={db_integrity_status()} | counts={counts}"
+    )
+
+
+def load_source_link_report_config():
+    global SOURCE_LINK_REPORT_CHAT_ID
+    with state_mutex:
+        saved = STATE["sync_source_manager"].get("source_link_report_chat_id")
+    if saved not in (None, ""):
+        SOURCE_LINK_REPORT_CHAT_ID = normalize_channel_id(saved) if str(saved) != "0" else 0
+    return SOURCE_LINK_REPORT_CHAT_ID
+
+
+def save_source_link_report_config(chat_id, title="", source_link="", username=""):
+    global SOURCE_LINK_REPORT_CHAT_ID
+    norm = normalize_channel_id(chat_id) if chat_id else 0
+    norm_text = str(norm)
+    target_text = str(normalize_channel_id(TARGET_CHAT_ID)) if TARGET_CHAT_ID else ""
+    queue_text = str(normalize_channel_id(WORKER_QUEUE_GROUP_ID)) if WORKER_QUEUE_GROUP_ID else ""
+    if norm and norm_text == target_text:
+        raise ValueError("Target channel cannot be used as source-link report channel.")
+    if norm and queue_text and norm_text == queue_text:
+        raise ValueError("Worker queue group cannot be used as source-link report channel.")
+    SOURCE_LINK_REPORT_CHAT_ID = norm
+    with state_mutex:
+        STATE["sync_source_manager"]["source_link_report_chat_id"] = str(norm or 0)
+        STATE["sync_source_manager"]["source_link_report_title"] = title or ""
+        STATE["sync_source_manager"]["source_link_report_link"] = source_link or ""
+        STATE["sync_source_manager"]["source_link_report_username"] = username or ""
+        STATE["sync_source_manager"]["source_link_report_updated_at"] = now_iso()
+        save_state("sync_source_manager")
+    log_event(f"Source link report channel set to {norm or 'disabled'} ({title or 'no title'}).")
+    return norm
+
+
+def get_source_link_report_config():
+    with state_mutex:
+        manager = STATE["sync_source_manager"]
+        return {
+            "chat_id": str(SOURCE_LINK_REPORT_CHAT_ID or manager.get("source_link_report_chat_id") or "0"),
+            "title": manager.get("source_link_report_title", ""),
+            "link": manager.get("source_link_report_link", ""),
+            "username": manager.get("source_link_report_username", ""),
+            "updated_at": manager.get("source_link_report_updated_at", ""),
+        }
+
+
+def repair_db_indexes_in_place(path=None):
+    db_path = Path(path or DB_FILE)
+    if not db_path.exists():
+        return False
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=60.0)
+        conn.execute("REINDEX")
+        conn.commit()
+        result = conn.execute("PRAGMA integrity_check;").fetchone()
+        return bool(result and result[0] == "ok")
+    except Exception as exc:
+        log_event(f"SQLite in-place index repair failed: {str(exc)[:180]}")
+        return False
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+
+
+def quarantine_sqlite_bundle(source_path, quarantined_path):
+    """Move a database and any matching WAL/SHM/journal files as one recovery bundle."""
+    source_path = Path(source_path)
+    quarantined_path = Path(quarantined_path)
+    moved = []
+    members = [(source_path, quarantined_path)]
+    members.extend(
+        (Path(str(source_path) + suffix), Path(str(quarantined_path) + suffix))
+        for suffix in ("-wal", "-shm", "-journal")
+    )
+    for source, destination in members:
+        if not source.exists():
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(source, destination)
+        except Exception:
+            shutil.copy2(source, destination)
+            source.unlink()
+        moved.append(destination)
+    return moved
+
+
+def quote_sqlite_identifier(value):
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def salvage_sqlite_table(source_conn, destination_conn, table_name, batch_size=256):
+    """Recover readable rowid ranges while skipping only pages SQLite cannot decode."""
+    table_sql = quote_sqlite_identifier(table_name)
+    source_columns = {
+        str(row[1])
+        for row in source_conn.execute(f"PRAGMA table_info({table_sql})").fetchall()
+    }
+    destination_columns = [
+        str(row[1])
+        for row in destination_conn.execute(f"PRAGMA table_info({table_sql})").fetchall()
+    ]
+    columns = [column for column in destination_columns if column in source_columns]
+    if not columns:
+        return 0, 0
+
+    quoted_columns = ", ".join(quote_sqlite_identifier(column) for column in columns)
+    placeholders = ", ".join("?" for _ in columns)
+    insert_sql = (
+        f"INSERT OR IGNORE INTO {table_sql} ({quoted_columns}) "
+        f"VALUES ({placeholders})"
+    )
+    bounds = source_conn.execute(
+        f"SELECT MIN(rowid), MAX(rowid) FROM {table_sql}"
+    ).fetchone()
+    if not bounds or bounds[0] is None or bounds[1] is None:
+        return 0, 0
+
+    recovered = 0
+    skipped = 0
+
+    def insert_rows(rows):
+        nonlocal recovered, skipped
+        try:
+            destination_conn.executemany(insert_sql, rows)
+            recovered += len(rows)
+            return
+        except Exception:
+            pass
+        for row in rows:
+            try:
+                destination_conn.execute(insert_sql, row)
+                recovered += 1
+            except Exception:
+                skipped += 1
+
+    def recover_range(start_rowid, end_rowid):
+        nonlocal skipped
+        if start_rowid > end_rowid:
+            return
+        try:
+            rows = source_conn.execute(
+                f"SELECT {quoted_columns} FROM {table_sql} "
+                "WHERE rowid BETWEEN ? AND ? ORDER BY rowid",
+                (start_rowid, end_rowid),
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            if start_rowid == end_rowid:
+                skipped += 1
+                return
+            midpoint = start_rowid + ((end_rowid - start_rowid) // 2)
+            recover_range(start_rowid, midpoint)
+            recover_range(midpoint + 1, end_rowid)
+            return
+        insert_rows(rows)
+
+    first_rowid, last_rowid = int(bounds[0]), int(bounds[1])
+    batch_size = max(32, int(batch_size))
+    for start_rowid in range(first_rowid, last_rowid + 1, batch_size):
+        recover_range(start_rowid, min(last_rowid, start_rowid + batch_size - 1))
+    return recovered, skipped
+
+
+def salvage_pending_database_rows(destination_conn):
+    global DB_PENDING_SALVAGE_SOURCES
+    if not DB_PENDING_SALVAGE_SOURCES:
+        return 0
+
+    tables = (
+        "posted",
+        "channels",
+        "subscriptions",
+        "target_media",
+        "target_media_full_index",
+        "dead_media",
+        "content_filter_hashes",
+        "media_job_state",
+    )
+    total_recovered = 0
+    total_skipped = 0
+    sources = list(dict.fromkeys(Path(path) for path in DB_PENDING_SALVAGE_SOURCES if path))
+    DB_PENDING_SALVAGE_SOURCES = []
+
+    for source_path in sources:
+        if not source_path.exists():
+            continue
+        source_conn = None
+        source_recovered = 0
+        source_skipped = 0
+        try:
+            source_conn = sqlite3.connect(str(source_path), timeout=30.0)
+            source_conn.execute("PRAGMA query_only=ON;")
+            for table_name in tables:
+                try:
+                    recovered, skipped = salvage_sqlite_table(
+                        source_conn,
+                        destination_conn,
+                        table_name,
+                    )
+                    source_recovered += recovered
+                    source_skipped += skipped
+                except Exception as exc:
+                    log_event(
+                        f"SQLite salvage skipped unreadable table {table_name} from "
+                        f"{source_path.name}: {str(exc)[:160]}"
+                    )
+            destination_conn.commit()
+        except Exception as exc:
+            log_event(f"SQLite salvage source could not be opened {source_path.name}: {str(exc)[:180]}")
+        finally:
+            if source_conn is not None:
+                with contextlib.suppress(Exception):
+                    source_conn.close()
+        total_recovered += source_recovered
+        total_skipped += source_skipped
+        log_event(
+            f"SQLite salvage source {source_path.name}: recovered={source_recovered}, "
+            f"unreadable_or_rejected={source_skipped}."
+        )
+
+    integrity = destination_conn.execute("PRAGMA integrity_check;").fetchone()
+    if not integrity or integrity[0] != "ok":
+        raise RuntimeError(f"rebuilt SQLite failed integrity after salvage: {integrity}")
+    log_event(
+        f"SQLite salvage complete: recovered={total_recovered}, "
+        f"unreadable_or_rejected={total_skipped}, integrity=ok."
+    )
+    return total_recovered
+
+
+def repair_db_from_backup_if_needed():
+    global DB_JOURNAL_INITIALIZED, DB_REQUIRES_TARGET_REINDEX, DB_PENDING_SALVAGE_SOURCES
+    if not DB_FILE.exists():
+        remove_sqlite_sidecars(DB_FILE)
+        DB_REQUIRES_TARGET_REINDEX = True
+        return False
+    if db_integrity_ok():
+        prune_db_recovery_artifacts()
+        return False
+    original_status = db_integrity_status()
+    if "index" in original_status.lower() and repair_db_indexes_in_place(DB_FILE):
+        log_event(f"DB index corruption repaired in place: {original_status}")
+        prune_db_recovery_artifacts()
+        return True
+    bad_path = DB_FILE.with_suffix(DB_FILE.suffix + f".corrupt_{int(time.time())}")
+    try:
+        quarantine_sqlite_bundle(DB_FILE, bad_path)
+    except Exception as exc:
+        log_event(f"SQLite corrupt bundle quarantine failed: {str(exc)[:180]}")
+        with contextlib.suppress(Exception):
+            shutil.copy2(DB_FILE, bad_path)
+            DB_FILE.unlink()
+    remove_sqlite_sidecars(DB_FILE)
+    DB_JOURNAL_INITIALIZED = False
+    snapshot = latest_backup_dir()
+    backup_db = snapshot / "runtime" / DB_FILE.name if snapshot else None
+    if backup_db and backup_db.exists() and sqlite_integrity_ok(backup_db):
+        copy_file_atomic(backup_db, DB_FILE)
+        remove_sqlite_sidecars(DB_FILE)
+        if not db_integrity_ok() and "index" in db_integrity_status().lower():
+            repair_db_indexes_in_place(DB_FILE)
+        if db_integrity_ok():
+            log_event(f"DB integrity failed; restored and validated backup DB from {backup_db}.")
+            prune_db_recovery_artifacts()
+            return True
+        restored_bad = DB_FILE.with_suffix(DB_FILE.suffix + f".restored_corrupt_{int(time.time())}")
+        with contextlib.suppress(Exception):
+            os.replace(DB_FILE, restored_bad)
+        remove_sqlite_sidecars(DB_FILE)
+        DB_REQUIRES_TARGET_REINDEX = True
+        DB_PENDING_SALVAGE_SOURCES = [bad_path, restored_bad]
+        prune_db_recovery_artifacts()
+        log_event(
+            f"Backup DB also failed integrity; quarantined as {restored_bad.name}. "
+            "A fresh DB will salvage every readable row from both recovery sources."
+        )
+        return False
+    if backup_db and backup_db.exists():
+        log_event(f"Backup DB failed validation and was not restored: {backup_db}.")
+    DB_REQUIRES_TARGET_REINDEX = True
+    DB_PENDING_SALVAGE_SOURCES = [bad_path]
+    if backup_db and backup_db.exists():
+        DB_PENDING_SALVAGE_SOURCES.append(backup_db)
+    prune_db_recovery_artifacts()
+    log_event(
+        "DB integrity failed; no valid backup DB found. "
+        "A fresh DB will salvage every readable row before normal startup."
+    )
+    return False
+
+
+def checkpoint_db_for_backup():
+    if not DB_FILE.exists():
+        return
+    conn = None
+    try:
+        conn = db_connect()
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+    except Exception as exc:
+        log_event(f"SQLite backup checkpoint skipped: {str(exc)[:140]}")
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+
+
+def prune_db_recovery_artifacts():
+    patterns = (
+        f"{DB_FILE.name}.corru*",
+        f"{DB_FILE.name}.restor*",
+        "royells_compact_*.db",
+    )
+    keep = max(1, DB_RECOVERY_ARTIFACT_KEEP)
+    for pattern in patterns:
+        files = sorted(
+            [path for path in RUNTIME_DIR.glob(pattern) if path.is_file()],
+            key=lambda path: path.stat().st_mtime,
+        )
+        for path in files[:-keep]:
+            with contextlib.suppress(Exception):
+                path.unlink()
+
+
+def create_compact_db_backup_copy():
+    if not DB_FILE.exists():
+        return None
+    checkpoint_db_for_backup()
+    compact_path = RUNTIME_DIR / f"royells_compact_backup_{uuid.uuid4().hex}.db"
+    try:
+        source_conn = sqlite3.connect(str(DB_FILE), timeout=60.0)
+        try:
+            dest_conn = sqlite3.connect(str(compact_path), timeout=60.0)
+            try:
+                source_conn.backup(dest_conn)
+                dest_conn.execute("PRAGMA optimize;")
+                dest_conn.commit()
+                dest_conn.execute("VACUUM;")
+                dest_conn.commit()
+            finally:
+                dest_conn.close()
+        finally:
+            source_conn.close()
+        if not sqlite_integrity_ok(compact_path):
+            raise RuntimeError("compact SQLite backup failed integrity validation")
+    except Exception:
+        cleanup(compact_path)
+        raise
+    return compact_path
+
+
+def prune_old_backups():
+    snapshots = sorted([p for p in BACKUP_DIR.glob("snapshot_*") if p.is_dir()])
+    keep = max(1, STATE_BACKUP_KEEP)
+    for snapshot in snapshots[:-keep]:
+        with contextlib.suppress(Exception):
+            shutil.rmtree(snapshot)
+    archives = sorted([p for p in BACKUP_DIR.glob("royells_backup_*.zip") if p.is_file()], key=lambda p: p.stat().st_mtime)
+    for archive in archives[:-keep]:
+        with contextlib.suppress(Exception):
+            archive.unlink(missing_ok=True)
+
+
+def backup_state_snapshot():
+    compact_db = None
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        snapshot = BACKUP_DIR / f"snapshot_{timestamp}"
+        latest = BACKUP_DIR / "latest"
+        compact_db = create_compact_db_backup_copy()
+        for src in managed_state_files():
+            if src.resolve() == DB_FILE.resolve():
+                continue
+            rel = backup_relative_path(src)
+            copy_file_atomic(src, snapshot / rel)
+            copy_file_atomic(src, latest / rel)
+        if compact_db and compact_db.exists():
+            db_rel = Path("runtime") / DB_FILE.name
+            copy_file_atomic(compact_db, snapshot / db_rel)
+            copy_file_atomic(compact_db, latest / db_rel)
+        prune_old_backups()
+        prune_db_recovery_artifacts()
+        return True
+    except Exception as e:
+        log_event(f"State backup failed: {e}")
+        return False
+    finally:
+        cleanup(compact_db)
+
+
+def create_backup_archive():
+    backup_state_snapshot()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_path = BACKUP_DIR / f"royells_backup_{timestamp}.zip"
+    compact_db = None
+    try:
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=BACKUP_ZIP_COMPRESSLEVEL) as zf:
+            manifest = {
+                "created_at": now_iso(),
+                "bot": "royells",
+                "runtime_dir": str(RUNTIME_DIR),
+                "data_dir": str(DATA_DIR),
+                "db_integrity": db_integrity_status(),
+                "db_size_bytes": DB_FILE.stat().st_size if DB_FILE.exists() else 0,
+                "files": [],
+            }
+            compact_db = create_compact_db_backup_copy()
+            if compact_db and compact_db.exists():
+                zf.write(compact_db, "runtime/royells.db")
+                manifest["files"].append("runtime/royells.db")
+                manifest["compact_db_size_bytes"] = compact_db.stat().st_size
+            for src in managed_archive_files():
+                if src.resolve() == DB_FILE.resolve():
+                    continue
+                rel = backup_relative_path(src).as_posix()
+                zf.write(src, rel)
+                manifest["files"].append(rel)
+            zf.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=True))
+    finally:
+        cleanup(compact_db)
+    prune_old_backups()
+    log_event(f"Backup archive created: {archive_path.name} ({archive_path.stat().st_size / (1024 * 1024):.2f} MB)")
+    return archive_path
+
+
+def safe_zip_members(zip_path):
+    """Validate restore archives against traversal, symlinks, zip bombs, and abuse."""
+    max_members = max(10, env_int("ROYELLS_RESTORE_MAX_MEMBERS", "500"))
+    max_bytes = max(1, env_int("ROYELLS_RESTORE_MAX_UNCOMPRESSED_MB", "2048")) * 1024 * 1024
+    max_ratio = max(10, env_int("ROYELLS_RESTORE_MAX_COMPRESSION_RATIO", "200"))
+    with zipfile.ZipFile(zip_path) as zf:
+        members = zf.infolist()
+        if len(members) > max_members:
+            raise ValueError(f"backup has too many members: {len(members)} > {max_members}")
+        total_size = 0
+        for info in members:
+            name = info.filename.replace("\\", "/")
+            path = Path(name)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError(f"unsafe backup path: {name}")
+            if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                raise ValueError(f"backup symlink is not allowed: {name}")
+            total_size += int(info.file_size or 0)
+            if total_size > max_bytes:
+                raise ValueError(f"backup expands beyond {max_bytes // (1024 * 1024)} MB")
+            compressed = max(1, int(info.compress_size or 0))
+            if info.file_size > 1024 * 1024 and info.file_size / compressed > max_ratio:
+                raise ValueError(f"suspicious compression ratio for: {name}")
+        return members
+
+
+def restore_backup_archive(zip_path):
+    global DB_JOURNAL_INITIALIZED
+    safe_zip_members(zip_path)
+    restore_root = RUNTIME_DIR / f"restore_{int(time.time())}"
+    restore_root.mkdir(parents=True, exist_ok=True)
+    restored = 0
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(restore_root)
+        for root_name, root in (("runtime", RUNTIME_DIR), ("data", DATA_DIR)):
+            source_root = restore_root / root_name
+            if not source_root.exists():
+                continue
+            for src in source_root.rglob("*"):
+                if not src.is_file():
+                    continue
+                if src.name == "bot.lock":
+                    continue
+                dst = root / src.relative_to(source_root)
+                if dst == DB_FILE:
+                    if not sqlite_integrity_ok(src):
+                        raise ValueError("backup archive contains an invalid SQLite database")
+                    with db_mutex:
+                        remove_sqlite_sidecars(DB_FILE)
+                        copy_file_atomic(src, dst)
+                        remove_sqlite_sidecars(DB_FILE)
+                        DB_JOURNAL_INITIALIZED = False
+                    if not db_integrity_ok():
+                        raise RuntimeError("restored SQLite database failed integrity validation")
+                else:
+                    copy_file_atomic(src, dst)
+                restored += 1
+        return restored
+    finally:
+        shutil.rmtree(restore_root, ignore_errors=True)
+
+
+def restore_json_backup_file(json_path):
+    max_bytes = max(1, env_int("ROYELLS_RESTORE_MAX_JSON_MB", "256")) * 1024 * 1024
+    if Path(json_path).stat().st_size > max_bytes:
+        raise ValueError(f"JSON backup exceeds {max_bytes // (1024 * 1024)} MB")
+    name = Path(json_path).name
+    allowed = {path.name: state_name for state_name, path in STATE_FILES.items()}
+    if name not in allowed:
+        raise ValueError(f"unknown JSON state file: {name}")
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("JSON root must be an object")
+    state_name = allowed[name]
+    atomic_json_save(STATE_FILES[state_name], data)
+    with state_mutex:
+        STATE[state_name] = load_json_state(state_name)
+    return state_name
+
+
+def reload_runtime_state_sync():
+    init_state_files()
+    load_source_link_report_config()
+    init_db()
+    load_channels()
+    loaded_target = load_target_full_index_from_db()
+    loaded_dead = load_dead_media_from_state()
+    log_db_startup_status()
+    return loaded_target, loaded_dead
+
+
+async def reload_runtime_after_restore(progress=None):
+    def step(text):
+        log_event(text)
+        if progress:
+            return progress(text)
+        return None
+
+    maybe_await = step("Restore 70%: reloading JSON state and database.")
+    if asyncio.iscoroutine(maybe_await):
+        await maybe_await
+    loaded_target, loaded_dead = await run_blocking("persistence", reload_runtime_state_sync)
+    maybe_await = step(
+        f"Restore 85%: loaded target index {loaded_target} uid(s), dead media {loaded_dead} uid(s)."
+    )
+    if asyncio.iscoroutine(maybe_await):
+        await maybe_await
+    with contextlib.suppress(Exception):
+        await refresh_userbot_dialog_cache(force=True)
+    with contextlib.suppress(Exception):
+        await startup_peer_warmup(include_userbot=True)
+    if RESTORE_RELOAD_TARGET_INDEX and TARGET_MEDIA_INDEX_ENABLED:
+        asyncio.create_task(build_target_media_index(delete_duplicates=False, reason="restore_reload"))
+    maybe_await = step("Restore 100%: runtime reloaded. Source guard and sync loops continue automatically.")
+    if asyncio.iscoroutine(maybe_await):
+        await maybe_await
+    return loaded_target, loaded_dead
+
+
+async def restore_from_document_message(client, document_message, status_msg):
+    reply = document_message
+    if not reply or not reply.document:
+        await safe_edit(status_msg, "Restore failed: no backup document found.")
+        return
+
+    file_name = (reply.document.file_name or "").lower()
+    if not (file_name.endswith(".zip") or file_name.endswith(".json")):
+        await safe_edit(status_msg, "Unsupported restore file. Send a Royells .zip backup or known state .json file.")
+        return
+
+    restore_path = DOWNLOAD_DIR / f"restore_{uuid.uuid4().hex}_{Path(file_name).name}"
+
+    async def progress(text):
+        with contextlib.suppress(Exception):
+            await safe_edit(status_msg, text)
+
+    try:
+        await progress("Restore 5%: downloading backup file...")
+        downloaded = await telegram_gateway_await('client.download_media', lambda: client.download_media(reply, file_name=str(restore_path)))
+        restore_path = Path(downloaded or restore_path)
+        await progress("Restore 20%: creating safety snapshot before restore...")
+        await run_blocking("persistence", backup_state_snapshot)
+
+        if restore_path.suffix.lower() == ".zip":
+            await progress("Restore 35%: validating and extracting backup zip...")
+            restored = await run_blocking("persistence", restore_backup_archive, restore_path)
+            await progress(f"Restore 60%: restored {restored} file(s).")
+            loaded_target, loaded_dead = await reload_runtime_after_restore(progress=progress)
+            await safe_edit(
+                status_msg,
+                (
+                    "Restore complete.\n"
+                    f"Files restored: {restored}\n"
+                    f"Target index loaded: {loaded_target}\n"
+                    f"Dead media loaded: {loaded_dead}\n"
+                    "Runtime reloaded; restart is optional unless session files were replaced."
+                ),
+                reply_markup=tools_keyboard(),
+            )
+        else:
+            await progress("Restore 40%: restoring JSON state file...")
+            state_name = await run_blocking("persistence", restore_json_backup_file, restore_path)
+            loaded_target, loaded_dead = await reload_runtime_after_restore(progress=progress)
+            await safe_edit(
+                status_msg,
+                (
+                    "JSON restore complete.\n"
+                    f"State: {state_name}\n"
+                    f"Target index loaded: {loaded_target}\n"
+                    f"Dead media loaded: {loaded_dead}"
+                ),
+                reply_markup=tools_keyboard(),
+            )
+        log_event(f"Restore completed from {file_name}.")
+    except Exception as e:
+        await safe_edit(status_msg, f"Restore failed:\n{str(e)[:900]}", reply_markup=tools_keyboard())
+        log_event(f"Manual restore failed: {e}")
+    finally:
+        cleanup(restore_path)
+
+
+async def persistent_backup_loop():
+    while True:
+        try:
+            ok = await run_blocking("persistence", backup_state_snapshot)
+            if ok:
+                log_event("Persistent state backup complete.")
+        except Exception as e:
+            log_event(f"Persistent backup loop error: {e}")
+        await asyncio.sleep(max(300, STATE_BACKUP_INTERVAL_SECONDS))
+
+
+async def telegram_backup_loop():
+    if not TELEGRAM_BACKUP_ENABLED or not OWNER_ID:
+        log_event("Telegram auto backup disabled.")
+        await asyncio.Event().wait()
+    await asyncio.sleep(120)
+    while True:
+        archive_path = None
+        try:
+            archive_path = await run_blocking("persistence", create_backup_archive)
+            await send_backup_document(app, OWNER_ID, archive_path, f"Royells auto backup\nTime: {format_display_datetime(seconds=True)}")
+            log_event("Telegram auto backup sent to owner.")
+        except Exception as e:
+            log_event(f"Telegram auto backup failed: {e}")
+        finally:
+            cleanup(archive_path)
+        await asyncio.sleep(max(3600, TELEGRAM_BACKUP_INTERVAL_SECONDS))
+
+
+def diagnostic_increment_error(error, context="", traceback_text=""):
+    text = f"{error.__class__.__name__}: {error}" if not isinstance(error, str) else error
+    lowered = text.lower()
+    if not any(marker in lowered for marker in ("error", "failed", "timeout", "flood", "invalid", "0-byte", "exception", "warning")):
+        return
+    if "0-byte" in lowered or "0 byte" in lowered:
+        key = "0-byte media"
+    elif "flood" in lowered:
+        key = "FloodWait"
+    elif "timeout" in lowered or "timed out" in lowered:
+        key = "Timeout"
+    elif "filenotfound" in lowered or "no such file" in lowered:
+        key = "FileNotFound"
+    elif "media_empty" in lowered or "media empty" in lowered:
+        key = "MEDIA_EMPTY"
+    elif "peer id invalid" in lowered or "peer_id_invalid" in lowered:
+        key = "PEER_ID_INVALID"
+    elif "channel_private" in lowered or "not accessible" in lowered:
+        key = "CHANNEL_PRIVATE"
+    else:
+        key = text.split(":", 1)[0][:60] or "Unknown"
+    diagnostic_stats["error_counts"][key] = int(diagnostic_stats["error_counts"].get(key) or 0) + 1
+    recent = diagnostic_stats.setdefault("recent_errors", [])
+    recent.append(
+        {
+            "time": now_iso(),
+            "key": key,
+            "context": str(context or "")[:120],
+            "error": text[:500],
+            "traceback": str(traceback_text or "")[-1600:],
+        }
+    )
+    if len(recent) > 30:
+        del recent[:-30]
+
+
+def diagnostic_update_queue_peak():
+    total = channel_download_queue.qsize() + upload_queue.qsize() + link_process_queue.qsize()
+    diagnostic_stats["max_queue"] = max(int(diagnostic_stats.get("max_queue") or 0), total)
+    return total
+
+
+def diagnostic_note_source_retired(channel_id, reason):
+    items = diagnostic_stats.setdefault("sources_retired", [])
+    items.append({"time": now_iso(), "channel_id": str(channel_id), "reason": str(reason)[:180]})
+    if len(items) > 200:
+        del items[:-200]
+
+
+def diagnostic_reset_after_success():
+    diagnostic_stats["period_started_at"] = now_iso()
+    diagnostic_stats["error_counts"] = {}
+    diagnostic_stats["recent_errors"] = []
+    diagnostic_stats["max_queue"] = diagnostic_update_queue_peak()
+    diagnostic_stats["sources_retired"] = []
+    diagnostic_stats["dead_media_added"] = 0
+    diagnostic_stats["uploads"] = 0
+    diagnostic_stats["duplicates_deleted"] = 0
+    diagnostic_stats["restore_events"] = []
+
+
+def generate_daily_diagnostic_report():
+    diagnostic_update_queue_peak()
+    subs, posted = get_db_stats()
+    health = channel_status_counts()
+    disk = shutil.disk_usage(str(DATA_DIR))
+    runtime_disk = shutil.disk_usage(str(RUNTIME_DIR))
+    db_size = DB_FILE.stat().st_size if DB_FILE.exists() else 0
+    with state_mutex:
+        clean_count = len(STATE["clean_duplicate"].get("items", {}))
+        target_index_count = len(STATE.get("target_media_index", {}).get("items", {}))
+        total_uploaded = STATE["total_auto_upload"].get("total_uploaded", 0)
+        dead_total = len(STATE.get("dead_media", {}).get("items", {}))
+    errors = diagnostic_stats.get("error_counts", {})
+    error_lines = [f"- {key}: {value}" for key, value in sorted(errors.items(), key=lambda kv: (-kv[1], kv[0]))[:20]]
+    recent_errors = diagnostic_stats.get("recent_errors", [])[-8:]
+    recent_error_lines = []
+    for item in recent_errors:
+        recent_error_lines.append(f"- {item.get('time')} | {item.get('context') or item.get('key')}: {item.get('error')}")
+        tb = str(item.get("traceback") or "").strip()
+        if tb:
+            recent_error_lines.extend("  " + line for line in tb.splitlines()[-8:])
+    retired = diagnostic_stats.get("sources_retired", [])[-20:]
+    retired_lines = [f"- {item['time']} | {item['channel_id']} | {item['reason']}" for item in retired]
+    log_lines = list(console_logs)[-20:]
+    lines = [
+        "=== Royells Bot Daily Diagnostic Report ===",
+        f"Generated: {format_display_datetime(seconds=True)}",
+        f"Period started: {diagnostic_stats.get('period_started_at')}",
+        "",
+        "[System]",
+        f"Uptime: {uptime()}",
+        f"Memory: {current_memory_mb():.0f} MB" if current_memory_mb() else "Memory: N/A",
+        f"Data disk: free {disk.free // (1024 * 1024)} MB / total {disk.total // (1024 * 1024)} MB",
+        f"Runtime disk: free {runtime_disk.free // (1024 * 1024)} MB / total {runtime_disk.total // (1024 * 1024)} MB",
+        f"DB size: {db_size / (1024 * 1024):.2f} MB",
+        f"DB integrity: {db_integrity_status()}",
+        f"Session: {'BAD ' + SESSION_AUTH_INVALID_REASON[:120] if SESSION_AUTH_INVALID else 'OK'}",
+        "",
+        "[Queue]",
+        f"Current queue: D{channel_download_queue.qsize()} U{upload_queue.qsize()} L{link_process_queue.qsize()}",
+        f"Max queue this period: {diagnostic_stats.get('max_queue', 0)}",
+        "",
+        "[Sources]",
+        f"Active: {health['active']} | Issues: {health['issues']} | Removed: {health['removed']}",
+        f"Guard: {last_source_guard.get('status')} | {short_dt(last_source_guard.get('time'))}",
+        f"Sync: {last_auto_sync.get('status')} | {short_dt(last_auto_sync.get('time'))}",
+        f"Retired this period: {len(retired)}",
+        *(retired_lines or ["- none"]),
+        "",
+        "[Media]",
+        f"Total uploaded: {max(auto_count, total_uploaded)}",
+        f"Uploads this period: {diagnostic_stats.get('uploads', 0)}",
+        f"Ledger: {clean_count} | DB posted: {posted} | Target index: {target_index_count}",
+        f"Dead media total: {dead_total}",
+        f"Dead media added this period: {diagnostic_stats.get('dead_media_added', 0)}",
+        f"Duplicates deleted this period: {diagnostic_stats.get('duplicates_deleted', 0)}",
+        f"Subscriptions: {subs} active",
+        "",
+        "[Errors]",
+        *(error_lines or ["- none"]),
+        "",
+        "[Error Details]",
+        *(recent_error_lines or ["- none"]),
+        "",
+        "[Recent Logs]",
+        *(log_lines or ["No recent logs."]),
+    ]
+    return "\n".join(str(line) for line in lines)
+
+
+async def send_diagnostic_report_now(client=app, chat_id=None, reset_on_success=False):
+    chat_id = chat_id or OWNER_ID
+    report_text = generate_daily_diagnostic_report()
+    report_path = RUNTIME_DIR / f"royells_diagnostic_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    report_path.write_text(report_text, encoding="utf-8")
+    try:
+        await telegram_gateway_await('client.send_document', lambda: client.send_document(
+            chat_id,
+            document=str(report_path),
+            caption=f"Royells Daily Diagnostic Report\nTime: {format_display_datetime(seconds=True)}",
+        ))
+        if reset_on_success:
+            diagnostic_reset_after_success()
+        return True
+    finally:
+        cleanup(report_path)
+
+
+async def diagnostic_report_loop():
+    if not DIAGNOSTIC_REPORT_ENABLED or not OWNER_ID:
+        log_event("Daily diagnostic report disabled.")
+        await asyncio.Event().wait()
+    await asyncio.sleep(300)
+    while True:
+        try:
+            await send_diagnostic_report_now(app, OWNER_ID, reset_on_success=True)
+            log_event("Daily diagnostic report sent to owner.")
+        except Exception as e:
+            log_event(f"Daily diagnostic report failed: {e}")
+        await asyncio.sleep(DIAGNOSTIC_REPORT_INTERVAL_SECONDS)
+
+
+async def send_backup_document(client, chat_id, archive_path, caption):
+    path = Path(archive_path)
+    if not path.exists() or path.stat().st_size <= 0:
+        raise RuntimeError(f"backup archive missing or empty: {path}")
+    try:
+        await telegram_gateway_await('client.send_document', lambda: client.send_document(chat_id, document=str(path), caption=caption))
+        return True
+    except Exception as first_error:
+        # Some cloud runtimes fail path streaming inside Pyrogram; retry with an explicit file handle.
+        log_event(f"Backup path send failed, retrying file handle: {str(first_error)[:180]}")
+        with path.open("rb") as file_obj:
+            await telegram_gateway_await('client.send_document', lambda: client.send_document(chat_id, document=file_obj, file_name=path.name, caption=caption))
+        return True
+
+
+def trim_events(state_name, limit=1000):
+    events = STATE[state_name].get("events")
+    if isinstance(events, list) and len(events) > limit:
+        STATE[state_name]["events"] = events[-limit:]
+
+
+def log_event(text):
+    print(text, flush=True)
+    console_logs.append(f"[{format_display_datetime(seconds=True)}] {text}")
+    with contextlib.suppress(Exception):
+        diagnostic_increment_error(str(text))
+
+
+def flood_wait_delay(seconds):
+    try:
+        base_seconds = max(1.0, float(seconds))
+    except Exception:
+        base_seconds = 1.0
+    jitter = random.uniform(0.0, max(0.0, FLOOD_WAIT_JITTER_SECONDS))
+    return min(float(FLOOD_WAIT_BACKOFF_CAP_SECONDS), base_seconds * FLOOD_WAIT_BACKOFF_MULTIPLIER + jitter)
+
+
+def is_flood_wait_error(exc):
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return isinstance(exc, FloodWait) or "flood_wait" in text or "floodwait" in text or "420 flood" in text
+
+
+def note_global_flood_wait(exc):
+    global TELEGRAM_FLOOD_UNTIL
+    seconds = int(getattr(exc, "value", 0) or 0)
+    if seconds <= 0:
+        match = re.search(r"wait of (\d+) seconds", str(exc), re.I)
+        seconds = int(match.group(1)) if match else 60
+    delay = flood_wait_delay(seconds)
+    TELEGRAM_FLOOD_UNTIL = max(TELEGRAM_FLOOD_UNTIL, time.monotonic() + delay)
+    mark_runtime_checkpoint_dirty("telegram flood wait")
+    return delay
+
+
+async def wait_global_flood_gate(label="telegram"):
+    while True:
+        remaining = TELEGRAM_FLOOD_UNTIL - time.monotonic()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining, 30.0))
+
+
+def begin_telegram_inflight(label, kind="api"):
+    token = uuid.uuid4().hex
+    with TELEGRAM_INFLIGHT_LOCK:
+        TELEGRAM_INFLIGHT[token] = {
+            "token": token,
+            "label": str(label)[:200],
+            "kind": str(kind)[:40],
+            "started_at": time.time(),
+            "started_iso": now_iso(),
+        }
+    mark_runtime_checkpoint_dirty(f"telegram inflight {kind}")
+    return token
+
+
+def end_telegram_inflight(token, status="done", error=""):
+    if not token:
+        return
+    with TELEGRAM_INFLIGHT_LOCK:
+        entry = TELEGRAM_INFLIGHT.pop(str(token), None)
+    if entry:
+        mark_runtime_checkpoint_dirty(f"telegram inflight {status}")
+
+
+def is_global_transport_error(exc):
+    if is_session_auth_error(exc) or is_flood_wait_error(exc):
+        return False
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return any(marker in text for marker in (
+        "broken pipe", "errno 32", "connection lost", "connection reset",
+        "connection aborted", "server disconnected", "client has not been started", "transport closed"
+    ))
+
+
+def is_temporary_network_error(exc):
+    if is_session_auth_error(exc):
+        return False
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return any(
+        marker in text
+        for marker in [
+            "broken pipe",
+            "errno 32",
+            "connection aborted",
+            "connection lost",
+            "connection reset",
+            "timeout",
+            "timed out",
+            "network",
+            "temporarily",
+            "socket",
+            "server disconnected",
+            "transport",
+            "client has not been started",
+        ]
+    )
+
+
+def is_reconnectable_telegram_error(exc):
+    if is_session_auth_error(exc):
+        return False
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return any(
+        marker in text
+        for marker in [
+            "errno 110",
+            "connection timed out",
+            "timed out",
+            "timeout",
+            "broken pipe",
+            "errno 32",
+            "connection lost",
+            "connection reset",
+            "connection aborted",
+            "server disconnected",
+            "transport",
+            "client has not been started",
+        ]
+    )
+
+
+def should_reconnect_telegram_error(exc):
+    """Reconnect only for real transport/client loss, not normal slow API timeouts."""
+    if is_session_auth_error(exc):
+        return False
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    if any(marker in text for marker in ["flood_wait", "floodwait", "peer id invalid", "peer_id_invalid"]):
+        return False
+    if "guard scan timed out" in text or "auto sync timed out" in text:
+        return False
+    if "timed out" in text or "timeout" in text:
+        return False
+    return any(
+        marker in text
+        for marker in [
+            "client has not been started",
+            "connection lost",
+            "connection reset",
+            "connection aborted",
+            "broken pipe",
+            "errno 32",
+            "server disconnected",
+        ]
+    )
+
+
+def is_invalid_media_upload_error(exc):
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return any(
+        marker in text
+        for marker in [
+            "media_empty",
+            "media empty",
+            "invalid media",
+            "media invalid",
+            "file must be non-empty",
+            "wrong file identifier",
+            "failed to send media",
+        ]
+    )
+
+
+def format_exception_for_log(exc):
+    text = str(exc).strip()
+    return f"{exc.__class__.__name__}: {text}" if text else exc.__class__.__name__
+
+
+def is_permanent_dead_media_error(exc):
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return any(
+        marker in text
+        for marker in [
+            "0-byte media",
+            "0 byte media",
+            "0 bytes",
+            "no valid media downloaded",
+            "file missing or 0 bytes before upload",
+            "invalid media: no telegram-ready media",
+            "invalid media: all prepared media",
+            "file must be non-empty",
+            "media_empty",
+            "media empty",
+        ]
+    )
+
+
+def should_skip_dead_media_now(exc, attempt):
+    return is_permanent_dead_media_error(exc) and int(attempt or 1) >= DEAD_MEDIA_SKIP_AFTER_ATTEMPTS
+
+
+def is_session_auth_error(exc):
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return any(
+        marker in text
+        for marker in [
+            "authkeyunregistered",
+            "auth key unregistered",
+            "authkeyduplicated",
+            "auth_key_duplicated",
+            "same authorization key",
+            "session revoked",
+            "session expired",
+            "session password needed",
+            "unauthorized",
+            "user deactivated",
+            "user is deactivated",
+        ]
+    )
+
+
+def mark_session_auth_invalid(reason):
+    global SESSION_AUTH_INVALID, SESSION_AUTH_INVALID_REASON
+    SESSION_AUTH_INVALID = True
+    SESSION_AUTH_INVALID_REASON = str(reason)[:500]
+    last_source_guard.update({"status": "paused session auth", "time": now_iso(), "queued": 0})
+    last_auto_sync.update({"status": "paused session auth", "time": now_iso(), "queued": 0})
+    log_event(f"Telegram user session paused: {SESSION_AUTH_INVALID_REASON}")
+
+
+def clear_session_auth_invalid():
+    global SESSION_AUTH_INVALID, SESSION_AUTH_INVALID_REASON
+    if SESSION_AUTH_INVALID:
+        log_event("Telegram user session validation recovered.")
+    SESSION_AUTH_INVALID = False
+    SESSION_AUTH_INVALID_REASON = ""
+
+
+def context_requires_userbot(context):
+    text = str(context or "").lower()
+    bot_only_markers = [" via bot", "validate bot", "send via bot", "bot target", "bot worker", "bot source"]
+    return not any(marker in text for marker in bot_only_markers)
+
+
+def schedule_userbot_reconnect(reason):
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(recover_userbot_connection(reason))
+    except RuntimeError:
+        pass
+
+
+async def recover_userbot_connection(reason):
+    global last_telegram_reconnect, TELEGRAM_TRANSPORT_GENERATION
+    if SESSION_AUTH_INVALID:
+        log_event("Telegram reconnect skipped: user session is invalid/duplicated and needs a new session string.")
+        return
+    now = time.time()
+    if now - last_telegram_reconnect < TELEGRAM_RECONNECT_COOLDOWN_SECONDS:
+        return
+    async with telegram_reconnect_lock:
+        now = time.time()
+        if now - last_telegram_reconnect < TELEGRAM_RECONNECT_COOLDOWN_SECONDS:
+            return
+        last_telegram_reconnect = now
+        previous_generation = TELEGRAM_TRANSPORT_GENERATION
+        log_event(f"Telegram transport reconnect generation {previous_generation}: {str(reason)[:160]}")
+        try:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(userbot.stop(), timeout=30)
+            await asyncio.sleep(1)
+            await asyncio.wait_for(userbot.start(), timeout=90)
+            TELEGRAM_TRANSPORT_GENERATION = previous_generation + 1
+            with contextlib.suppress(Exception):
+                await refresh_userbot_dialog_cache(force=True)
+            log_event(f"Telegram transport generation {TELEGRAM_TRANSPORT_GENERATION} ready; pending jobs may resume.")
+        except Exception as e:
+            log_event(f"Telegram userbot reconnect failed: {e}")
+            last_telegram_reconnect = time.time() - max(0, TELEGRAM_RECONNECT_COOLDOWN_SECONDS - 30)
+
+async def wait_for_telegram_client(context="telegram"):
+    if SESSION_AUTH_INVALID and context_requires_userbot(context):
+        raise RuntimeError(
+            "Telegram user session invalid/duplicated. Generate a new ROYELLS_USER_SESSION_STRING "
+            f"and stop every other process using the old session. Reason: {SESSION_AUTH_INVALID_REASON}"
+        )
+    waited = 0
+    while telegram_reconnect_lock.locked() and waited < 60:
+        await asyncio.sleep(1)
+        waited += 1
+    if waited:
+        log_event(f"{context} waited {waited}s for Telegram reconnect.")
+
+
+async def wait_while_session_invalid(component):
+    logged = False
+    while SESSION_AUTH_INVALID:
+        if not logged:
+            log_event(
+                f"{component} paused: Telegram user session is duplicated/invalid. "
+                "Generate a new ROYELLS_USER_SESSION_STRING and stop all old Spaces using it."
+            )
+            logged = True
+        await asyncio.sleep(max(30, SESSION_AUTH_PAUSE_SECONDS))
+
+
+async def start_telegram_client_safely(client, label, max_attempts=3):
+    """Start a Pyrogram client without converting FloodWait into a restart loop."""
+    for attempt in range(1, max(1, max_attempts) + 1):
+        try:
+            await client.start()
+            return True
+        except FloodWait as e:
+            wait_for = int(getattr(e, "value", 0) or 0)
+            if wait_for <= 0:
+                match = re.search(r"wait of (\d+) seconds", str(e), re.I)
+                wait_for = int(match.group(1)) if match else 60
+            wait_for = max(5, min(wait_for + 5, 7200))
+            log_event(f"{label} startup FloodWait: sleeping {wait_for}s before retry {attempt}/{max_attempts}.")
+            await asyncio.sleep(wait_for)
+        except ConnectionError as e:
+            if "already connected" in str(e).lower():
+                log_event(f"{label} already connected during startup; continuing.")
+                return True
+            raise
+    raise RuntimeError(f"{label} could not start after FloodWait retries.")
+
+
+async def notify_session_problem(reason):
+    global last_session_warning
+    now = time.time()
+    if now - last_session_warning < 1800:
+        return
+    last_session_warning = now
+    text = (
+        "Royells session warning.\n"
+        "Telegram user session may be expired/revoked.\n"
+        "Need a new ROYELLS_USER_SESSION_STRING.\n\n"
+        f"Reason: {str(reason)[:500]}"
+    )
+    with contextlib.suppress(Exception):
+        await telegram_gateway_await('app.send_message', lambda: app.send_message(OWNER_ID, text))
+    log_event(text.replace("\n", " | "))
+
+
+async def session_validator_loop():
+    await asyncio.sleep(90)
+    while True:
+        try:
+            await tg_call("session validate bot", app.get_me, retries=1)
+            await tg_call("session validate userbot", userbot.get_me, retries=1)
+            clear_session_auth_invalid()
+        except Exception as e:
+            if is_session_auth_error(e):
+                mark_session_auth_invalid(e)
+                await notify_session_problem(e)
+            elif should_reconnect_telegram_error(e):
+                schedule_userbot_reconnect(f"session validator: {e}")
+            else:
+                log_event(f"Session validator warning: {str(e)[:160]}")
+        await asyncio.sleep(1800)
+
+
+async def telegram_gateway_await(label, factory, timeout_seconds=None, retries=None):
+    """Central gateway for direct Pyrogram requests with isolated control capacity."""
+    retries = max(1, int(retries or TELEGRAM_CALL_RETRIES))
+    if timeout_seconds is None:
+        lowered = str(label).lower()
+        if "download_media" in lowered:
+            timeout_seconds = DOWNLOAD_MEDIA_TIMEOUT_SECONDS
+        elif any(token in lowered for token in ("send_document", "send_video", "send_media_group")):
+            timeout_seconds = UPLOAD_SEND_TIMEOUT_SECONDS
+        else:
+            timeout_seconds = TELEGRAM_CALL_TIMEOUT_SECONDS
+    last_error = None
+    for attempt in range(1, retries + 1):
+        started = time.monotonic()
+        inflight_token = ""
+        try:
+            inflight_token = begin_telegram_inflight(label, "control")
+            try:
+                await wait_global_flood_gate(label)
+                async with telegram_control_semaphore:
+                    result = await asyncio.wait_for(factory(), timeout=max(5, int(timeout_seconds)))
+            finally:
+                end_telegram_inflight(inflight_token)
+            duration = time.monotonic() - started
+            if duration >= float(os.getenv("ROYELLS_SLOW_API_SECONDS", "5")):
+                metric_increment("slow_api_operations")
+                log_event(f"Slow Telegram gateway: {label} duration={duration:.2f}s attempt={attempt}")
+            return result
+        except asyncio.CancelledError:
+            raise
+        except FloodWait as exc:
+            last_error = exc
+            delay = note_global_flood_wait(exc)
+            log_event(f"Telegram gateway FloodWait: {label} delay={delay}s attempt={attempt}")
+            await asyncio.sleep(delay)
+        except asyncio.TimeoutError as exc:
+            last_error = TimeoutError(f"{label} timed out after {timeout_seconds}s")
+            if attempt >= retries:
+                raise last_error from exc
+            await asyncio.sleep(min(10, 2 * attempt))
+        except Exception as exc:
+            last_error = exc
+            if is_session_auth_error(exc):
+                mark_session_auth_invalid(exc)
+                raise
+            if should_reconnect_telegram_error(exc):
+                schedule_userbot_reconnect(f"gateway {label}: {exc}")
+            if not is_temporary_network_error(exc) or attempt >= retries:
+                raise
+            await asyncio.sleep(min(10, 2 * attempt))
+    raise last_error or RuntimeError(f"Telegram gateway failed: {label}")
+
+
+async def tg_call(label, func, *args, retries=None, **kwargs):
+    retries = retries or TELEGRAM_CALL_RETRIES
+    call_timeout = kwargs.pop("_timeout_seconds", TELEGRAM_CALL_TIMEOUT_SECONDS)
+    last_error = None
+    for attempt in range(1, retries + 1):
+        inflight_token = ""
+        try:
+            inflight_token = begin_telegram_inflight(label, "api")
+            await wait_for_telegram_client(label)
+            await wait_global_flood_gate(label)
+            try:
+                async with telegram_api_semaphore:
+                    call = func(*args, **kwargs)
+                    started = time.monotonic()
+                    if call_timeout and call_timeout > 0:
+                        result = await asyncio.wait_for(call, timeout=max(5, call_timeout))
+                    else:
+                        result = await call
+                    duration = time.monotonic() - started
+                    if duration >= float(os.getenv("ROYELLS_SLOW_API_SECONDS", "5")):
+                        metric_increment("slow_api_operations")
+                        log_event(f"Slow Telegram API: {label} duration={duration:.2f}s attempt={attempt}")
+                    return result
+            finally:
+                end_telegram_inflight(inflight_token)
+        except asyncio.TimeoutError as e:
+            last_error = TimeoutError(f"{label} timed out after {call_timeout}s")
+            if attempt >= retries:
+                raise last_error
+            delay = min(30, 2 * attempt)
+            log_event(f"{label} timed out, retry {attempt}/{retries} in {delay}s")
+            await asyncio.sleep(delay)
+        except FloodWait as e:
+            await asyncio.sleep(note_global_flood_wait(e))
+            last_error = e
+        except Exception as e:
+            last_error = e
+            if is_session_auth_error(e):
+                mark_session_auth_invalid(e)
+                with contextlib.suppress(Exception):
+                    asyncio.create_task(notify_session_problem(e))
+                raise
+            if should_reconnect_telegram_error(e):
+                schedule_userbot_reconnect(f"{label}: {e}")
+            if not is_temporary_network_error(e) or attempt >= retries:
+                raise
+            delay = min(30, 2 * attempt)
+            log_event(f"{label} temporary network issue, retry {attempt}/{retries} in {delay}s")
+            await asyncio.sleep(delay)
+    raise last_error
+
+
+def uptime():
+    return str(datetime.now() - BOT_START).split(".")[0]
+
+
+def _coerce_user_id(value):
+    try:
+        uid = int(str(value).strip())
+        return uid if uid > 0 else None
+    except Exception:
+        return None
+
+
+def env_admin_ids():
+    ids = set()
+    for raw in os.getenv("ROYELLS_ADMIN_IDS", "").replace(";", ",").split(","):
+        uid = _coerce_user_id(raw)
+        if uid:
+            ids.add(uid)
+    return ids
+
+
+def runtime_admin_ids():
+    ids = set()
+    if OWNER_ID:
+        ids.add(int(OWNER_ID))
+    ids.update(env_admin_ids())
+    with contextlib.suppress(Exception):
+        control = STATE.get("runtime_config", {}).get("control", {}) if STATE else {}
+        for raw in control.get("admin_ids", []):
+            uid = _coerce_user_id(raw)
+            if uid:
+                ids.add(uid)
+    return ids
+
+
+def is_owner(uid):
+    uid = _coerce_user_id(uid)
+    return bool(uid and uid in runtime_admin_ids())
+
+
+def admin_filter_func(_flt, _client, update):
+    return is_owner(getattr(getattr(update, "from_user", None), "id", None))
+
+
+ADMIN_FILTER = filters.create(admin_filter_func, name="royells_admin")
+
+
+async def safe_edit(msg, text, reply_markup=None, parse_mode=None):
+    try:
+        await msg.edit_text(text, disable_web_page_preview=True, reply_markup=reply_markup, parse_mode=parse_mode)
+        await asyncio.sleep(0)
+    except MessageNotModified:
+        pass
+    except Exception:
+        pass
+
+
+def is_manual_telegram_link_job(job):
+    return str((job or {}).get("source") or "") == "telegram_link"
+
+
+async def update_manual_link_status(job, text, reply_markup=None):
+    if not is_manual_telegram_link_job(job):
+        return
+    status_msg = job.get("status_msg")
+    if status_msg:
+        await safe_edit(status_msg, text, reply_markup=reply_markup)
+        return
+    chat_id = job.get("status_chat_id")
+    message_id = job.get("status_message_id")
+    if chat_id and message_id:
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await('app.edit_message_text', lambda: app.edit_message_text(
+                int(chat_id),
+                int(message_id),
+                text,
+                disable_web_page_preview=True,
+                reply_markup=reply_markup,
+            ))
+
+
+def cleanup(*paths):
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+
+def track_download_file(path):
+    if not path:
+        return
+    with contextlib.suppress(Exception):
+        active_download_files.add(str(Path(path).resolve()))
+    mark_runtime_checkpoint_dirty("download file tracked")
+
+
+def untrack_download_files(paths):
+    for path in paths or []:
+        with contextlib.suppress(Exception):
+            active_download_files.discard(str(Path(path).resolve()))
+    mark_runtime_checkpoint_dirty("download file untracked")
+
+
+def directory_size_bytes(path):
+    total = 0
+    try:
+        for item in Path(path).rglob("*"):
+            if item.is_file():
+                total += item.stat().st_size
+    except Exception:
+        return total
+    return total
+
+
+def cleanup_download_dir_if_needed(force=False):
+    try:
+        root = DOWNLOAD_DIR.resolve()
+        if not root.exists():
+            return 0, 0
+        limit_bytes = max(1, DOWNLOAD_STORAGE_LIMIT_MB) * 1024 * 1024
+        min_free_bytes = max(1, MIN_FREE_STORAGE_MB) * 1024 * 1024
+        usage = shutil.disk_usage(str(RUNTIME_DIR))
+        current_size = directory_size_bytes(root)
+        if not force and current_size <= limit_bytes and usage.free >= min_free_bytes:
+            return 0, 0
+
+        files = []
+        for item in root.rglob("*"):
+            if not item.is_file():
+                continue
+            resolved = item.resolve()
+            if root not in resolved.parents:
+                continue
+            if str(resolved) in active_download_files:
+                continue
+            try:
+                files.append((resolved.stat().st_mtime, resolved.stat().st_size, resolved))
+            except Exception:
+                continue
+        files.sort()
+
+        deleted = 0
+        freed = 0
+        for _, size, item in files:
+            try:
+                item.unlink(missing_ok=True)
+                deleted += 1
+                freed += size
+                current_size = max(0, current_size - size)
+                usage = shutil.disk_usage(str(RUNTIME_DIR))
+                if not force and current_size <= limit_bytes and usage.free >= min_free_bytes:
+                    break
+            except Exception:
+                continue
+        return deleted, freed
+    except Exception:
+        return 0, 0
+
+
+def current_memory_mb():
+    status_path = Path("/proc/self/status")
+    try:
+        for line in status_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0
+
+
+def request_automatic_process_restart(reason):
+    """Automatic full-process restart is permanently disabled to protect queue ownership."""
+    reason_text = str(reason or "automatic recovery")[:500]
+    log_event(f"Automatic process restart permanently suppressed: {reason_text}")
+    return False
+
+
+async def event_loop_heartbeat_loop():
+    global EVENT_LOOP_HEARTBEAT_TS
+    interval = max(1, HARD_WATCHDOG_HEARTBEAT_SECONDS)
+    expected = time.monotonic()
+    while True:
+        now_mono = time.monotonic()
+        lag = max(0.0, now_mono - expected)
+        metric_set("event_loop_lag_seconds", round(lag, 3))
+        metric_set_peak("event_loop_lag_peak_seconds_by_kind", "main", lag)
+        with RUNTIME_METRICS_LOCK:
+            RUNTIME_METRICS["event_loop_lag_peak_seconds"] = max(float(RUNTIME_METRICS.get("event_loop_lag_peak_seconds") or 0), lag)
+        if lag >= float(os.getenv("ROYELLS_EVENT_LOOP_LAG_LOG_SECONDS", "1.0")):
+            log_event(f"Event loop latency warning: {lag:.3f}s")
+        EVENT_LOOP_HEARTBEAT_TS = time.time()
+        expected = now_mono + interval
+        await asyncio.sleep(interval)
+
+
+def start_hard_watchdog(label="main"):
+    """Start a daemon watchdog with diagnostic-only behavior by default."""
+    global HARD_WATCHDOG_STARTED, EVENT_LOOP_HEARTBEAT_TS
+    if HARD_WATCHDOG_STARTED or not HARD_WATCHDOG_ENABLED:
+        return False
+    HARD_WATCHDOG_STARTED = True
+    EVENT_LOOP_HEARTBEAT_TS = time.time()
+    started_at = time.time()
+
+    def watchdog_runner():
+        memory_over_count = 0
+        stall_reported = False
+        while True:
+            time.sleep(max(5, HARD_WATCHDOG_HEARTBEAT_SECONDS))
+            now = time.time()
+            stalled_for = now - EVENT_LOOP_HEARTBEAT_TS
+            if now - started_at > HARD_WATCHDOG_STARTUP_GRACE_SECONDS and stalled_for > HARD_WATCHDOG_STALL_SECONDS:
+                if not stall_reported:
+                    stall_reported = True
+                    print(f"Hard watchdog alert: {label} event loop stalled for {int(stalled_for)}s.", flush=True)
+                    print("=== BLOCKED MAIN EVENT LOOP STACK ===\n" + _format_main_loop_stack(), flush=True)
+                    print("=== LAST ASYNC TASK SNAPSHOT ===\n" + json.dumps(ASYNC_TASK_SNAPSHOT, ensure_ascii=False, indent=2)[:30000], flush=True)
+                    print("=== QUEUE/SEMAPHORE OWNERSHIP ===\n" + json.dumps({
+                        "queues": {"download": channel_download_queue.qsize(), "upload": upload_queue.qsize(), "link": link_process_queue.qsize(), "button": button_queue.qsize(), "job_state_db": job_state_db_queue.qsize(), "critical_db": critical_db_write_queue.qsize()},
+                        "workers": list(active_worker_jobs.values()),
+                        "semaphores": {"telegram_api_locked": telegram_api_semaphore.locked(), "telegram_media_locked": telegram_media_semaphore.locked(), "source_link_locked": source_link_check_semaphore.locked()},
+                        "executors": executor_diagnostics(),
+                        "retry_queue": retry_admission_queue.qsize(),
+                    }, default=str, ensure_ascii=False, indent=2)[:30000], flush=True)
+                    if HARD_WATCHDOG_FORCE_RESTART:
+                        request_automatic_process_restart(
+                            f"{label} event loop stalled for {int(stalled_for)}s"
+                        )
+            else:
+                stall_reported = False
+            mem = current_memory_mb()
+            if MEMORY_RESTART_LIMIT_MB > 0 and mem > MEMORY_RESTART_LIMIT_MB:
+                memory_over_count += 1
+                if memory_over_count >= 3:
+                    print(
+                        f"Hard watchdog memory alert: {label} memory {mem:.0f} MB exceeded limit {MEMORY_RESTART_LIMIT_MB} MB.",
+                        flush=True,
+                    )
+                    if HARD_WATCHDOG_FORCE_RESTART:
+                        request_automatic_process_restart(
+                            f"{label} memory {mem:.0f} MB exceeded {MEMORY_RESTART_LIMIT_MB} MB"
+                        )
+                    memory_over_count = 0
+            else:
+                memory_over_count = 0
+
+    threading.Thread(target=watchdog_runner, name=f"royells-hard-watchdog-{label}", daemon=True).start()
+    log_event(
+        f"Hard watchdog active for {label}: mode={'restart' if HARD_WATCHDOG_FORCE_RESTART else 'diagnostic-only'}, "
+        f"stall>{HARD_WATCHDOG_STALL_SECONDS}s, memory>{MEMORY_RESTART_LIMIT_MB or 'off'} MB."
+    )
+    return True
+
+
+def _format_main_loop_stack():
+    frame = sys._current_frames().get(MAIN_LOOP_THREAD_ID) if MAIN_LOOP_THREAD_ID else None
+    return "".join(traceback.format_stack(frame)) if frame else "main loop frame unavailable"
+
+
+def install_asyncio_diagnostics(loop):
+    global MAIN_LOOP_THREAD_ID
+    MAIN_LOOP_THREAD_ID = threading.get_ident()
+    if not ASYNC_DIAGNOSTICS_ENABLED:
+        loop.set_debug(False)
+        return
+    loop.set_debug(True)
+    loop.slow_callback_duration = float(os.getenv("ROYELLS_SLOW_CALLBACK_SECONDS", "1.0"))
+    previous_factory = loop.get_task_factory()
+    def factory(loop, coro, context=None):
+        if previous_factory:
+            try:
+                task = previous_factory(loop, coro, context=context)
+            except TypeError:
+                task = previous_factory(loop, coro)
+        else:
+            task = asyncio.Task(coro, loop=loop, context=context) if context is not None else asyncio.Task(coro, loop=loop)
+        ASYNC_TASK_META[task] = {"created": time.monotonic(), "reported": set(), "name": getattr(coro, "__qualname__", repr(coro))}
+        task.add_done_callback(lambda done: ASYNC_TASK_META.pop(done, None))
+        return task
+    loop.set_task_factory(factory)
+
+
+async def asyncio_diagnostics_loop():
+    global ASYNC_TASK_SNAPSHOT
+    while True:
+        now = time.monotonic()
+        rows = []
+        for task in asyncio.all_tasks():
+            if task is asyncio.current_task():
+                continue
+            meta = ASYNC_TASK_META.setdefault(task, {"created": now, "reported": set(), "name": task.get_name()})
+            age = now - meta["created"]
+            stack = task.get_stack(limit=8)
+            location = " -> ".join(f"{f.f_code.co_name}:{f.f_lineno}" for f in stack[-4:]) or "waiting/native"
+            rows.append({"name": task.get_name(), "coroutine": meta["name"], "age": round(age, 1), "state": getattr(task, "_state", "unknown"), "stack": location})
+            for threshold in ASYNC_DIAGNOSTIC_THRESHOLDS:
+                if age >= threshold and threshold not in meta["reported"]:
+                    meta["reported"].add(threshold)
+                    log_event(f"Async task >{threshold}s: {meta['name']} state={getattr(task, '_state', '?')} stack={location}")
+        ASYNC_TASK_SNAPSHOT = rows
+        await asyncio.sleep(5)
+
+
+async def runtime_resource_guard_loop():
+    while True:
+        try:
+            deleted, freed = await run_blocking("media", cleanup_download_dir_if_needed)
+            if deleted:
+                log_event(f"Storage guard cleaned {deleted} download file(s), freed {freed // (1024 * 1024)} MB.")
+            diagnostic_update_queue_peak()
+            gc.collect()
+            mem = current_memory_mb()
+            if mem:
+                log_event(f"Runtime guard: memory {mem:.0f} MB, download queue {channel_download_queue.qsize()}, upload queue {upload_queue.qsize()}.")
+        except Exception as e:
+            log_event(f"Runtime guard error: {e}")
+        await asyncio.sleep(max(60, min(STORAGE_MONITOR_INTERVAL_SECONDS, MEMORY_GC_INTERVAL_SECONDS)))
+
+
+def keepalive_ping_fallback_url(url):
+    text = str(url or "").strip().rstrip("/")
+    if text.lower().endswith("/health"):
+        return text[:-7] + "/ping"
+    return ""
+
+
+async def outbound_keepalive_loop():
+    if not KEEPALIVE_PING_URLS:
+        log_event("Outbound keepalive disabled: no ping URL configured.")
+        await asyncio.Event().wait()
+    await asyncio.sleep(60)
+    while True:
+        for url in list(KEEPALIVE_PING_URLS):
+            try:
+                response = await run_blocking("control", requests.get, url, timeout=15)
+                if response.status_code == 404:
+                    fallback_url = keepalive_ping_fallback_url(url)
+                    if fallback_url:
+                        fallback_response = await run_blocking("control", requests.get, fallback_url, timeout=15)
+                        log_event(
+                            f"Keepalive ping {url}: 404; fallback {fallback_url}: "
+                            f"{fallback_response.status_code}"
+                        )
+                        if 200 <= fallback_response.status_code < 400:
+                            with contextlib.suppress(ValueError):
+                                KEEPALIVE_PING_URLS[KEEPALIVE_PING_URLS.index(url)] = fallback_url
+                        continue
+                log_event(f"Keepalive ping {url}: {response.status_code}")
+            except Exception as e:
+                log_event(f"Keepalive ping failed for {url}: {str(e)[:120]}")
+            await asyncio.sleep(2)
+        await asyncio.sleep(max(60, KEEPALIVE_PING_INTERVAL_SECONDS))
+
+
+async def delete_incoming_message(message):
+    with contextlib.suppress(Exception):
+        await telegram_gateway_await('message.delete', lambda: message.delete())
+
+
+URL_RE = re.compile(
+    r"(https?://[^\s<>()]+|(?:t\.me|telegram\.me|telegram\.dog)/[^\s<>()]+)",
+    flags=re.I,
+)
+
+
+def extract_first_url(text):
+    """Return the first clean URL from pasted text so captions do not break link processors."""
+    raw = str(text or "").strip()
+    match = URL_RE.search(raw)
+    if not match:
+        return raw if raw.startswith("http") else ""
+    url = match.group(1).strip().strip(".,;)]}>\"'")
+    if re.match(r"^(t\.me|telegram\.me|telegram\.dog)/", url, flags=re.I):
+        url = "https://" + url
+    return url
+
+
+def detect_link_platform(url):
+    text = (extract_first_url(url) or url or "").lower()
+    if "t.me/" in text or "telegram.me/" in text or "telegram.dog/" in text:
+        return "telegram"
+    return "unsupported"
+
+
+def canonical_link_url(url, platform="telegram"):
+    clean = extract_first_url(url) or str(url or "").strip()
+    clean = clean.strip()
+    if not clean:
+        return ""
+    return clean.split("?", 1)[0].rstrip("/") or clean
+
+
+def parse_telegram_message_link(url):
+    """Parse public, /s/, and /c/ Telegram post links into (chat_ref, msg_id)."""
+    clean = canonical_link_url(url, "telegram")
+    if re.match(r"^(t\.me|telegram\.me|telegram\.dog)/", clean, flags=re.I):
+        clean = "https://" + clean
+    match = re.search(
+        r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?(?:(?:c/(\d+))|([A-Za-z0-9_]{4,}))/?/(\d+)(?:/)?$",
+        clean,
+        flags=re.I,
+    )
+    if not match:
+        return None, None
+    private_id, username, message_id = match.groups()
+    if private_id:
+        return int(f"-100{private_id}"), int(message_id)
+    return f"@{username.lower()}", int(message_id)
+
+
+def should_offload_link(platform):
+    if not WORKER_QUEUE_GROUP_ID and not WORKER_HTTP_URLS:
+        return False
+    if platform == "telegram":
+        if not OFFLOAD_TELEGRAM_LINKS:
+            return False
+        ready, reason = worker_queue_transport_ready()
+        if not ready:
+            log_event(f"Worker queue unavailable; Telegram link will use local queue: {reason}")
+        return ready
+    return False
+
+
+def build_worker_queue_payload(url, platform, requester_id, status_msg=None, **extra):
+    task_id = stable_uid("worker_task", requester_id, url, time.time(), uuid.uuid4().hex[:8])
+    payload = {
+        "royells_queue": 1,
+        "kind": "task",
+        "task_id": task_id,
+        "platform": platform,
+        "url": url,
+        "requester_id": int(requester_id),
+        "status_chat_id": int(status_msg.chat.id) if status_msg else 0,
+        "status_message_id": int(status_msg.id) if status_msg else 0,
+        "target_chat_id": int(TARGET_CHAT_ID),
+        "created_at": now_iso(),
+    }
+    if SOURCE_LINK_REPORT_CHAT_ID:
+        payload["source_link_report_chat_id"] = int(SOURCE_LINK_REPORT_CHAT_ID)
+    for key, value in extra.items():
+        if value not in (None, ""):
+            payload[key] = value
+    if WORKER_QUEUE_SECRET:
+        payload["secret"] = WORKER_QUEUE_SECRET
+    return payload
+
+
+def build_worker_queue_ping_payload():
+    payload = {
+        "royells_queue": 1,
+        "kind": "ping",
+        "task_id": stable_uid("worker_ping", now_iso(), uuid.uuid4().hex[:8]),
+        "created_at": now_iso(),
+        "target_chat_id": int(TARGET_CHAT_ID),
+    }
+    if WORKER_QUEUE_SECRET:
+        payload["secret"] = WORKER_QUEUE_SECRET
+    return payload
+
+
+def parse_worker_queue_payload(text):
+    raw_text = (text or "").strip()
+    if raw_text.startswith("/royells_queue") or raw_text.startswith("/royells_task"):
+        parts = raw_text.split(maxsplit=1)
+        raw_text = parts[1] if len(parts) > 1 else ""
+    if raw_text.startswith("```") and raw_text.endswith("```"):
+        raw_text = raw_text.strip("`").strip()
+    if not raw_text.startswith("{"):
+        start = raw_text.find("{")
+        end = raw_text.rfind("}")
+        if start >= 0 and end > start:
+            raw_text = raw_text[start : end + 1]
+    try:
+        data = json.loads(raw_text or "")
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("royells_queue") != 1:
+        return None
+    if WORKER_QUEUE_SECRET and data.get("secret") != WORKER_QUEUE_SECRET:
+        return None
+    return data
+
+
+def record_worker_queue_task(payload, status="queued", detail=""):
+    task_id = str(payload.get("task_id") or "")
+    if not task_id:
+        return
+    with state_mutex:
+        items = STATE["worker_queue"].setdefault("items", {})
+        old = items.get(task_id, {})
+        items[task_id] = {
+            **old,
+            "task_id": task_id,
+            "platform": payload.get("platform", "unknown"),
+            "url": payload.get("url", ""),
+            "requester_id": payload.get("requester_id"),
+            "status_chat_id": payload.get("status_chat_id"),
+            "status_message_id": payload.get("status_message_id"),
+            "queue_message_id": payload.get("queue_message_id") or old.get("queue_message_id"),
+            "worker_id": payload.get("worker_id") or old.get("worker_id", ""),
+            "status": status,
+            "detail": str(detail or old.get("detail", ""))[:500],
+            "created_at": old.get("created_at", payload.get("created_at") or now_iso()),
+            "updated_at": now_iso(),
+        }
+        events = STATE["worker_queue"].setdefault("events", [])
+        events.append({"time": now_iso(), "task_id": task_id, "status": status, "detail": str(detail)[:180]})
+        if len(events) > 1000:
+            STATE["worker_queue"]["events"] = events[-1000:]
+        if len(items) > 800:
+            ordered = sorted(items.values(), key=lambda item: item.get("updated_at", ""))
+            keep = {item["task_id"] for item in ordered[-600:] if item.get("task_id")}
+            STATE["worker_queue"]["items"] = {tid: item for tid, item in items.items() if tid in keep}
+        save_state("worker_queue")
+
+
+def update_worker_queue_result(payload):
+    status = str(payload.get("status") or "unknown")
+    detail = payload.get("message", "")
+    record_worker_queue_task(payload, status=status, detail=detail)
+
+
+def record_worker_queue_heartbeat(payload):
+    """Persist the latest worker heartbeat so the dashboard exposes transport health."""
+    with state_mutex:
+        STATE["worker_queue"]["last_worker_seen"] = now_iso()
+        STATE["worker_queue"]["last_worker_id"] = payload.get("worker_id", "")
+        STATE["worker_queue"]["last_worker_status"] = payload.get("status", payload.get("kind", "heartbeat"))
+        STATE["worker_queue"]["last_worker_message"] = str(payload.get("message", ""))[:300]
+        save_state("worker_queue")
+
+
+def record_worker_queue_transport(status, detail="", message_id=None):
+    """Persist master-to-group transport health for dashboard diagnostics."""
+    with state_mutex:
+        STATE["worker_queue"]["last_transport_status"] = str(status)[:40]
+        STATE["worker_queue"]["last_transport_detail"] = str(detail)[:300]
+        STATE["worker_queue"]["last_transport_message_id"] = message_id
+        STATE["worker_queue"]["last_transport_time"] = now_iso()
+        save_state("worker_queue")
+
+
+def worker_queue_stats():
+    with state_mutex:
+        items = list(STATE.get("worker_queue", {}).setdefault("items", {}).values())
+        last_worker_seen = STATE.get("worker_queue", {}).get("last_worker_seen", "")
+        last_worker_id = STATE.get("worker_queue", {}).get("last_worker_id", "")
+        last_worker_status = STATE.get("worker_queue", {}).get("last_worker_status", "")
+        last_transport_status = STATE.get("worker_queue", {}).get("last_transport_status", "")
+        last_transport_detail = STATE.get("worker_queue", {}).get("last_transport_detail", "")
+        last_transport_time = STATE.get("worker_queue", {}).get("last_transport_time", "")
+    pending_statuses = {"queued", "sent", "processing", "claimed"}
+    done_statuses = {"uploaded", "duplicate", "skipped", "done"}
+    failed_statuses = {"failed", "error"}
+    pending = sum(1 for item in items if item.get("status") in pending_statuses)
+    done = sum(1 for item in items if item.get("status") in done_statuses)
+    failed = sum(1 for item in items if item.get("status") in failed_statuses)
+    last = max(items, key=lambda item: item.get("updated_at", ""), default={})
+    worker_seen_age = seconds_since_iso(last_worker_seen) if last_worker_seen else 10**9
+    worker_stale_after = max(300, WORKER_QUEUE_HEARTBEAT_SECONDS * 3)
+    worker_alive = bool(last_worker_seen and worker_seen_age <= worker_stale_after)
+    return {
+        "total": len(items),
+        "pending": pending,
+        "done": done,
+        "failed": failed,
+        "last_status": last.get("status", "none"),
+        "last_time": last.get("updated_at", ""),
+        "last_platform": last.get("platform", ""),
+        "last_worker_seen": last_worker_seen,
+        "last_worker_id": last_worker_id,
+        "last_worker_status": last_worker_status,
+        "worker_alive": worker_alive,
+        "worker_seen_age": worker_seen_age,
+        "worker_stale_after": worker_stale_after,
+        "last_transport_status": last_transport_status,
+        "last_transport_detail": last_transport_detail,
+        "last_transport_time": last_transport_time,
+    }
+
+
+def worker_queue_transport_ready():
+    """Return whether master should offload new link work to external workers."""
+    if WORKER_HTTP_URLS:
+        return True, "http configured"
+    if not WORKER_QUEUE_GROUP_ID:
+        return False, "queue group missing"
+    if not WORKER_QUEUE_REQUIRE_HEARTBEAT:
+        return True, "heartbeat check disabled"
+    qstats = worker_queue_stats()
+    if qstats.get("worker_alive"):
+        return True, "worker heartbeat fresh"
+    return False, "worker heartbeat missing/stale"
+
+
+async def send_worker_queue_message(queue_text):
+    """Send queue transport through the private group with userbot first and bot-history fallback."""
+    primary_sent = None
+    bot_sent = None
+    errors = []
+    if not WORKER_QUEUE_GROUP_ID:
+        record_worker_queue_transport("skipped", "worker queue group not configured")
+        raise RuntimeError("Worker queue group is not configured.")
+    if WORKER_QUEUE_SEND_VIA_USERBOT:
+        try:
+            primary_sent = await tg_call(
+                "worker queue send via userbot",
+                userbot.send_message,
+                WORKER_QUEUE_GROUP_ID,
+                queue_text,
+                disable_web_page_preview=True,
+                retries=2,
+            )
+        except Exception as e:
+            errors.append(f"userbot: {str(e)[:160]}")
+    if primary_sent:
+        record_worker_queue_transport("ok", "task sent through userbot", getattr(primary_sent, "id", None))
+        return primary_sent
+    if WORKER_QUEUE_SEND_VIA_BOT:
+        try:
+            bot_sent = await telegram_gateway_await('app.send_message', lambda: app.send_message(
+                WORKER_QUEUE_GROUP_ID,
+                queue_text[:4000],
+                disable_web_page_preview=True,
+            ))
+        except Exception as e:
+            errors.append(f"bot: {str(e)[:160]}")
+    if bot_sent:
+        record_worker_queue_transport(
+            "bot_history",
+            "task sent by main bot; worker backlog scanner will claim it",
+            getattr(bot_sent, "id", None),
+        )
+        return bot_sent
+    record_worker_queue_transport("failed", " | ".join(errors or ["userbot sender disabled or unavailable"]))
+    raise RuntimeError(
+        "Worker queue transport failed. Add main bot, queue bot, and logged-in userbot to the queue group, "
+        "or set ROYELLS_WORKER_HTTP_URLS to the worker Space URL. "
+        + " | ".join(errors or ["all group senders disabled or unavailable"])
+    )
+
+
+async def send_worker_http_payload(payload):
+    """Push a worker task directly to worker Space HTTP /queue, protected by the shared queue secret."""
+    if not WORKER_HTTP_URLS:
+        raise RuntimeError("Worker HTTP URL is not configured.")
+    errors = []
+    headers = {"Content-Type": "application/json"}
+    if WORKER_QUEUE_SECRET:
+        headers["X-Royells-Secret"] = WORKER_QUEUE_SECRET
+    for base_url in WORKER_HTTP_URLS:
+        endpoint = base_url.rstrip("/") + "/queue"
+        try:
+            response = await run_blocking(
+                "control", requests.post,
+                endpoint,
+                json=payload,
+                headers=headers,
+                timeout=WORKER_HTTP_TIMEOUT_SECONDS,
+            )
+            body = response.text[:300]
+            if response.ok:
+                parsed = {}
+                with contextlib.suppress(Exception):
+                    parsed = response.json()
+                worker_id = parsed.get("worker_id") if isinstance(parsed, dict) else ""
+                detail = f"task sent to {base_url}"
+                if worker_id:
+                    detail += f" | {worker_id}"
+                    record_worker_queue_heartbeat(
+                        {
+                            "worker_id": worker_id,
+                            "status": "http_accept",
+                            "message": f"HTTP accepted task through {base_url}",
+                        }
+                    )
+                record_worker_queue_transport("http_ok", detail)
+                return {"url": base_url, "status_code": response.status_code, "body": body, "json": parsed}
+            errors.append(f"{base_url}: {response.status_code} {body}")
+        except Exception as e:
+            errors.append(f"{base_url}: {str(e)[:180]}")
+    detail = " | ".join(errors)[:500]
+    record_worker_queue_transport("http_failed", detail)
+    raise RuntimeError(f"Worker HTTP transport failed. {detail}")
+
+
+async def send_worker_queue_payload(payload):
+    """Send a worker payload through the most reliable configured transport."""
+    payload_json = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    command = f"/royells_queue@{WORKER_BOT_USERNAME}" if WORKER_BOT_USERNAME else "/royells_queue"
+    errors = []
+
+    if WORKER_HTTP_URLS:
+        try:
+            result = await send_worker_http_payload(payload)
+            return "http", result
+        except Exception as e:
+            errors.append(f"http: {str(e)[:180]}")
+
+    if WORKER_QUEUE_GROUP_ID:
+        try:
+            sent = await send_worker_queue_message(f"{command} {payload_json}")
+            return "group", sent
+        except Exception as e:
+            errors.append(f"group: {str(e)[:180]}")
+
+    raise RuntimeError(" | ".join(errors) or "No worker queue transport is configured.")
+
+
+async def send_worker_queue_ping():
+    payload = build_worker_queue_ping_payload()
+    transport, result = await send_worker_queue_payload(payload)
+    log_event(f"Worker queue ping sent through {transport}: {getattr(result, 'id', '') if transport == 'group' else result.get('status_code')}")
+
+
+async def worker_queue_ping_loop():
+    if QUEUE_WORKER_MODE or (not WORKER_QUEUE_GROUP_ID and not WORKER_HTTP_URLS):
+        while True:
+            await asyncio.sleep(3600)
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await send_worker_queue_ping()
+        except Exception as e:
+            log_event(f"Worker queue ping failed: {str(e)[:160]}")
+        await asyncio.sleep(max(120, WORKER_QUEUE_PING_SECONDS))
+
+
+async def enqueue_worker_task(client, url, platform, requester_id, status_msg):
+    payload = build_worker_queue_payload(url, platform, requester_id, status_msg)
+    transport, sent = await send_worker_queue_payload(payload)
+    if transport == "group":
+        payload["queue_message_id"] = getattr(sent, "id", None)
+    else:
+        payload["queue_message_id"] = ""
+    record_worker_queue_task(payload, status="sent")
+    log_event(f"Worker queue task sent through {transport}: {payload['task_id']} | {platform} | user {requester_id}")
+    return payload
+
+
+async def queue_private_link(client, message, text, notice):
+    clean_url = extract_first_url(text)
+    if not clean_url:
+        await delete_incoming_message(message)
+        return await telegram_gateway_await('client.send_message', lambda: client.send_message(message.chat.id, "No valid link found in the message."))
+    platform = detect_link_platform(clean_url)
+    if platform == "unsupported":
+        await delete_incoming_message(message)
+        return await telegram_gateway_await('client.send_message', lambda: client.send_message(message.chat.id, "Unsupported link. Send a Telegram post/channel link."))
+    offload = False
+    queue_pos = link_process_queue.qsize() + 1
+    queue_name = "local queue"
+    status_msg = await telegram_gateway_await('client.send_message', lambda: client.send_message(
+        message.chat.id,
+        f"{notice}\nRoute: {queue_name}\nQueue position: {queue_pos}\nOriginal link removed.",
+        disable_web_page_preview=True,
+    ))
+    await delete_incoming_message(message)
+    if offload:
+        try:
+            await enqueue_worker_task(client, clean_url, platform, message.from_user.id, status_msg)
+            await safe_edit(status_msg, f"{platform.title()} link sent to queue.")
+            return status_msg
+        except Exception as e:
+            log_event(f"External queue failed, falling back to local processing: {e}")
+            await safe_edit(status_msg, f"Queue failed. Using local queue.\nReason: {str(e)[:160]}")
+    link_job = stamp_queue_job(
+        {
+            "url": clean_url,
+            "status_msg": status_msg,
+            "retries": 0,
+            "requester_id": int(getattr(message.from_user, "id", 0) or 0),
+        },
+        "link",
+    )
+    await link_process_queue.put(link_job)
+    return status_msg
+
+
+TELEGRAM_LINK_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/(?:(?:s/[A-Za-z0-9_]{4,})|(?:c/\d+)|(?:[A-Za-z0-9_]{4,})|(?:\+[\w-]+)|(?:joinchat/[\w-]+))(?:/\d+)?",
+    flags=re.I,
+)
+
+
+def normalize_telegram_link_for_report(url):
+    text = str(url or "").strip().strip(".,;)]}>\"'")
+    if not text:
+        return ""
+    if re.match(r"^(t\.me|telegram\.me|telegram\.dog)/", text, flags=re.I):
+        text = "https://" + text
+    if not re.search(r"https?://(?:t\.me|telegram\.me|telegram\.dog)/", text, flags=re.I):
+        return ""
+    return text.split("?", 1)[0].rstrip("/")
+
+
+def extract_telegram_links_from_message(msg):
+    links = []
+    for text in [getattr(msg, "text", None), getattr(msg, "caption", None)]:
+        if not text:
+            continue
+        links.extend(normalize_telegram_link_for_report(m.group(0)) for m in TELEGRAM_LINK_RE.finditer(str(text)))
+    for entity in list(getattr(msg, "entities", None) or []) + list(getattr(msg, "caption_entities", None) or []):
+        url = getattr(entity, "url", None)
+        if url:
+            links.append(normalize_telegram_link_for_report(url))
+    reply_markup = getattr(msg, "reply_markup", None)
+    for row in getattr(reply_markup, "inline_keyboard", None) or []:
+        for button in row or []:
+            url = getattr(button, "url", None)
+            if url:
+                links.append(normalize_telegram_link_for_report(url))
+    clean = []
+    seen = set()
+    for link in links:
+        if link and link not in seen:
+            clean.append(link)
+            seen.add(link)
+    return clean
+
+
+def mark_source_link_discovered(link, source_msg, origin):
+    uid = stable_uid("src_link", normalize_telegram_link_for_report(link))
+    with state_mutex:
+        discovered = STATE["sync_source_manager"].setdefault("discovered_links", {})
+        if uid in discovered:
+            return False
+        discovered[uid] = {
+            "uid": uid,
+            "link": link,
+            "origin": origin,
+            "source_chat_id": getattr(getattr(source_msg, "chat", None), "id", ""),
+            "source_message_id": getattr(source_msg, "id", ""),
+            "created_at": now_iso(),
+        }
+        if len(discovered) > 5000:
+            ordered = sorted(discovered.values(), key=lambda item: item.get("created_at", ""))
+            keep = {item["uid"] for item in ordered[-4000:] if item.get("uid")}
+            STATE["sync_source_manager"]["discovered_links"] = {
+                key: item for key, item in discovered.items() if key in keep
+            }
+        save_state("sync_source_manager")
+    return True
+
+
+def source_link_is_invite(clean_link):
+    lowered = str(clean_link or "").lower()
+    return "t.me/+" in lowered or "telegram.me/+" in lowered or "telegram.dog/+" in lowered or "/joinchat/" in lowered
+
+
+def source_link_is_private_message_link(clean_link):
+    return bool(re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/c/\d+(?:/\d+)?", str(clean_link or ""), flags=re.I))
+
+
+def source_link_status_template(valid="unknown", live="unknown", joinable="unknown", method="not checked", note=""):
+    return {
+        "valid": valid,
+        "live": live,
+        "joinable": joinable,
+        "method": method,
+        "note": str(note or "")[:180],
+        "checked_at": format_display_datetime(seconds=True),
+    }
+
+
+def source_link_status_cache_key(clean_link, ref):
+    return stable_uid("src_link_live", normalize_telegram_link_for_report(clean_link), str(ref or ""))
+
+
+def get_cached_source_link_status(cache_key):
+    item = source_link_check_cache.get(cache_key)
+    if not item:
+        return None
+    if item.get("expires_at", 0) < time.time():
+        source_link_check_cache.pop(cache_key, None)
+        return None
+    result = dict(item.get("result") or {})
+    if result:
+        result["method"] = f"{result.get('method', 'checked')} cached"
+    return result or None
+
+
+def remember_source_link_status(cache_key, result):
+    source_link_check_cache[cache_key] = {
+        "expires_at": time.time() + SOURCE_LINK_CHECK_CACHE_SECONDS,
+        "result": dict(result or {}),
+    }
+    if len(source_link_check_cache) > 2000:
+        now = time.time()
+        expired = [key for key, item in source_link_check_cache.items() if item.get("expires_at", 0) < now]
+        for key in expired[:1000]:
+            source_link_check_cache.pop(key, None)
+        if len(source_link_check_cache) > 2000:
+            for key in list(source_link_check_cache.keys())[:500]:
+                source_link_check_cache.pop(key, None)
+
+
+async def source_link_probe_call(label, func, *args, timeout=25):
+    await wait_for_telegram_client(label)
+    async with telegram_api_semaphore:
+        return await asyncio.wait_for(func(*args), timeout=max(5, timeout))
+
+
+def source_link_status_from_chat(chat, clean_link, method, note=""):
+    username = getattr(chat, "username", "") or ""
+    if username:
+        joinable = "yes"
+        note = note or "public username resolved"
+    elif source_link_is_private_message_link(clean_link):
+        joinable = "accessible"
+        note = note or "private /c link is accessible to this userbot"
+    elif source_link_is_invite(clean_link):
+        joinable = "yes" if "join probe" in method else "accessible"
+        note = note or "invite link resolved for this userbot"
+    else:
+        joinable = "accessible"
+        note = note or "chat resolved for this userbot"
+    return source_link_status_template("yes", "yes", joinable, method, note)
+
+
+def source_link_status_from_error(exc, method):
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    already_joined = [
+        "user_already_participant",
+        "already a participant",
+        "already participant",
+    ]
+    dead_or_invalid = [
+        "invite_hash_expired",
+        "invite hash expired",
+        "invite_hash_invalid",
+        "invite hash invalid",
+        "username_not_occupied",
+        "username not occupied",
+        "peer_id_invalid",
+        "peer id invalid",
+        "channel_invalid",
+        "chat_invalid",
+        "not found",
+        "no chat found",
+    ]
+    not_joinable = [
+        "channel_private",
+        "chat_admin_required",
+        "user_banned_in_channel",
+        "forbidden",
+        "not enough rights",
+        "invite request sent",
+        "join request",
+    ]
+    temporary = [
+        "flood_wait",
+        "floodwait",
+        "timed out",
+        "timeout",
+        "connection",
+        "ssl",
+        "transport",
+    ]
+    if any(marker in text for marker in already_joined):
+        return source_link_status_template("yes", "yes", "yes", method, "userbot is already joined")
+    if any(marker in text for marker in dead_or_invalid):
+        return source_link_status_template("no", "no", "no", method, str(exc))
+    if any(marker in text for marker in not_joinable):
+        return source_link_status_template("unknown", "unknown", "no", method, str(exc))
+    if any(marker in text for marker in temporary):
+        return source_link_status_template("unknown", "unknown", "unknown", method, str(exc))
+    return source_link_status_template("unknown", "unknown", "unknown", method, str(exc))
+
+
+async def check_source_link_live_status(clean_link, ref, resolved_chat=None):
+    if not SOURCE_LINK_LIVE_CHECK_ENABLED:
+        return source_link_status_template(method="disabled", note="ROYELLS_SOURCE_LINK_LIVE_CHECK=0")
+    cache_key = source_link_status_cache_key(clean_link, ref)
+    cached = get_cached_source_link_status(cache_key)
+    if cached:
+        return cached
+    async with source_link_check_semaphore:
+        cached = get_cached_source_link_status(cache_key)
+        if cached:
+            return cached
+        if resolved_chat is not None:
+            result = source_link_status_from_chat(resolved_chat, clean_link, "existing resolve")
+            remember_source_link_status(cache_key, result)
+            return result
+        if ref in (None, ""):
+            result = source_link_status_template("no", "no", "no", "parse", "link reference could not be parsed")
+            remember_source_link_status(cache_key, result)
+            return result
+        if source_link_is_invite(clean_link):
+            if SOURCE_LINK_JOIN_PROBE_ENABLED:
+                try:
+                    chat = await source_link_probe_call("source link invite join probe", userbot.join_chat, clean_link, timeout=30)
+                    result = source_link_status_from_chat(chat, clean_link, "invite join probe", "joined by probe")
+                    if SOURCE_LINK_JOIN_PROBE_LEAVE_AFTER:
+                        chat_id = getattr(chat, "id", None)
+                        if chat_id:
+                            with contextlib.suppress(Exception):
+                                await source_link_probe_call("source link invite leave after probe", userbot.leave_chat, chat_id, timeout=15)
+                                result["note"] = "joined successfully and left after probe"
+                    remember_source_link_status(cache_key, result)
+                    return result
+                except Exception as e:
+                    result = source_link_status_from_error(e, "invite join probe")
+                    remember_source_link_status(cache_key, result)
+                    return result
+            try:
+                chat = await source_link_probe_call("source link invite resolve", userbot.get_chat, clean_link, timeout=20)
+                result = source_link_status_from_chat(chat, clean_link, "invite resolve", "invite accessible; join probe disabled")
+            except Exception as e:
+                result = source_link_status_from_error(e, "invite resolve")
+                if result.get("valid") == "unknown" and result.get("joinable") == "unknown":
+                    result = source_link_status_template(
+                        "unknown",
+                        "unknown",
+                        "unknown",
+                        "invite probe disabled",
+                        "set ROYELLS_SOURCE_LINK_JOIN_PROBE=1 to test private invite joinability",
+                    )
+            remember_source_link_status(cache_key, result)
+            return result
+        try:
+            lookup = normalize_channel_id(ref) if not (isinstance(ref, str) and ref.startswith("http")) else ref
+            chat = await source_link_probe_call("source link public resolve", userbot.get_chat, lookup, timeout=25)
+            result = source_link_status_from_chat(chat, clean_link, "public resolve")
+        except Exception as e:
+            result = source_link_status_from_error(e, "public resolve")
+        remember_source_link_status(cache_key, result)
+        return result
+
+
+async def build_source_link_report(link, source_msg, origin):
+    clean_link = normalize_telegram_link_for_report(link)
+    ref, _ = extract_source_channel_reference(clean_link)
+    resolved_chat = None
+    title = "Unknown"
+    username = ""
+    channel_id = ""
+    chat_type = "private/invite"
+    members = ""
+    description = ""
+    if ref not in (None, ""):
+        try:
+            chat = await tg_call("source link report get_chat", userbot.get_chat, ref, retries=1)
+            resolved_chat = chat
+            title = getattr(chat, "title", "") or getattr(chat, "first_name", "") or title
+            username = getattr(chat, "username", "") or ""
+            channel_id = str(getattr(chat, "id", "") or "")
+            chat_type = "public" if username else "private"
+            description = (getattr(chat, "description", "") or "").strip()
+            with contextlib.suppress(Exception):
+                count = await tg_call("source link member count", userbot.get_chat_members_count, getattr(chat, "id", ref), retries=1)
+                if count:
+                    members = str(count)
+        except Exception as e:
+            channel_id = str(ref)
+            description = f"Resolve note: {str(e)[:120]}"
+
+    live_status = await check_source_link_live_status(clean_link, ref, resolved_chat=resolved_chat)
+    source_chat = getattr(source_msg, "chat", None)
+    source_title = getattr(source_chat, "title", "") or str(getattr(source_chat, "id", ""))
+    source_link = source_message_link(source_msg)
+    user_or_id = f"@{username}" if username else (channel_id or str(ref or "unknown"))
+    lines = [
+        "SOURCE LINK FOUND",
+        "-----------------",
+        f"Channel Name : {title[:80]}",
+        f"Username/ID  : {user_or_id}",
+        f"Type         : {chat_type}",
+        f"Channel Link : {clean_link}",
+        f"Valid/Live   : {live_status.get('valid', 'unknown')} / {live_status.get('live', 'unknown')}",
+        f"Joinable     : {live_status.get('joinable', 'unknown')}",
+        f"Check Method : {live_status.get('method', 'unknown')}",
+        f"Found Time   : {format_display_datetime(seconds=True)}",
+        f"Origin       : {origin}",
+        f"Source       : {source_title}",
+    ]
+    if live_status.get("note"):
+        lines.append(f"Check Note   : {live_status.get('note')}")
+    if source_link:
+        lines.append(f"Source Msg   : {source_link}")
+    if members:
+        lines.append(f"Members      : {members}")
+    if description:
+        lines.append("")
+        lines.append(description[:500])
+    return "\n".join(lines)[:3900]
+
+
+async def send_source_link_report_task(link, source_msg, origin, already_marked=False):
+    if not SOURCE_LINK_DISCOVERY_ENABLED or not SOURCE_LINK_REPORT_CHAT_ID:
+        return False
+    if not already_marked and not mark_source_link_discovered(link, source_msg, origin):
+        return False
+    report_text = await build_source_link_report(link, source_msg, origin)
+    errors = []
+    for label, client in (("userbot", userbot), ("bot", app)):
+        try:
+            await tg_call(
+                f"source link report via {label}",
+                client.send_message,
+                SOURCE_LINK_REPORT_CHAT_ID,
+                report_text,
+                disable_web_page_preview=False,
+                retries=2,
+            )
+            log_event(f"Source link report sent via {label}: {link}")
+            return True
+        except Exception as e:
+            errors.append(f"{label}: {str(e)[:120]}")
+            if label == "userbot" and should_reconnect_telegram_error(e):
+                schedule_userbot_reconnect(f"source link report: {e}")
+    log_event(f"Source link report failed for {link}: {' | '.join(errors)[:240]}")
+    return False
+
+
+def schedule_source_link_discovery(msg, origin):
+    if not SOURCE_LINK_DISCOVERY_ENABLED or not SOURCE_LINK_REPORT_CHAT_ID:
+        return
+    links = extract_telegram_links_from_message(msg)
+    for link in links:
+        if mark_source_link_discovered(link, msg, f"{origin}:scheduled"):
+            asyncio.create_task(send_source_link_report_task(link, msg, origin, already_marked=True))
+
+
+def source_message_link(msg):
+    if not msg or not getattr(msg, "chat", None):
+        return ""
+    username = getattr(msg.chat, "username", "") or ""
+    if username:
+        return f"https://t.me/{username}/{msg.id}"
+    chat_id = str(getattr(msg.chat, "id", "") or "")
+    if chat_id.startswith("-100") and chat_id[4:].isdigit():
+        return f"https://t.me/c/{chat_id[4:]}/{msg.id}"
+    return ""
+
+
+BRAIN_STOP_WORDS = {
+    "this", "that", "with", "from", "have", "your", "more", "just", "video", "photo", "post", "reel", "link",
+    "channel", "group", "join", "follow", "like", "share", "subscribe", "free", "viral", "trending",
+    "ami", "tumi", "tomar", "amar", "kore", "hobe", "ache", "ase", "jabe", "kisu", "kichu", "video",
+    "à¦†à¦®à¦¿", "à¦¤à§à¦®à¦¿", "à¦†à¦®à¦¾à¦°", "à¦¤à§‹à¦®à¦¾à¦°", "à¦•à¦°à§‡", "à¦¹à¦¬à§‡", "à¦†à¦›à§‡",
+}
+
+BRAIN_CATEGORY_LEXICON = {
+    "adult_short_video": ("reel", "short", "clip", "viral", "trending", "status", "story", "vertical", "feed"),
+    "adult_photo_model": ("model", "photo", "photoshoot", "portrait", "glamour", "style", "beauty", "fashion"),
+    "adult_video_album": ("album", "collection", "pack", "gallery", "series", "part", "episode", "set"),
+    "adult_premium_style": ("premium", "exclusive", "vip", "private", "paid", "special", "backup", "locked"),
+    "adult_amateur_style": ("amateur", "real", "homemade", "local", "desi", "bhabhi", "housewife", "aunty"),
+    "adult_professional_style": ("professional", "studio", "official", "creator", "star", "actress", "modeling"),
+    "adult_couple_style": ("couple", "romantic", "love", "partner", "duo", "pair"),
+    "adult_cosplay_style": ("cosplay", "costume", "anime", "roleplay", "fantasy", "dressup"),
+    "adult_dance_style": ("dance", "dancing", "music", "song", "performance", "stage", "moves"),
+    "adult_lifestyle_style": ("travel", "vlog", "selfie", "gym", "fitness", "pool", "beach", "lifestyle"),
+    "adult_meme_funny": ("funny", "meme", "comedy", "joke", "roast", "prank", "reaction"),
+}
+
+BRAIN_SAFETY_REJECT_TERMS = {
+    "minor", "underage", "child", "teen", "schoolgirl", "school boy", "schoolboy", "kid", "kids",
+    "forced", "blackmail", "hidden cam", "leak", "revenge", "rape", "abuse",
+}
+
+
+def brain_state():
+    return STATE.setdefault("brain_dictionary", default_state("brain_dictionary"))
+
+
+def normalize_brain_term(term, hashtag=False):
+    text = str(term or "").strip().lower()
+    text = text.strip(".,;:!?()[]{}<>\"'`~|/\\")
+    if hashtag:
+        text = "#" + text.lstrip("#")
+    else:
+        text = text.lstrip("#")
+    if not text or text in {"#", "@"}:
+        return ""
+    clean = text.lstrip("#")
+    if len(clean) < 4 or clean.isdigit() or clean in BRAIN_STOP_WORDS:
+        return ""
+    if not re.search(r"[a-zA-Z\u0980-\u09FF]", clean):
+        return ""
+    return text
+
+
+def split_brain_terms(raw):
+    terms = []
+    for part in re.split(r"[,;\n\r\t ]+", str(raw or "")):
+        text = part.strip()
+        if text:
+            terms.append(text)
+    return terms
+
+
+def extract_brain_terms_from_text(text):
+    raw = str(text or "")
+    hashtags = {normalize_brain_term(m.group(0), hashtag=True) for m in re.finditer(r"#[\w\u0980-\u09FF]{3,}", raw)}
+    hashtags.discard("")
+    keyword_candidates = re.findall(r"[\w\u0980-\u09FF]{4,}", raw.lower())
+    keywords = {normalize_brain_term(word) for word in keyword_candidates}
+    keywords.discard("")
+    return keywords, hashtags
+
+
+def init_brain_dictionary_from_env():
+    if not BRAIN_DICTIONARY_ENABLED:
+        return
+    changed = False
+    with state_mutex:
+        brain = brain_state()
+        if BRAIN_KEYWORDS_ENV:
+            for term in split_brain_terms(BRAIN_KEYWORDS_ENV):
+                norm = normalize_brain_term(term)
+                if norm and norm not in brain.setdefault("keywords", []):
+                    brain["keywords"].append(norm)
+                    changed = True
+        if BRAIN_HASHTAGS_ENV:
+            for term in split_brain_terms(BRAIN_HASHTAGS_ENV):
+                norm = normalize_brain_term(term, hashtag=True)
+                if norm and norm not in brain.setdefault("hashtags", []):
+                    brain["hashtags"].append(norm)
+                    changed = True
+        if changed:
+            brain.setdefault("events", []).append({"time": now_iso(), "action": "seed_from_env"})
+            trim_events("brain_dictionary")
+            save_state("brain_dictionary")
+
+
+def brain_add_terms(raw_terms, source="owner"):
+    added_keywords = []
+    added_hashtags = []
+    with state_mutex:
+        brain = brain_state()
+        for raw in split_brain_terms(raw_terms):
+            is_hash = raw.strip().startswith("#")
+            norm = normalize_brain_term(raw, hashtag=is_hash)
+            if not norm:
+                continue
+            if norm.startswith("#"):
+                items = brain.setdefault("hashtags", [])
+                if norm not in items:
+                    items.append(norm)
+                    added_hashtags.append(norm)
+            else:
+                items = brain.setdefault("keywords", [])
+                if norm not in items:
+                    items.append(norm)
+                    added_keywords.append(norm)
+        if added_keywords or added_hashtags:
+            brain.setdefault("events", []).append(
+                {"time": now_iso(), "action": "add_terms", "source": source, "keywords": added_keywords, "hashtags": added_hashtags}
+            )
+            trim_events("brain_dictionary")
+            save_state("brain_dictionary")
+    return added_keywords, added_hashtags
+
+
+def brain_learn_from_messages(messages):
+    if not BRAIN_DICTIONARY_ENABLED:
+        return
+    changed = False
+    with state_mutex:
+        brain = brain_state()
+        candidates = brain.setdefault("keyword_candidates", {})
+        learned = brain.setdefault("learned_from", {})
+        keywords = brain.setdefault("keywords", [])
+        hashtags = brain.setdefault("hashtags", [])
+        excludes = set(brain.setdefault("exclude_keywords", []))
+        for msg in messages or []:
+            chat_id = str(getattr(getattr(msg, "chat", None), "id", "") or "")
+            if not chat_id:
+                continue
+            text = getattr(msg, "caption", None) or getattr(msg, "text", None) or ""
+            found_keywords, found_hashtags = extract_brain_terms_from_text(text)
+            for term in sorted((found_keywords | found_hashtags) - excludes):
+                item = candidates.setdefault(term, {"term": term, "sources": [], "count": 0, "updated_at": now_iso()})
+                if chat_id not in item["sources"]:
+                    item["sources"].append(chat_id)
+                item["count"] = int(item.get("count") or 0) + 1
+                item["updated_at"] = now_iso()
+                learned.setdefault(term, [])
+                if chat_id not in learned[term]:
+                    learned[term].append(chat_id)
+                if len(set(item["sources"])) >= 2:
+                    target = hashtags if term.startswith("#") else keywords
+                    if term not in target:
+                        target.append(term)
+                        changed = True
+        if changed:
+            brain.setdefault("events", []).append({"time": now_iso(), "action": "learn_terms"})
+            trim_events("brain_dictionary")
+            save_state("brain_dictionary")
+
+
+def brain_candidate_identity_keys(identifier="", item=None):
+    """Return stable identity keys for one pending source candidate across link/id aliases."""
+    values = []
+    if item:
+        values.extend(
+            [
+                item.get("identifier", ""),
+                item.get("chat_id", ""),
+                item.get("username", ""),
+                item.get("source_link", ""),
+            ]
+        )
+    if identifier:
+        values.append(identifier)
+    keys = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        ref, clean_link = extract_source_channel_reference(text)
+        if clean_link:
+            canonical = normalize_telegram_link_for_report(clean_link) or clean_link
+            public_match = re.match(r"https?://(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?([A-Za-z0-9_]{4,})(?:/\d+)?/?$", canonical, flags=re.I)
+            private_match = re.match(r"https?://(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)(?:/\d+)?/?$", canonical, flags=re.I)
+            if public_match:
+                keys.add(f"user:{public_match.group(1).lower()}")
+                keys.add(f"link:https://t.me/{public_match.group(1).lower()}")
+            elif private_match:
+                keys.add(f"id:-100{private_match.group(1)}")
+                keys.add(f"link:https://t.me/c/{private_match.group(1)}")
+            else:
+                keys.add(f"link:{canonical.lower()}")
+        if ref not in (None, ""):
+            norm = normalize_channel_id(ref)
+            if isinstance(norm, str) and norm.startswith("@"):
+                keys.add(f"user:{norm.lower().lstrip('@')}")
+                keys.add(f"link:https://t.me/{norm.lower().lstrip('@')}")
+            elif str(norm).startswith("-100"):
+                keys.add(f"id:{norm}")
+                if str(norm)[4:].isdigit():
+                    keys.add(f"link:https://t.me/c/{str(norm)[4:]}")
+            else:
+                keys.add(f"id:{norm}")
+        elif text.startswith("@"):
+            keys.add(f"user:{text.lower().lstrip('@')}")
+        elif re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", text):
+            keys.add(f"user:{text.lower()}")
+        elif text.lstrip("-").isdigit():
+            keys.add(f"id:{normalize_channel_id(text)}")
+    if not keys:
+        fallback = normalize_telegram_link_for_report(identifier or (item or {}).get("identifier", "")) or str(identifier or (item or {}).get("identifier", ""))
+        if fallback:
+            keys.add(f"raw:{fallback.lower()}")
+    return keys
+
+
+def brain_active_source_identity_keys():
+    """Return canonical identity keys for currently connected source channels."""
+    keys = set()
+    for item in active_channel_state_items(include_issues=False, limit=None):
+        keys.update(channel_item_dedupe_keys(item))
+        keys.update(
+            brain_candidate_identity_keys(
+                item={
+                    "identifier": item.get("source_link") or item.get("channel_id", ""),
+                    "chat_id": item.get("channel_id", ""),
+                    "username": item.get("username", ""),
+                    "source_link": item.get("source_link", ""),
+                }
+            )
+        )
+    for ch in list(ACTIVE_CHANNELS):
+        norm = normalize_channel_id(ch)
+        if is_reserved_source_channel(norm) or not channel_is_active_record(norm):
+            continue
+        record = get_channel_record(norm)
+        keys.update(channel_dedupe_keys(norm, record.get("username", ""), record.get("source_link", "")))
+        keys.update(
+            brain_candidate_identity_keys(
+                item={
+                    "identifier": record.get("source_link") or norm,
+                    "chat_id": norm,
+                    "username": record.get("username", ""),
+                    "source_link": record.get("source_link", ""),
+                }
+            )
+        )
+    return {key for key in keys if key}
+
+
+def brain_candidate_is_existing_source(identifier="", item=None):
+    values = [identifier]
+    if item:
+        values.extend([item.get("identifier", ""), item.get("chat_id", ""), item.get("username", ""), item.get("source_link", "")])
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if is_reserved_source_channel(text):
+            return True
+        if not text.startswith("http") and channel_is_active_record(normalize_channel_id(text)):
+            return True
+    candidate_keys = brain_candidate_identity_keys(identifier, item=item)
+    return bool(candidate_keys and (candidate_keys & brain_active_source_identity_keys()))
+
+
+def brain_reject_existing_source_candidate_locked(brain, uid, item, reason="already connected source"):
+    pending = brain.setdefault("pending_channels", {})
+    current = pending.pop(uid, None) or deepcopy(item or {})
+    current.update(
+        {
+            "uid": uid,
+            "status": "rejected_duplicate",
+            "reason": reason,
+            "note": reason,
+            "updated_at": now_iso(),
+        }
+    )
+    brain.setdefault("blacklisted_channels", {})[uid] = current
+    brain.setdefault("recommendation_cache", {}).pop(uid, None)
+    brain.setdefault("events", []).append({"time": now_iso(), "action": "reject_existing_source", "uid": uid, "reason": reason})
+    trim_events("brain_dictionary")
+    return deepcopy(current)
+
+
+def brain_reject_existing_source_candidate(uid, item, reason="already connected source"):
+    with state_mutex:
+        brain = brain_state()
+        result = brain_reject_existing_source_candidate_locked(brain, uid, item, reason=reason)
+        save_state("brain_dictionary")
+        return result
+
+
+def brain_filter_existing_sources_locked(brain):
+    removed = 0
+    pending = brain.setdefault("pending_channels", {})
+    for uid, item in list(pending.items()):
+        if brain_candidate_is_existing_source(item=item):
+            brain_reject_existing_source_candidate_locked(brain, uid, item, reason="already connected source")
+            removed += 1
+    return removed
+
+
+def brain_candidate_uid(identifier):
+    keys = sorted(brain_candidate_identity_keys(identifier))
+    seed = keys[0] if keys else (normalize_telegram_link_for_report(identifier) or str(identifier))
+    return stable_uid("brain_ch", seed).split("_", 1)[1][:16]
+
+
+def brain_dedupe_pending_locked(brain):
+    pending = brain.setdefault("pending_channels", {})
+    if not pending:
+        return 0
+    seen = {}
+    removed = 0
+    for uid, item in sorted(
+        list(pending.items()),
+        key=lambda pair: (-float(pair[1].get("score") or 0), str(pair[1].get("updated_at") or ""), str(pair[1].get("created_at") or "")),
+        reverse=False,
+    ):
+        keys = brain_candidate_identity_keys(item=item)
+        duplicate_uid = next((seen[key] for key in keys if key in seen), "")
+        if duplicate_uid and duplicate_uid in pending:
+            keeper = pending[duplicate_uid]
+            if float(item.get("score") or 0) > float(keeper.get("score") or 0):
+                keeper.update({k: v for k, v in item.items() if v not in (None, "", [], {})})
+            pending.pop(uid, None)
+            removed += 1
+            continue
+        for key in keys:
+            seen[key] = uid
+    if removed:
+        brain.setdefault("events", []).append({"time": now_iso(), "action": "pending_dedupe", "removed": removed})
+        trim_events("brain_dictionary")
+    return removed
+
+
+def brain_pending_exists(identifier):
+    if brain_candidate_is_existing_source(identifier):
+        return True
+    uid = brain_candidate_uid(identifier)
+    keys = brain_candidate_identity_keys(identifier)
+    with state_mutex:
+        brain = brain_state()
+        pending = brain.setdefault("pending_channels", {})
+        blacklisted = brain.setdefault("blacklisted_channels", {})
+        if uid in pending or uid in blacklisted:
+            return True
+        for item in list(pending.values()) + list(blacklisted.values()):
+            if keys & brain_candidate_identity_keys(item=item):
+                return True
+        return False
+
+
+def brain_add_pending_channel(identifier, origin="unknown", title="", status="pending", note=""):
+    if not BRAIN_DICTIONARY_ENABLED:
+        return ""
+    clean = normalize_telegram_link_for_report(identifier) or str(identifier or "").strip()
+    if not clean:
+        return ""
+    if brain_candidate_is_existing_source(clean):
+        with state_mutex:
+            brain = brain_state()
+            brain.setdefault("events", []).append({"time": now_iso(), "action": "pending_skip_existing_source", "identifier": clean[:120], "origin": origin})
+            trim_events("brain_dictionary")
+            save_state("brain_dictionary")
+        return ""
+    uid = brain_candidate_uid(clean)
+    with state_mutex:
+        brain = brain_state()
+        if brain_filter_existing_sources_locked(brain):
+            save_state("brain_dictionary")
+        keys = brain_candidate_identity_keys(clean)
+        if uid in brain.setdefault("blacklisted_channels", {}):
+            return uid
+        pending = brain.setdefault("pending_channels", {})
+        for old_uid, old_item in list(pending.items()):
+            if keys & brain_candidate_identity_keys(item=old_item):
+                uid = old_uid
+                break
+        old = pending.get(uid, {})
+        pending[uid] = {
+            **old,
+            "uid": uid,
+            "identifier": clean,
+            "title": title or old.get("title", ""),
+            "origin": origin or old.get("origin", ""),
+            "status": old.get("status", status) if old else status,
+            "note": note or old.get("note", ""),
+            "score": old.get("score", 0),
+            "created_at": old.get("created_at", now_iso()),
+            "updated_at": now_iso(),
+            "dedupe_keys": sorted(keys | set(old.get("dedupe_keys", []))),
+        }
+        brain_dedupe_pending_locked(brain)
+        brain.setdefault("events", []).append({"time": now_iso(), "action": "pending_add", "uid": uid, "origin": origin})
+        trim_events("brain_dictionary")
+        save_state("brain_dictionary")
+    return uid
+
+
+def brain_terms_for_matching():
+    with state_mutex:
+        brain = brain_state()
+        keywords = set(brain.setdefault("keywords", []))
+        hashtags = set(brain.setdefault("hashtags", []))
+    return keywords | hashtags
+
+
+def brain_text_relevance_score(texts):
+    terms = brain_terms_for_matching()
+    if not terms:
+        return 0.0, 0, 0
+    checked = 0
+    matched = 0
+    for text in texts:
+        text_lower = str(text or "").lower()
+        if not text_lower.strip():
+            continue
+        checked += 1
+        if any(term.lower() in text_lower for term in terms):
+            matched += 1
+    if checked <= 0:
+        return 0.0, 0, 0
+    return matched / checked, matched, checked
+
+
+def brain_message_semantic_text(msg, fallback_title=""):
+    if not msg:
+        return str(fallback_title or "")
+    parts = [
+        getattr(msg, "caption", None) or "",
+        getattr(msg, "text", None) or "",
+        fallback_title or "",
+    ]
+    chat = getattr(msg, "chat", None)
+    if chat:
+        parts.extend([getattr(chat, "title", "") or "", getattr(chat, "username", "") or "", getattr(chat, "description", "") or ""])
+    for media in (getattr(msg, "video", None), getattr(msg, "document", None), getattr(msg, "photo", None)):
+        if not media:
+            continue
+        parts.extend([getattr(media, "file_name", "") or "", getattr(media, "mime_type", "") or ""])
+    return " ".join(str(part) for part in parts if part)
+
+
+def brain_semantic_empty_profile():
+    return {"categories": {}, "total": 0, "top": "unknown", "confidence": 0.0, "updated_at": ""}
+
+
+def brain_classify_semantic_text(text):
+    raw = str(text or "").lower()
+    if not raw.strip() or not BRAIN_SEMANTIC_ENABLED:
+        return "unknown", 0.0, {}
+    scores = defaultdict(int)
+    hashtag_terms = {tag.lstrip("#") for tag in re.findall(r"#[\w\u0980-\u09FF]{3,}", raw)}
+    for category, terms in BRAIN_CATEGORY_LEXICON.items():
+        for term in terms:
+            term_l = term.lower()
+            if not term_l:
+                continue
+            if " " in term_l:
+                hits = raw.count(term_l)
+            else:
+                hits = len(re.findall(rf"(?<![\w]){re.escape(term_l)}(?![\w])", raw))
+                if term_l in hashtag_terms:
+                    hits += 2
+            if hits:
+                scores[category] += hits
+    if not scores:
+        return "unknown", 0.0, {}
+    total = sum(scores.values())
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    top, top_score = ranked[0]
+    confidence = round(top_score / max(1, total), 4)
+    return top, confidence, dict(scores)
+
+
+def brain_safety_flags_from_text(text):
+    raw = str(text or "").lower()
+    flags = []
+    for term in BRAIN_SAFETY_REJECT_TERMS:
+        if term in raw:
+            flags.append(term)
+    return sorted(set(flags))[:8]
+
+
+def brain_semantic_profile_from_messages(messages, title=""):
+    profile = brain_semantic_empty_profile()
+    safety_flags = set()
+    for msg in messages or []:
+        if not is_valid_media(msg) or is_gif_media(msg):
+            continue
+        semantic_text = brain_message_semantic_text(msg, fallback_title=title)
+        safety_flags.update(brain_safety_flags_from_text(semantic_text))
+        category, confidence, raw_scores = brain_classify_semantic_text(semantic_text)
+        if category == "unknown":
+            continue
+        weight = max(1, int(round(confidence * 10)))
+        cats = profile.setdefault("categories", {})
+        cats[category] = int(cats.get(category) or 0) + weight
+        for raw_cat, raw_count in raw_scores.items():
+            if raw_cat != category and raw_count > 0:
+                cats[raw_cat] = int(cats.get(raw_cat) or 0) + max(1, int(raw_count))
+        profile["total"] = int(profile.get("total") or 0) + weight
+    cats = profile.get("categories", {})
+    total = sum(int(v or 0) for v in cats.values())
+    profile["total"] = total
+    if total > 0:
+        top, top_score = sorted(cats.items(), key=lambda item: (-int(item[1] or 0), item[0]))[0]
+        profile["top"] = top
+        profile["confidence"] = round(int(top_score or 0) / total, 4)
+    if safety_flags:
+        profile["safety_flags"] = sorted(safety_flags)[:8]
+    profile["updated_at"] = now_iso()
+    return profile
+
+
+def brain_merge_category_profile(base, addition):
+    merged = deepcopy(base or brain_semantic_empty_profile())
+    cats = merged.setdefault("categories", {})
+    for category, count in (addition or {}).get("categories", {}).items():
+        cats[category] = int(cats.get(category) or 0) + int(count or 0)
+    total = sum(int(v or 0) for v in cats.values())
+    merged["total"] = total
+    if total > 0:
+        top, top_score = sorted(cats.items(), key=lambda item: (-int(item[1] or 0), item[0]))[0]
+        merged["top"] = top
+        merged["confidence"] = round(int(top_score or 0) / total, 4)
+    else:
+        merged["top"] = "unknown"
+        merged["confidence"] = 0.0
+    merged["updated_at"] = now_iso()
+    return merged
+
+
+def brain_category_similarity(source_profile, candidate_profile):
+    src = (source_profile or {}).get("categories", {}) or {}
+    cand = (candidate_profile or {}).get("categories", {}) or {}
+    src_total = sum(int(v or 0) for v in src.values())
+    cand_total = sum(int(v or 0) for v in cand.values())
+    if src_total <= 0 or cand_total <= 0:
+        return 0.0
+    categories = set(src) | set(cand)
+    distance = 0.0
+    for category in categories:
+        distance += abs((int(src.get(category) or 0) / src_total) - (int(cand.get(category) or 0) / cand_total))
+    return round(max(0.0, 1.0 - (distance / 2.0)), 4)
+
+
+def brain_top_categories_text(profile, limit=5):
+    cats = (profile or {}).get("categories", {}) or {}
+    if not cats:
+        return "none"
+    ranked = sorted(cats.items(), key=lambda item: (-int(item[1] or 0), item[0]))[:limit]
+    total = max(1, sum(int(v or 0) for v in cats.values()))
+    return ", ".join(f"{cat} {int((int(count or 0) / total) * 100)}%" for cat, count in ranked)
+
+
+def brain_media_empty_counts():
+    return {"photo": 0, "video": 0, "total": 0, "photo_ratio": 0.0, "video_ratio": 0.0}
+
+
+def brain_media_kind(msg):
+    if not msg or is_gif_media(msg):
+        return ""
+    if getattr(msg, "photo", None):
+        return "photo"
+    if getattr(msg, "video", None):
+        return "video"
+    return ""
+
+
+def brain_media_counts_from_messages(messages):
+    counts = brain_media_empty_counts()
+    for msg in messages or []:
+        kind = brain_media_kind(msg)
+        if kind in {"photo", "video"}:
+            counts[kind] += 1
+            counts["total"] += 1
+    total = max(1, int(counts["total"]))
+    counts["photo_ratio"] = round(counts["photo"] / total, 4) if counts["total"] else 0.0
+    counts["video_ratio"] = round(counts["video"] / total, 4) if counts["total"] else 0.0
+    return counts
+
+
+def brain_media_similarity(source_counts, candidate_counts):
+    src_total = int((source_counts or {}).get("total") or 0)
+    cand_total = int((candidate_counts or {}).get("total") or 0)
+    if src_total <= 0 or cand_total <= 0:
+        return 0.0
+    src_video = float((source_counts or {}).get("video_ratio") or 0.0)
+    cand_video = float((candidate_counts or {}).get("video_ratio") or 0.0)
+    return round(max(0.0, 1.0 - abs(src_video - cand_video)), 4)
+
+
+def brain_recalculate_global_media_profile(save=True):
+    if not BRAIN_DICTIONARY_ENABLED:
+        return brain_media_empty_counts()
+    totals = brain_media_empty_counts()
+    semantic_global = brain_semantic_empty_profile()
+    with state_mutex:
+        source_items = STATE.get("sync_source_manager", {}).setdefault("source_brain", {})
+        for item in source_items.values():
+            profile = item.get("media_profile", {})
+            totals["photo"] += int(profile.get("photo") or 0)
+            totals["video"] += int(profile.get("video") or 0)
+            semantic_global = brain_merge_category_profile(semantic_global, item.get("semantic_profile", {}))
+        totals["total"] = totals["photo"] + totals["video"]
+        total = max(1, totals["total"])
+        totals["photo_ratio"] = round(totals["photo"] / total, 4) if totals["total"] else 0.0
+        totals["video_ratio"] = round(totals["video"] / total, 4) if totals["total"] else 0.0
+        brain = brain_state()
+        brain["global_media_profile"] = {**totals, "updated_at": now_iso()}
+        brain["global_category_profile"] = semantic_global
+        brain["learning_samples"] = int(totals["total"] or 0)
+        if save:
+            save_state("brain_dictionary")
+    return totals
+
+
+def brain_record_successful_media_profile(messages, title=""):
+    """Learn only successful photo/video uploads; GIFs, failed, duplicate, and unsupported media are ignored."""
+    if not BRAIN_DICTIONARY_ENABLED:
+        return
+    counts = brain_media_counts_from_messages(messages)
+    semantic_profile = brain_semantic_profile_from_messages(messages, title=title)
+    if int(counts.get("total") or 0) <= 0:
+        return
+    msg = next((m for m in messages or [] if getattr(m, "chat", None)), None)
+    if not msg:
+        return
+    key = guard_key(getattr(msg.chat, "id", ""))
+    with state_mutex:
+        source_items = STATE["sync_source_manager"].setdefault("source_brain", {})
+        item = source_items.setdefault(key, source_brain_default(key, title=title or getattr(msg.chat, "title", "") or ""))
+        if title:
+            item["title"] = title
+        profile = item.setdefault("media_profile", brain_media_empty_counts())
+        profile["photo"] = int(profile.get("photo") or 0) + int(counts["photo"])
+        profile["video"] = int(profile.get("video") or 0) + int(counts["video"])
+        profile["total"] = int(profile.get("photo") or 0) + int(profile.get("video") or 0)
+        total = max(1, int(profile["total"]))
+        profile["photo_ratio"] = round(int(profile["photo"]) / total, 4)
+        profile["video_ratio"] = round(int(profile["video"]) / total, 4)
+        profile["last_updated"] = now_iso()
+        item["media_profile"] = profile
+        if int(semantic_profile.get("total") or 0) > 0:
+            item["semantic_profile"] = brain_merge_category_profile(item.get("semantic_profile"), semantic_profile)
+        item["updated_at"] = now_iso()
+        save_state("sync_source_manager")
+    brain_recalculate_global_media_profile(save=True)
+
+
+async def brain_media_profile_for_chat(chat_ref, limit=None):
+    limit = limit or BRAIN_VALIDATION_MESSAGE_LIMIT
+    messages = []
+    async for msg in userbot.get_chat_history(chat_ref, limit=limit):
+        if brain_media_kind(msg):
+            messages.append(msg)
+        await asyncio.sleep(0)
+    return brain_media_counts_from_messages(messages)
+
+
+async def brain_resolve_candidate(identifier, join=False):
+    ref, _link = extract_source_channel_reference(identifier)
+    lookup = ref if ref not in (None, "") else identifier
+    if join:
+        try:
+            return await tg_call("brain join candidate", userbot.join_chat, lookup, retries=1, _timeout_seconds=35)
+        except Exception:
+            return await tg_call("brain get candidate after join fail", userbot.get_chat, lookup, retries=1, _timeout_seconds=25)
+    return await tg_call("brain get candidate", userbot.get_chat, lookup, retries=1, _timeout_seconds=25)
+
+
+async def brain_validate_candidate(uid, allow_join=False):
+    with state_mutex:
+        brain_snapshot = brain_state()
+        candidate = deepcopy(brain_snapshot.setdefault("pending_channels", {}).get(uid, {}))
+        cached = deepcopy(brain_snapshot.setdefault("recommendation_cache", {}).get(uid, {}))
+    if not candidate:
+        return None
+    if brain_candidate_is_existing_source(item=candidate):
+        return brain_reject_existing_source_candidate(uid, candidate, reason="already connected source")
+    now_ts = time.time()
+    if cached and float(cached.get("expires_at") or 0) > now_ts and cached.get("profile"):
+        with state_mutex:
+            brain = brain_state()
+            pending = brain.setdefault("pending_channels", {})
+            item = pending.setdefault(uid, candidate)
+            item.update(deepcopy(cached["profile"]))
+            item["cache_hit"] = True
+            item["updated_at"] = now_iso()
+            save_state("brain_dictionary")
+            return deepcopy(item)
+    identifier = candidate.get("identifier") or ""
+    status = "pending"
+    score = 0.0
+    note = ""
+    title = candidate.get("title", "")
+    chat_id = ""
+    username = ""
+    media_counts = brain_media_empty_counts()
+    global_profile = brain_recalculate_global_media_profile(save=False)
+    with state_mutex:
+        global_category_profile = deepcopy(brain_state().get("global_category_profile", {}) or brain_semantic_empty_profile())
+    media_score = 0.0
+    text_score = 0.0
+    semantic_score = 0.0
+    semantic_profile = brain_semantic_empty_profile()
+    try:
+        chat = await brain_resolve_candidate(identifier, join=allow_join)
+        chat_id = str(getattr(chat, "id", "") or "")
+        username = getattr(chat, "username", "") or ""
+        title = getattr(chat, "title", "") or getattr(chat, "first_name", "") or title or chat_id
+        resolved_candidate = {**candidate, "identifier": identifier, "chat_id": chat_id, "username": username, "title": title}
+        if brain_candidate_is_existing_source(item=resolved_candidate):
+            return brain_reject_existing_source_candidate(uid, resolved_candidate, reason="already connected source after resolve")
+        texts = []
+        media_messages = []
+        async for msg in userbot.get_chat_history(getattr(chat, "id", identifier), limit=BRAIN_VALIDATION_MESSAGE_LIMIT):
+            text = getattr(msg, "caption", None) or getattr(msg, "text", None) or ""
+            if text:
+                texts.append(text)
+            if brain_media_kind(msg):
+                media_messages.append(msg)
+            await asyncio.sleep(0)
+        media_counts = brain_media_counts_from_messages(media_messages)
+        semantic_profile = brain_semantic_profile_from_messages(media_messages, title=title)
+        media_score = brain_media_similarity(global_profile, media_counts)
+        semantic_score = brain_category_similarity(global_category_profile, semantic_profile)
+        text_score, matched, checked = brain_text_relevance_score(texts)
+        safety_flags = semantic_profile.get("safety_flags", [])
+        semantic_available = int(global_category_profile.get("total") or 0) > 0 and int(semantic_profile.get("total") or 0) > 0
+        media_available = int(global_profile.get("total") or 0) > 0 and int(media_counts.get("total") or 0) > 0
+        if safety_flags:
+            status = "review_safety"
+            score = 0.0
+            note = f"safety review required: {', '.join(safety_flags[:4])}"
+        elif semantic_available or media_available:
+            if semantic_available:
+                remaining = 1.0 - BRAIN_SEMANTIC_WEIGHT
+                score = (semantic_score * BRAIN_SEMANTIC_WEIGHT) + (media_score * remaining * BRAIN_MEDIA_PROFILE_WEIGHT) + (text_score * remaining * (1.0 - BRAIN_MEDIA_PROFILE_WEIGHT))
+                threshold = BRAIN_SEMANTIC_THRESHOLD
+            else:
+                score = (media_score * BRAIN_MEDIA_PROFILE_WEIGHT) + (text_score * (1.0 - BRAIN_MEDIA_PROFILE_WEIGHT))
+                threshold = BRAIN_MEDIA_PROFILE_THRESHOLD
+            if score >= threshold:
+                status = "recommended"
+                note = (
+                    f"semantic {semantic_score:.2f}; media {media_score:.2f}; candidate photo/video "
+                    f"{media_counts['photo_ratio']:.0%}/{media_counts['video_ratio']:.0%}; "
+                    f"top {semantic_profile.get('top', 'unknown')}"
+                )
+            else:
+                status = "review" if max(media_score, semantic_score) >= max(0.45, threshold - 0.2) else "rejected_low_relevance"
+                note = (
+                    f"semantic {semantic_score:.2f}; media {media_score:.2f}; below threshold {threshold:.2f}; "
+                    f"top {semantic_profile.get('top', 'unknown')}"
+                )
+        elif checked == 0:
+            status = "review"
+            note = "no photo/video signal and no readable captions/text in recent messages"
+        elif text_score >= BRAIN_RELEVANCE_THRESHOLD:
+            score = text_score
+            status = "recommended"
+            note = f"matched {matched}/{checked} recent messages"
+        else:
+            score = text_score
+            status = "rejected_low_relevance"
+            note = f"matched {matched}/{checked}; below threshold {BRAIN_RELEVANCE_THRESHOLD:.2f}"
+    except Exception as e:
+        status = "review" if not allow_join else "join_failed"
+        note = str(e)[:220]
+    with state_mutex:
+        brain = brain_state()
+        pending = brain.setdefault("pending_channels", {})
+        item = pending.setdefault(uid, candidate)
+        resolved_keys = brain_candidate_identity_keys(
+            item={
+                **item,
+                "identifier": identifier,
+                "chat_id": chat_id,
+                "username": username,
+            }
+        )
+        item.update(
+            {
+                "status": status,
+                "score": round(float(score), 3),
+                "title": title,
+                "chat_id": chat_id,
+                "username": username,
+                "note": note,
+                "media_profile": media_counts,
+                "global_media_profile": global_profile,
+                "semantic_profile": semantic_profile,
+                "global_category_profile": global_category_profile,
+                "media_score": round(float(media_score), 3),
+                "text_score": round(float(text_score), 3),
+                "semantic_score": round(float(semantic_score), 3),
+                "dedupe_keys": sorted(resolved_keys | set(item.get("dedupe_keys", []))),
+                "validated_at": now_iso(),
+                "updated_at": now_iso(),
+            }
+        )
+        brain_dedupe_pending_locked(brain)
+        brain.setdefault("recommendation_cache", {})[uid] = {
+            "profile": {
+                key: deepcopy(item.get(key))
+                for key in (
+                    "status",
+                    "score",
+                    "title",
+                    "chat_id",
+                    "username",
+                    "note",
+                    "media_profile",
+                    "semantic_profile",
+                    "global_media_profile",
+                    "global_category_profile",
+                    "media_score",
+                    "text_score",
+                    "semantic_score",
+                    "validated_at",
+                )
+            },
+            "expires_at": time.time() + BRAIN_RECOMMENDATION_CACHE_SECONDS,
+            "updated_at": now_iso(),
+        }
+        if len(brain.get("recommendation_cache", {})) > 500:
+            for old_uid, old_item in list(brain["recommendation_cache"].items())[:100]:
+                if float(old_item.get("expires_at") or 0) <= time.time():
+                    brain["recommendation_cache"].pop(old_uid, None)
+        brain["last_validation"] = now_iso()
+        brain.setdefault("events", []).append({"time": now_iso(), "action": "validate", "uid": uid, "status": status, "score": item["score"]})
+        trim_events("brain_dictionary")
+        save_state("brain_dictionary")
+    return item
+
+
+def brain_can_join_now():
+    now = time.time()
+    while brain_join_window and brain_join_window[0] < now - 3600:
+        brain_join_window.popleft()
+    return len(brain_join_window) < BRAIN_JOIN_LIMIT_PER_HOUR
+
+
+async def brain_approve_candidate(uid, join=False):
+    with state_mutex:
+        candidate = deepcopy(brain_state().setdefault("pending_channels", {}).get(uid, {}))
+    if not candidate:
+        return False, "Candidate not found."
+    identifier = candidate.get("identifier") or candidate.get("chat_id") or ""
+    if join and not brain_can_join_now():
+        return False, "Join limit reached for this hour."
+    try:
+        if join:
+            brain_join_window.append(time.time())
+        norm_channel, title, source_link, username = await resolve_source_channel_input(identifier)
+        added = await run_blocking("db", add_channel_db, norm_channel, title, source_link, username)
+        await run_blocking("db", load_channels)
+        with state_mutex:
+            brain = brain_state()
+            item = brain.setdefault("pending_channels", {}).pop(uid, candidate)
+            item.update({"status": "joined" if join else "approved", "title": title, "channel_id": str(norm_channel), "updated_at": now_iso()})
+            brain.setdefault("approved_channels", {})[uid] = item
+            brain.setdefault("events", []).append({"time": now_iso(), "action": "approve", "uid": uid, "channel_id": str(norm_channel)})
+            trim_events("brain_dictionary")
+            save_state("brain_dictionary")
+        return True, f"{title} saved as source {norm_channel}." if added else f"{title} was already saved."
+    except Exception as e:
+        return False, str(e)[:400]
+
+
+def brain_reject_candidate(uid, blacklist=False, reason="owner"):
+    with state_mutex:
+        brain = brain_state()
+        pending = brain.setdefault("pending_channels", {})
+        item = pending.pop(uid, None)
+        if not item:
+            return False
+        item.update({"status": "blacklisted" if blacklist else "rejected", "reason": reason, "updated_at": now_iso()})
+        target = brain.setdefault("blacklisted_channels" if blacklist else "rejected_channels", {})
+        target[uid] = item
+        brain.setdefault("events", []).append({"time": now_iso(), "action": "blacklist" if blacklist else "reject", "uid": uid})
+        trim_events("brain_dictionary")
+        save_state("brain_dictionary")
+    return True
+
+
+async def offload_source_media_job_to_worker(job, reason):
+    if QUEUE_WORKER_MODE or not SOURCE_MEDIA_WORKER_FALLBACK:
+        return False
+    if not WORKER_HAS_SOURCE_ACCESS:
+        return False
+    if not (WORKER_HTTP_URLS or WORKER_QUEUE_GROUP_ID):
+        return False
+    messages = job.get("messages") or []
+    first_msg = messages[0] if messages else None
+    link = source_message_link(first_msg)
+    if not link:
+        return False
+    payload = build_worker_queue_payload(
+        link,
+        "telegram",
+        OWNER_ID,
+        None,
+        source_job_id=job.get("job_id", ""),
+        source_job_type=job.get("type", ""),
+        source_channel=job.get("ch_name", ""),
+        fallback_reason=str(reason)[:300],
+    )
+    try:
+        transport, _sent = await send_worker_queue_payload(payload)
+        record_worker_queue_task(payload, status="sent_source_fallback", detail=f"sent through {transport}")
+        log_event(f"Source media job sent to worker fallback via {transport}: {link}")
+        return True
+    except Exception as e:
+        log_event(f"Source media worker fallback failed for {link}: {str(e)[:180]}")
+        return False
+
+
+def is_valid_media(msg):
+    if not msg:
+        return False
+    if msg.animation or msg.document or msg.audio or msg.voice or msg.sticker:
+        return False
+    return bool(msg.photo or msg.video)
+
+
+def is_gif_media(msg):
+    if not msg:
+        return False
+    if msg.animation:
+        return True
+    doc = getattr(msg, "document", None)
+    mime_type = getattr(doc, "mime_type", "") if doc else ""
+    file_name = getattr(doc, "file_name", "") if doc else ""
+    return mime_type == "image/gif" or file_name.lower().endswith(".gif")
+
+
+def get_media_uid(msg):
+    if not msg:
+        return None
+    if msg.photo:
+        return msg.photo.file_unique_id
+    if msg.video:
+        return msg.video.file_unique_id
+    return None
+
+
+def get_media_kind(msg):
+    if msg and msg.photo:
+        return "photo"
+    if msg and msg.video:
+        return "video"
+    return "unknown"
+
+
+def normalize_channel_id(cid):
+    text = str(cid or "").strip()
+    if not text:
+        return ""
+    ref, _source_link = extract_source_channel_reference(text, _allow_raw_fallback=False)
+    if ref not in (None, "") and str(ref).strip() != text:
+        return normalize_channel_id(ref)
+    if text.startswith("@"):
+        return "@" + text[1:].strip().lower()
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", text):
+        return "@" + text.lower()
+    if text.isdigit() and text.startswith("100") and len(text) >= 13:
+        return int(f"-{text}")
+    if text.isdigit() and len(text) >= 10:
+        return int(f"-100{text}")
+    if text.startswith("-100") and text[1:].isdigit():
+        return int(text)
+    if text.lstrip("-").isdigit():
+        return int(text)
+    return text
+
+
+def channel_id_variants(cid):
+    raw = str(cid).strip()
+    norm = normalize_channel_id(raw)
+    variants = {raw, str(norm)}
+    norm_text = str(norm)
+    if norm_text.startswith("-100") and norm_text[4:].isdigit():
+        variants.add(norm_text[4:])
+        variants.add(norm_text[1:])
+    return variants
+
+
+def normalize_tme_url(text):
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("@"):
+        return "@" + raw[1:].strip().lower()
+    if re.match(r"^(t\.me|telegram\.me|telegram\.dog)/", raw, flags=re.I):
+        raw = "https://" + raw
+    return raw
+
+
+def extract_source_channel_reference(text, _allow_raw_fallback=True):
+    raw = normalize_tme_url(text)
+    if not raw:
+        return None, ""
+    lowered = raw.lower()
+
+    if "t.me/+" in lowered or "telegram.me/+" in lowered or "telegram.dog/+" in lowered or "/joinchat/" in lowered:
+        return raw, raw
+
+    private_match = re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)(?:/\d+)?", raw, flags=re.I)
+    if private_match:
+        return int(f"-100{private_match.group(1)}"), raw
+
+    public_match = re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?([A-Za-z0-9_]{4,})(?:/\d+)?", raw, flags=re.I)
+    if public_match:
+        username = public_match.group(1).lower()
+        return f"@{username}", f"https://t.me/{username}"
+
+    if raw.startswith("@"):
+        username = raw[1:].strip().lower()
+        return f"@{username}", f"https://t.me/{username}"
+
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", raw):
+        return f"@{raw.lower()}", f"https://t.me/{raw.lower()}"
+
+    if _allow_raw_fallback:
+        return normalize_channel_id(raw), ""
+    return raw, ""
+
+
+def channel_dedupe_keys(cid=None, username="", source_link="", _visited=None, _depth=0):
+    """Build stable identity keys so the same source cannot appear through ID/link aliases."""
+    if _visited is None:
+        _visited = set()
+    if _depth > 8:
+        return set()
+    keys = set()
+    for value in (cid, username, source_link):
+        if value in (None, ""):
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        visit_key = text.lower()
+        if visit_key in _visited:
+            continue
+        _visited.add(visit_key)
+        if "t.me/" in text or "telegram.me/" in text or "telegram.dog/" in text:
+            ref, _ = extract_source_channel_reference(text)
+            canonical_link = normalize_telegram_link_for_report(text) or text
+            keys.add(f"link:{canonical_link.lower()}")
+            if ref not in (None, ""):
+                keys.update(channel_dedupe_keys(ref, _visited=_visited, _depth=_depth + 1))
+            continue
+        if text.startswith("@"):
+            keys.add(f"user:{text.lower().lstrip('@')}")
+            continue
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", text):
+            keys.add(f"user:{text.lower()}")
+            continue
+        for variant in channel_id_variants(text):
+            norm_variant = normalize_channel_id(variant)
+            keys.add(f"id:{norm_variant}")
+    return keys
+
+
+def channel_item_dedupe_keys(item):
+    return channel_dedupe_keys(
+        item.get("channel_id"),
+        username=item.get("username", ""),
+        source_link=item.get("source_link", ""),
+    )
+
+
+async def resolve_source_channel_input(text):
+    ref, source_link = extract_source_channel_reference(text)
+    if ref in (None, ""):
+        raise ValueError("Invalid source channel input.")
+
+    chat = None
+    last_error = None
+    if isinstance(ref, str) and ("t.me/+" in ref.lower() or "/joinchat/" in ref.lower()):
+        try:
+            chat = await tg_call("source join invite", userbot.join_chat, ref, retries=1)
+        except Exception as e:
+            last_error = e
+            with contextlib.suppress(Exception):
+                chat = await tg_call("source get invite chat", userbot.get_chat, ref, retries=1)
+    if chat is None:
+        try:
+            lookup = normalize_channel_id(ref) if not (isinstance(ref, str) and ref.startswith("http")) else ref
+            chat = await tg_call("source resolve get_chat", userbot.get_chat, lookup, retries=2)
+        except Exception as e:
+            last_error = e
+            with contextlib.suppress(Exception):
+                await refresh_userbot_dialog_cache(force=True)
+                chat = await find_source_chat_from_dialogs(ref)
+
+    if chat is not None:
+        resolved_id = getattr(chat, "id", None) or ref
+        title = getattr(chat, "title", "") or getattr(chat, "first_name", "") or str(resolved_id)
+        username = getattr(chat, "username", "") or ""
+        if username:
+            source_link = f"https://t.me/{username}"
+        return normalize_channel_id(resolved_id), title, source_link, username
+
+    norm = normalize_channel_id(ref)
+    if isinstance(norm, str) and norm.startswith("http"):
+        raise RuntimeError(f"Could not join/resolve invite link: {last_error}")
+    return norm, str(norm), source_link, ""
+
+
+def parse_bulk_source_inputs(text):
+    """Normalize one-per-line or comma-separated source identifiers."""
+    raw_items = re.split(r"[\r\n,]+", str(text or ""))
+    items = []
+    seen = set()
+    for raw in raw_items:
+        value = re.sub(r"^\s*(?:[-*]+|\d+[\.\)])\s*", "", raw).strip()
+        value = value.strip("`'\" ")
+        if not value:
+            continue
+        key = normalize_tme_url(value).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(value)
+    if not items:
+        raise ValueError("No source channel input found.")
+    if len(items) > MAX_BULK_SOURCE_CHANNELS:
+        raise ValueError(
+            f"Too many sources: {len(items)}. Maximum per batch is {MAX_BULK_SOURCE_CHANNELS}."
+        )
+    return items
+
+
+def active_source_identity_keys():
+    keys = set()
+    for item in active_channel_state_items(include_issues=False, limit=None):
+        keys.update(channel_item_dedupe_keys(item))
+    return keys
+
+
+async def add_source_channels_bulk(text):
+    """Resolve and persist multiple sources while isolating per-item failures."""
+    identifiers = parse_bulk_source_inputs(text)
+    known_keys = active_source_identity_keys()
+    added = []
+    existing = []
+    failed = []
+
+    for identifier in identifiers:
+        try:
+            norm_channel, title, source_link, username = await asyncio.wait_for(
+                resolve_source_channel_input(identifier),
+                timeout=BULK_SOURCE_RESOLVE_TIMEOUT_SECONDS,
+            )
+            if is_reserved_source_channel(norm_channel):
+                raise ValueError("target/queue/report chat cannot be used as a source")
+            resolved_keys = channel_dedupe_keys(norm_channel, username, source_link) or {
+                f"id:{norm_channel}"
+            }
+            if known_keys & resolved_keys:
+                existing.append(
+                    {
+                        "input": identifier,
+                        "channel_id": norm_channel,
+                        "title": title,
+                    }
+                )
+                continue
+            saved = await run_blocking(
+                "db",
+                add_channel_db,
+                norm_channel,
+                title,
+                source_link,
+                username,
+            )
+            if not saved:
+                raise RuntimeError("database rejected the source")
+            known_keys.update(resolved_keys)
+            added.append(
+                {
+                    "input": identifier,
+                    "channel_id": norm_channel,
+                    "title": title,
+                    "source_link": source_link,
+                    "username": username,
+                }
+            )
+        except Exception as exc:
+            reason = (
+                "resolve timed out"
+                if isinstance(exc, asyncio.TimeoutError)
+                else str(exc)[:180]
+            )
+            failed.append({"input": identifier, "reason": reason})
+        await asyncio.sleep(0)
+
+    if added:
+        await run_blocking("db", load_channels)
+    return {
+        "requested": len(identifiers),
+        "added": added,
+        "existing": existing,
+        "failed": failed,
+    }
+
+
+def format_bulk_source_result(result):
+    added = result.get("added", [])
+    existing = result.get("existing", [])
+    failed = result.get("failed", [])
+    lines = [
+        "BULK SOURCE RESULT",
+        "------------------",
+        f"Requested : {int(result.get('requested') or 0)}",
+        f"Added     : {len(added)}",
+        f"Existing  : {len(existing)}",
+        f"Failed    : {len(failed)}",
+    ]
+    if added:
+        lines.extend(["", "Added:"])
+        for item in added[:25]:
+            lines.append(
+                f"+ {str(item.get('title') or item.get('input'))[:42]} | {item.get('channel_id')}"
+            )
+        if len(added) > 25:
+            lines.append(f"...and {len(added) - 25} more added")
+    if existing:
+        lines.extend(["", "Already active:"])
+        for item in existing[:15]:
+            lines.append(
+                f"= {str(item.get('title') or item.get('input'))[:42]} | {item.get('channel_id')}"
+            )
+        if len(existing) > 15:
+            lines.append(f"...and {len(existing) - 15} more existing")
+    if failed:
+        lines.extend(["", "Failed:"])
+        for item in failed[:20]:
+            lines.append(f"! {str(item.get('input'))[:48]} | {str(item.get('reason'))[:90]}")
+        if len(failed) > 20:
+            lines.append(f"...and {len(failed) - 20} more failed")
+    return "\n".join(lines)[:3900]
+
+
+def channel_uid(cid):
+    return stable_uid("channel", str(cid).strip())
+
+
+def reserved_source_channel_ids():
+    reserved = set()
+    for peer in (TARGET_CHAT_ID, WORKER_QUEUE_GROUP_ID, SOURCE_LINK_REPORT_CHAT_ID):
+        if not peer:
+            continue
+        for variant in channel_id_variants(peer):
+            reserved.add(str(variant))
+            with contextlib.suppress(Exception):
+                reserved.add(str(normalize_channel_id(variant)))
+    return reserved
+
+
+def is_reserved_source_channel(cid):
+    if not cid:
+        return False
+    variants = {str(v) for v in channel_id_variants(cid)}
+    return bool(variants & reserved_source_channel_ids())
+
+
+def sanitize_active_source_channels(reason="runtime"):
+    removed = []
+    for ch in list(ACTIVE_CHANNELS):
+        if is_reserved_source_channel(ch):
+            ACTIVE_CHANNELS.discard(ch)
+            removed.append(ch)
+            record_channel(
+                ch,
+                status="ignored_system",
+                action=f"{reason}_system_skip",
+                reason="target/queue/report chat removed from active source scanner",
+            )
+    if removed:
+        log_event(f"System chat source guard removed {len(removed)} reserved source(s): {', '.join(map(str, removed[:6]))}")
+    return removed
+
+
+def active_source_channels():
+    sanitize_active_source_channels("active_source_list")
+    state_order = {
+        str(item.get("channel_id")): idx
+        for idx, item in enumerate(active_channel_state_items(include_issues=False, limit=None))
+    }
+    raw_channels = sorted(
+        [ch for ch in ACTIVE_CHANNELS if channel_is_active_record(ch) and not is_reserved_source_channel(ch)],
+        key=lambda item: (state_order.get(str(normalize_channel_id(item)), 10**9), str(item)),
+    )
+    return unique_active_channels(raw_channels)
+
+
+def unique_active_channels(channels=None):
+    seen = set()
+    unique = []
+    source_channels = list(channels) if channels is not None else list(ACTIVE_CHANNELS)
+    for ch in source_channels:
+        norm = normalize_channel_id(ch)
+        if is_reserved_source_channel(norm) or not channel_is_active_record(norm):
+            continue
+        record = get_channel_record(norm)
+        keys = channel_dedupe_keys(norm, record.get("username", ""), record.get("source_link", ""))
+        if not keys:
+            keys = {f"id:{norm}"}
+        if seen & keys:
+            ACTIVE_CHANNELS.discard(ch)
+            record_channel(
+                norm,
+                title=record.get("title", "") or str(norm),
+                status=RESOLVED_ALIAS_STATUS,
+                action="source_duplicate_suppressed",
+                reason="duplicate source identifier suppressed from active scanner",
+                source_link=record.get("source_link", ""),
+                username=record.get("username", ""),
+            )
+            continue
+        seen.update(keys)
+        unique.append(norm)
+    return unique
+
+
+def active_channel_state_items(include_issues=False, limit=None):
+    inactive = {"ignored_system", RESOLVED_ALIAS_STATUS}
+    if not include_issues:
+        inactive |= {"removed", "expired_or_deleted"}
+    with state_mutex:
+        items = [deepcopy(item) for item in STATE["channel_manager"].setdefault("channels", {}).values()]
+    items.sort(
+        key=lambda item: (
+            item.get("added_at") or item.get("created_at") or item.get("updated_at") or "",
+            item.get("title") or str(item.get("channel_id", "")),
+        )
+    )
+    seen = set()
+    unique = []
+    for item in items:
+        if item.get("status") in inactive:
+            continue
+        cid = normalize_channel_id(item.get("channel_id", ""))
+        if is_reserved_source_channel(cid):
+            continue
+        keys = channel_item_dedupe_keys(item) or {f"id:{cid}"}
+        if seen & keys:
+            continue
+        seen.update(keys)
+        item["channel_id"] = cid
+        unique.append(item)
+        if limit and len(unique) >= limit:
+            break
+    return unique
+
+
+def append_event(state_name, event):
+    with state_mutex:
+        STATE[state_name].setdefault("events", []).append({"time": now_iso(), **event})
+        trim_events(state_name)
+        save_state(state_name)
+
+
+def record_channel(cid, title="", status="active", action="sync", reason="", source_link="", username=""):
+    norm = normalize_channel_id(cid)
+    if status == "active" and is_reserved_source_channel(norm):
+        status = "ignored_system"
+        reason = reason or "target/queue/report chat is not a source"
+    uid = channel_uid(norm)
+    with state_mutex:
+        chs = STATE["channel_manager"].setdefault("channels", {})
+        old = chs.get(uid, {})
+        chs[uid] = {
+            "uid": uid,
+            "channel_id": norm,
+            "title": title or old.get("title", ""),
+            "source_link": source_link or old.get("source_link", ""),
+            "username": username or old.get("username", ""),
+            "status": status,
+            "last_reason": reason or old.get("last_reason", ""),
+            "added_at": old.get("added_at", now_iso()),
+            "updated_at": now_iso(),
+        }
+        if status != "active":
+            chs[uid]["failed_at"] = now_iso()
+        STATE["channel_manager"].setdefault("events", []).append(
+            {"time": now_iso(), "action": action, "uid": uid, "channel_id": norm, "status": status, "reason": reason}
+        )
+        trim_events("channel_manager")
+        save_state("channel_manager")
+    return uid
+
+
+def delete_channel_db_rows(cid):
+    norm = normalize_channel_id(cid)
+    with db_mutex:
+        conn = db_connect()
+        try:
+            for variant in channel_id_variants(norm):
+                conn.execute("DELETE FROM channels WHERE channel_id=?", (str(variant),))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def mark_channel_resolved_alias(old_cid, resolved_cid, title="", source_link="", username="", reason=""):
+    old_norm = normalize_channel_id(old_cid)
+    new_norm = normalize_channel_id(resolved_cid)
+    if str(old_norm) == str(new_norm):
+        return False
+    ACTIVE_CHANNELS.discard(old_norm)
+    delete_channel_db_rows(old_norm)
+    record_channel(
+        old_norm,
+        title=title or str(old_norm),
+        status=RESOLVED_ALIAS_STATUS,
+        action="peer_alias_resolved",
+        reason=reason or f"source identifier merged into {new_norm}",
+        source_link=source_link,
+        username=username,
+    )
+    return True
+
+
+def activate_resolved_source(original_cid, resolved_cid, title="", source_link="", username="", action="peer_resolved", reason=""):
+    resolved_norm = normalize_channel_id(resolved_cid)
+    mark_channel_resolved_alias(original_cid, resolved_norm, title=title, source_link=source_link, username=username, reason=reason)
+    add_channel_db(str(resolved_norm), title=title, source_link=source_link, username=username)
+    load_channels()
+    record_channel(
+        resolved_norm,
+        title=title,
+        status="active",
+        action=action,
+        reason=reason,
+        source_link=source_link,
+        username=username,
+    )
+    return resolved_norm
+
+
+def get_channel_record(cid):
+    norm = normalize_channel_id(cid)
+    wanted = {str(v) for v in channel_id_variants(norm)}
+    with state_mutex:
+        channels = deepcopy(STATE["channel_manager"].setdefault("channels", {}))
+    uid = channel_uid(norm)
+    if uid in channels:
+        return channels[uid]
+    for item in channels.values():
+        item_id = str(item.get("channel_id", ""))
+        if item_id in wanted or str(normalize_channel_id(item_id)) in wanted:
+            return item
+    return {}
+
+
+def source_removal_targets(cid):
+    targets = {normalize_channel_id(cid)}
+    record = get_channel_record(cid)
+    for value in (record.get("channel_id"), record.get("username"), record.get("source_link"), cid):
+        if value in (None, ""):
+            continue
+        targets.add(normalize_channel_id(value))
+        if "t.me/" in str(value) or "telegram.me/" in str(value) or "telegram.dog/" in str(value):
+            ref, _ = extract_source_channel_reference(value)
+            if ref not in (None, ""):
+                targets.add(normalize_channel_id(ref))
+
+    target_keys = set()
+    for target in list(targets):
+        target_keys.update(channel_dedupe_keys(target))
+
+    with state_mutex:
+        channels = list(STATE["channel_manager"].setdefault("channels", {}).values())
+    for item in channels:
+        item_keys = channel_item_dedupe_keys(item)
+        if target_keys and item_keys and target_keys & item_keys:
+            targets.add(normalize_channel_id(item.get("channel_id", "")))
+    return targets
+
+
+def clear_source_runtime_tracking(cid):
+    for target in source_removal_targets(cid):
+        norm = normalize_channel_id(target)
+        ACTIVE_CHANNELS.discard(norm)
+        copy_restricted_cache.pop(copy_restricted_cache_key(norm), None)
+        with contextlib.suppress(Exception):
+            SOURCE_DIALOG_CACHE_BY_ID.pop(int(norm), None)
+        if isinstance(norm, str):
+            SOURCE_DIALOG_CACHE_BY_USERNAME.pop(norm.lower().lstrip("@"), None)
+        with state_mutex:
+            cursors = STATE["sync_source_manager"].setdefault("cursors", {})
+            for variant in channel_id_variants(norm):
+                cursors.pop(guard_key(variant), None)
+            save_state("sync_source_manager")
+
+
+def channel_resolution_candidates(cid):
+    item = get_channel_record(cid)
+    candidates = []
+    for value in [item.get("source_link"), item.get("username"), item.get("channel_id"), cid]:
+        if not value:
+            continue
+        text = str(value).strip()
+        if text and text not in candidates:
+            candidates.append(text)
+        if "t.me/" in text or "telegram.me/" in text:
+            ref, _link = extract_source_channel_reference(text)
+            if ref and str(ref) not in candidates:
+                candidates.append(str(ref))
+        if text and not text.startswith("@") and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", text):
+            at_name = f"@{text}"
+            if at_name not in candidates:
+                candidates.append(at_name)
+    for variant in channel_id_variants(cid):
+        text = str(variant)
+        if text not in candidates:
+            candidates.append(text)
+    return candidates
+
+
+async def refresh_userbot_dialog_cache(force=False):
+    """Refresh Pyrogram's peer cache by scanning joined dialogs at a controlled rate."""
+    global last_dialog_cache_refresh, SOURCE_DIALOG_CACHE_BY_ID, SOURCE_DIALOG_CACHE_BY_USERNAME
+    now = time.time()
+    if not force and now - last_dialog_cache_refresh < max(60, DIALOG_REFRESH_INTERVAL_SECONDS):
+        return 0
+    last_dialog_cache_refresh = now
+    count = 0
+    by_id = {}
+    by_username = {}
+    async for _dialog in userbot.get_dialogs():
+        chat = getattr(_dialog, "chat", None)
+        if chat:
+            chat_id = getattr(chat, "id", None)
+            username = (getattr(chat, "username", "") or "").lower()
+            if chat_id is not None:
+                by_id[int(chat_id)] = chat
+            if username:
+                by_username[username] = chat
+        count += 1
+        if count % 50 == 0:
+            await asyncio.sleep(0)
+    SOURCE_DIALOG_CACHE_BY_ID = by_id
+    SOURCE_DIALOG_CACHE_BY_USERNAME = by_username
+    log_event(f"Userbot dialog peer cache refreshed: {count} dialog(s).")
+    return count
+
+
+def source_peer_resolve_key(channel_id):
+    return str(normalize_channel_id(channel_id))
+
+
+def source_peer_resolve_allowed(channel_id, force=False):
+    if force:
+        return True
+    return SOURCE_PEER_RESOLVE_NEXT_AT.get(source_peer_resolve_key(channel_id), 0) <= time.time()
+
+
+def note_source_peer_resolve_attempt(channel_id):
+    SOURCE_PEER_RESOLVE_NEXT_AT[source_peer_resolve_key(channel_id)] = time.time() + SOURCE_PEER_RESOLVE_COOLDOWN_SECONDS
+
+
+def clear_source_peer_resolve_cooldown(channel_id):
+    SOURCE_PEER_RESOLVE_NEXT_AT.pop(source_peer_resolve_key(channel_id), None)
+
+
+async def find_source_chat_from_dialogs(channel_id, allow_scan=True):
+    """Find a source channel in already-joined dialogs using ID variants or username."""
+    item = get_channel_record(channel_id)
+    wanted_ids = set()
+    wanted_usernames = set()
+    for candidate in channel_resolution_candidates(channel_id):
+        text = str(candidate).strip()
+        if not text:
+            continue
+        if text.startswith("@"):
+            wanted_usernames.add(text[1:].lower())
+        elif re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", text):
+            wanted_usernames.add(text.lower())
+        for variant in channel_id_variants(text):
+            with contextlib.suppress(Exception):
+                wanted_ids.add(int(normalize_channel_id(variant)))
+    if item.get("username"):
+        wanted_usernames.add(str(item["username"]).lstrip("@").lower())
+
+    for wanted_id in wanted_ids:
+        chat = SOURCE_DIALOG_CACHE_BY_ID.get(wanted_id)
+        if chat is not None:
+            return chat
+    for username in wanted_usernames:
+        chat = SOURCE_DIALOG_CACHE_BY_USERNAME.get(username)
+        if chat is not None:
+            return chat
+
+    if not allow_scan:
+        return None
+
+    async for dialog in userbot.get_dialogs():
+        chat = getattr(dialog, "chat", None)
+        if not chat:
+            continue
+        chat_id = getattr(chat, "id", None)
+        username = (getattr(chat, "username", "") or "").lower()
+        if chat_id is not None:
+            SOURCE_DIALOG_CACHE_BY_ID[int(chat_id)] = chat
+        if username:
+            SOURCE_DIALOG_CACHE_BY_USERNAME[username] = chat
+        if (chat_id in wanted_ids) or (username and username in wanted_usernames):
+            return chat
+        await asyncio.sleep(0)
+    return None
+
+
+async def resolve_source_peer_for_access(channel_id, context="source", force_refresh=False):
+    """Return a Telegram peer that Pyrogram can access without retiring unresolved sources."""
+    norm = normalize_channel_id(channel_id)
+    allow_network_scan = force_refresh or source_peer_resolve_allowed(norm)
+    if allow_network_scan:
+        note_source_peer_resolve_attempt(norm)
+        with contextlib.suppress(Exception):
+            await refresh_userbot_dialog_cache(force=force_refresh)
+    chat = await find_source_chat_from_dialogs(norm, allow_scan=allow_network_scan)
+    if chat is None:
+        return norm
+
+    resolved_id = getattr(chat, "id", None) or norm
+    title = getattr(chat, "title", "") or getattr(chat, "first_name", "") or str(resolved_id)
+    username = getattr(chat, "username", "") or ""
+    source_link = f"https://t.me/{username}" if username else get_channel_record(norm).get("source_link", "")
+    resolved_norm = normalize_channel_id(resolved_id)
+    if str(norm) != str(resolved_norm) or isinstance(norm, str):
+        resolved_norm = activate_resolved_source(
+            norm,
+            resolved_norm,
+            title=title,
+            source_link=source_link,
+            username=username,
+            action=f"{context}_peer_resolved",
+            reason=f"{context} resolved through userbot dialog cache",
+        )
+    clear_source_peer_resolve_cooldown(norm)
+    clear_source_peer_resolve_cooldown(resolved_norm)
+    return resolved_norm
+
+
+def remove_channel_state(cid):
+    norm = normalize_channel_id(cid)
+    targets = source_removal_targets(norm)
+    target_keys = set()
+    for target in targets:
+        target_keys.update(channel_dedupe_keys(target))
+    changed = []
+    with state_mutex:
+        channels = STATE["channel_manager"].setdefault("channels", {})
+        for uid, item in channels.items():
+            item_id = normalize_channel_id(item.get("channel_id", ""))
+            item_keys = channel_item_dedupe_keys(item)
+            if item_id in targets or (target_keys and item_keys and target_keys & item_keys):
+                item["status"] = "removed"
+                item["removed_at"] = now_iso()
+                item["updated_at"] = now_iso()
+                changed.append((uid, item_id))
+        STATE["channel_manager"].setdefault("events", []).append(
+            {"time": now_iso(), "action": "remove", "channel_id": norm, "removed_count": len(changed)}
+        )
+        trim_events("channel_manager")
+        save_state("channel_manager")
+
+
+def channel_is_active_record(cid):
+    if is_reserved_source_channel(cid):
+        return False
+    uid = channel_uid(normalize_channel_id(cid))
+    with state_mutex:
+        item = STATE["channel_manager"].setdefault("channels", {}).get(uid, {})
+    return item.get("status", "active") not in {"removed", "expired_or_deleted", "ignored_system", RESOLVED_ALIAS_STATUS}
+
+
+def channel_status_counts():
+    with state_mutex:
+        channels = list(STATE["channel_manager"].setdefault("channels", {}).values())
+    hard_issue_statuses = {"removed", "expired_or_deleted"}
+    inactive_statuses = hard_issue_statuses | {"ignored_system", RESOLVED_ALIAS_STATUS}
+    seen = set()
+    deduped = []
+    for item in channels:
+        cid = normalize_channel_id(item.get("channel_id", ""))
+        if is_reserved_source_channel(cid):
+            continue
+        keys = channel_item_dedupe_keys(item) or {f"id:{cid}"}
+        if seen & keys:
+            continue
+        seen.update(keys)
+        deduped.append(item)
+    issues = [c for c in deduped if c.get("status") in hard_issue_statuses]
+    active = [c for c in deduped if c.get("status") not in inactive_statuses]
+    removed = [c for c in issues if c.get("status") == "removed"]
+    unavailable = [c for c in issues if c.get("status") == "expired_or_deleted"]
+    temp_issues = [
+        c for c in deduped
+        if c.get("status") not in inactive_statuses and c.get("last_reason")
+    ]
+    return {
+        "active": len(active),
+        "issues": len(issues),
+        "removed": len(removed),
+        "unavailable": len(unavailable),
+        "temp_issues": len(temp_issues),
+    }
+
+
+def classify_channel_error(exc):
+    if is_session_auth_error(exc) or is_flood_wait_error(exc) or is_global_transport_error(exc):
+        return ""
+    text = str(exc).lower()
+    name = exc.__class__.__name__.lower()
+    combined = f"{name} {text}"
+    if any(x in combined for x in ["peeridinvalid", "peer id invalid", "peer_id_invalid"]):
+        return "temporary_peer"
+    if any(x in combined for x in ["chat not found", "not found", "channelinvalid", "channel invalid"]):
+        return "temporary_peer"
+    if any(x in combined for x in ["channelprivate", "chatadminrequired", "userbannedinchannel", "banned"]):
+        return "temporary_access"
+    if any(x in combined for x in ["username not occupied", "deleted", "deactivated"]):
+        return "temporary_peer"
+    if any(
+        x in combined
+        for x in [
+            "usernameinvalid",
+            "username invalid",
+        ]
+    ):
+        return "temporary_peer"
+    if any(x in combined for x in ["forbidden", "not participant", "have no rights"]):
+        return "temporary_access"
+    return ""
+
+
+def channel_missing_error_kind(error):
+    if is_session_auth_error(error):
+        return ""
+    combined = f"{error.__class__.__name__} {error}".lower()
+    hard_markers = [
+        "peeridinvalid",
+        "peer id invalid",
+        "peer_id_invalid",
+        "channelprivate",
+        "channel private",
+        "channel_private",
+        "chatadminrequired",
+        "chat admin required",
+        "userbannedinchannel",
+        "channel deleted",
+        "chat deleted",
+        "deleted channel",
+        "deleted chat",
+        "deactivated",
+    ]
+    if any(marker in combined for marker in hard_markers):
+        return "hard"
+    soft_markers = [
+        "chat not found",
+        "channel not found",
+        "channelinvalid",
+        "channel invalid",
+    ]
+    if any(marker in combined for marker in soft_markers):
+        return "soft"
+    return ""
+
+
+def maybe_retire_deleted_channel(channel_id, error, status=""):
+    if not CHANNEL_AUTO_RETIRE_DELETED_SOURCES:
+        return False
+    kind = channel_missing_error_kind(error)
+    if not kind:
+        return False
+    if kind == "soft" and not CHANNEL_RETIRE_ON_SOFT_MISSING:
+        return False
+    norm = normalize_channel_id(channel_id)
+    key = guard_key(norm)
+    threshold = CHANNEL_HARD_DELETE_CONFIRMATIONS if kind == "hard" else CHANNEL_SOFT_DELETE_CONFIRMATIONS
+    with state_mutex:
+        cursors = STATE["sync_source_manager"].setdefault("cursors", {})
+        old = cursors.get(key, {})
+        previous_kind = old.get("delete_confirm_kind")
+        count = int(old.get("delete_confirm_count") or 0)
+        count = count + 1 if previous_kind == kind else 1
+        cursors[key] = {
+            **old,
+            "channel_id": key,
+            "delete_confirm_kind": kind,
+            "delete_confirm_count": count,
+            "delete_confirm_last_error": str(error)[:160],
+            "delete_confirm_updated_at": now_iso(),
+        }
+        save_state("sync_source_manager")
+    if count < threshold:
+        if count == 1 or count == threshold - 1:
+            log_event(
+                f"Source {key} delete confirmation {count}/{threshold} ({kind}); "
+                "kept active until confirmed."
+            )
+        return False
+    ACTIVE_CHANNELS.discard(norm)
+    reason = f"confirmed {kind} missing source after {count}/{threshold}: {str(error)[:180]}"
+    if kind == "hard":
+        delete_channel_db_rows(norm)
+    record_channel(norm, status="expired_or_deleted", action="auto_retire_deleted", reason=reason)
+    with state_mutex:
+        cursor = STATE["sync_source_manager"].setdefault("cursors", {}).setdefault(key, {})
+        cursor["next_check_after"] = time.time() + 86400 * 365
+        cursor["last_temp_error"] = reason[:160]
+        save_state("sync_source_manager")
+    diagnostic_note_source_retired(key, reason)
+    log_event(f"Source channel retired from active scan: {key}. Reason: {reason[:180]}")
+    return True
+
+
+def is_peer_id_error(exc):
+    if is_session_auth_error(exc):
+        return False
+    combined = f"{exc.__class__.__name__} {exc}".lower()
+    return any(
+        marker in combined
+        for marker in [
+            "peeridinvalid",
+            "peer id invalid",
+            "peer_id_invalid",
+            "channelprivate",
+            "channel private",
+            "channel_private",
+            "chatadminrequired",
+            "chat admin required",
+            "userbannedinchannel",
+        ]
+    )
+
+
+def mark_peer_invalid_unresolved(channel_id, error, context="peer_resolver"):
+    if is_flood_wait_error(error):
+        delay = note_global_flood_wait(error)
+        log_event(f"Global FloodWait during {context}; source {channel_id} remains active (gate {delay:.1f}s).")
+        return "global_flood"
+    if is_global_transport_error(error):
+        schedule_userbot_reconnect(f"{context}: {error}")
+        log_event(f"Global transport incident during {context}; source {channel_id} remains active.")
+        return "global_transport"
+    if is_session_auth_error(error):
+        mark_session_auth_invalid(error)
+        with contextlib.suppress(Exception):
+            asyncio.create_task(notify_session_problem(error))
+        log_event(f"Peer resolver paused for {channel_id}: session auth error, source kept active.")
+        return "session_auth"
+    norm = normalize_channel_id(channel_id)
+    key = guard_key(norm)
+    with state_mutex:
+        cursors = STATE["sync_source_manager"].setdefault("cursors", {})
+        old = cursors.get(key, {})
+        count = int(old.get("peer_invalid_count") or 0) + 1
+        next_check = time.time() + min(86400, CHANNEL_PEER_INVALID_BACKOFF_SECONDS * count)
+        cursors[key] = {
+            **old,
+            "channel_id": key,
+            "peer_invalid_count": count,
+            "peer_invalid_last_error": str(error)[:180],
+            "peer_invalid_context": context,
+            "peer_invalid_updated_at": now_iso(),
+            "last_temp_error": f"peer unresolved {count}/{CHANNEL_RETIRE_PEER_INVALID_AFTER}: {str(error)[:120]}",
+            "next_check_after": next_check,
+        }
+        source_brain_record(key, "access_error", reason=error, save=False)
+        save_state("sync_source_manager")
+    if count >= CHANNEL_RETIRE_PEER_INVALID_AFTER and CHANNEL_RETIRE_ON_PEER_INVALID:
+        ACTIVE_CHANNELS.discard(norm)
+        reason = f"confirmed unresolved peer after {count}/{CHANNEL_RETIRE_PEER_INVALID_AFTER}: {str(error)[:180]}"
+        delete_channel_db_rows(norm)
+        record_channel(norm, status="expired_or_deleted", action="auto_retire_peer_invalid", reason=reason)
+        with state_mutex:
+            cursor = STATE["sync_source_manager"].setdefault("cursors", {}).setdefault(key, {})
+            cursor["next_check_after"] = time.time() + 86400 * 365
+            cursor["last_temp_error"] = reason[:160]
+            save_state("sync_source_manager")
+        diagnostic_note_source_retired(key, reason)
+        log_event(f"Source channel retired from active scan: {key}. Reason: {reason}")
+        return "expired_or_deleted"
+    if count >= CHANNEL_RETIRE_PEER_INVALID_AFTER:
+        with state_mutex:
+            cursor = STATE["sync_source_manager"].setdefault("cursors", {}).setdefault(key, {})
+            cursor["next_check_after"] = max(float(cursor.get("next_check_after") or 0), time.time() + CHANNEL_PEER_INVALID_BACKOFF_SECONDS)
+            cursor["last_temp_error"] = f"peer unresolved kept active {count}: {str(error)[:120]}"
+            save_state("sync_source_manager")
+        log_event(
+            f"Source peer unresolved for {key}: {count}; kept active and cooled down "
+            f"{CHANNEL_PEER_INVALID_BACKOFF_SECONDS}s."
+        )
+        return "cooldown"
+    if count == 1 or count == CHANNEL_RETIRE_PEER_INVALID_AFTER - 1:
+        log_event(
+            f"Source peer unresolved for {key}: {count}/{CHANNEL_RETIRE_PEER_INVALID_AFTER}; "
+            f"cooldown {int(max(0, next_check - time.time()))}s."
+        )
+    return "cooldown"
+
+
+def clear_peer_invalid_unresolved(channel_id):
+    key = guard_key(channel_id)
+    with state_mutex:
+        cursor = STATE["sync_source_manager"].setdefault("cursors", {}).get(key, {})
+        if not cursor:
+            return
+        changed = False
+        for field in ("peer_invalid_count", "peer_invalid_last_error", "peer_invalid_context", "peer_invalid_updated_at"):
+            if field in cursor:
+                cursor.pop(field, None)
+                changed = True
+        if changed:
+            save_state("sync_source_manager")
+
+
+def should_attempt_peer_refresh(exc):
+    if is_session_auth_error(exc):
+        return False
+    status = classify_channel_error(exc)
+    return is_peer_id_error(exc) or status in {"temporary_peer", "temporary_access"}
+
+
+async def try_refresh_channel_peer(channel_id, reason):
+    if not should_attempt_peer_refresh(reason):
+        return None
+    if not source_peer_resolve_allowed(channel_id):
+        return None
+    note_source_peer_resolve_attempt(channel_id)
+    with contextlib.suppress(Exception):
+        await refresh_userbot_dialog_cache(force=True)
+        dialog_chat = await find_source_chat_from_dialogs(channel_id, allow_scan=False)
+        if dialog_chat is not None:
+            resolved_id = getattr(dialog_chat, "id", None) or channel_id
+            title = getattr(dialog_chat, "title", "") or getattr(dialog_chat, "first_name", "") or str(resolved_id)
+            username = getattr(dialog_chat, "username", "") or ""
+            source_link = f"https://t.me/{username}" if username else get_channel_record(channel_id).get("source_link", "")
+            resolved_norm = activate_resolved_source(
+                channel_id,
+                resolved_id,
+                title=title,
+                action="peer_resolved_dialog",
+                reason=str(reason)[:160],
+                source_link=source_link,
+                username=username,
+            )
+            log_event(f"Dialog cache peer resolver refreshed {channel_id} -> {resolved_norm} ({title[:40]}).")
+            clear_source_peer_resolve_cooldown(channel_id)
+            clear_source_peer_resolve_cooldown(resolved_norm)
+            clear_peer_invalid_unresolved(channel_id)
+            clear_peer_invalid_unresolved(resolved_norm)
+            return resolved_norm
+    candidates = channel_resolution_candidates(channel_id)
+    for candidate in candidates:
+        try:
+            lookup = normalize_channel_id(candidate) if not str(candidate).startswith("http") else str(candidate)
+            chat = await tg_call("peer resolver get_chat", userbot.get_chat, lookup, retries=1)
+            resolved_id = getattr(chat, "id", None) or lookup
+            title = getattr(chat, "title", "") or getattr(chat, "first_name", "") or str(resolved_id)
+            username = getattr(chat, "username", "") or ""
+            source_link = f"https://t.me/{username}" if username else (str(candidate) if str(candidate).startswith("http") else "")
+            resolved_norm = activate_resolved_source(
+                channel_id,
+                resolved_id,
+                title=title,
+                source_link=source_link,
+                username=username,
+                action="peer_resolved",
+                reason=str(reason)[:160],
+            )
+            log_event(f"Auto peer resolver refreshed {channel_id} -> {resolved_norm} ({title[:40]}).")
+            clear_source_peer_resolve_cooldown(channel_id)
+            clear_source_peer_resolve_cooldown(resolved_norm)
+            clear_peer_invalid_unresolved(channel_id)
+            clear_peer_invalid_unresolved(resolved_norm)
+            return resolved_norm
+        except Exception as e:
+            if is_session_auth_error(e):
+                mark_session_auth_invalid(e)
+                with contextlib.suppress(Exception):
+                    asyncio.create_task(notify_session_problem(e))
+                raise
+            continue
+    with contextlib.suppress(Exception):
+        dialog_chat = await find_source_chat_from_dialogs(channel_id, allow_scan=False)
+        if dialog_chat is not None:
+            resolved_id = getattr(dialog_chat, "id", None) or channel_id
+            title = getattr(dialog_chat, "title", "") or getattr(dialog_chat, "first_name", "") or str(resolved_id)
+            username = getattr(dialog_chat, "username", "") or ""
+            source_link = f"https://t.me/{username}" if username else get_channel_record(channel_id).get("source_link", "")
+            resolved_norm = activate_resolved_source(
+                channel_id,
+                resolved_id,
+                title=title,
+                source_link=source_link,
+                username=username,
+                action="peer_resolved_dialog_retry",
+                reason=str(reason)[:160],
+            )
+            clear_source_peer_resolve_cooldown(channel_id)
+            clear_source_peer_resolve_cooldown(resolved_norm)
+            clear_peer_invalid_unresolved(channel_id)
+            clear_peer_invalid_unresolved(resolved_norm)
+            return resolved_norm
+    result = mark_peer_invalid_unresolved(channel_id, reason, context="try_refresh_channel_peer")
+    if result != "expired_or_deleted":
+        register_guard_temp_error(channel_id, "source peer unresolved; waiting for later dialog-cache retry", reconnect=False)
+        log_event(f"Auto peer resolver cooled down {channel_id}; dialog cache has no usable peer yet.")
+    return None
+
+
+async def warmup_peer(client, peer, label):
+    if not peer:
+        return False
+    try:
+        await telegram_gateway_await('client.get_chat', lambda: client.get_chat(peer))
+        log_event(f"Peer warmup ok: {label} -> {peer}")
+        return True
+    except Exception as e:
+        if is_flood_wait_error(e):
+            delay = note_global_flood_wait(e)
+            log_event(f"Peer warmup globally throttled: {label} (gate {delay:.1f}s); source health unchanged.")
+            return None
+        if is_global_transport_error(e):
+            schedule_userbot_reconnect(f"peer warmup {label}: {e}")
+            log_event(f"Peer warmup transport incident: {label}; source health unchanged.")
+            return None
+        if is_session_auth_error(e):
+            raise
+        if str(label).startswith("bot ") and is_peer_id_error(e):
+            log_event(f"Peer warmup skipped: {label} -> {peer} (bot is not a member/admin; userbot warmup will be used)")
+            return False
+        if is_peer_id_error(e):
+            log_event(f"Peer warmup pending: {label} -> {peer} (userbot dialog cache will retry later)")
+        else:
+            log_event(f"Peer warmup failed: {label} -> {peer}: {str(e)[:160]}")
+        return False
+
+
+async def startup_peer_warmup(include_userbot=True):
+    app_peers = [(TARGET_CHAT_ID, "target channel")]
+    if WORKER_QUEUE_GROUP_ID:
+        app_peers.append((WORKER_QUEUE_GROUP_ID, "worker queue group"))
+    if SOURCE_LINK_REPORT_CHAT_ID:
+        app_peers.append((SOURCE_LINK_REPORT_CHAT_ID, "source link report channel"))
+    for peer, label in app_peers:
+        await warmup_peer(app, peer, f"bot {label}")
+        await asyncio.sleep(0.1)
+
+    if not include_userbot:
+        return
+
+    with contextlib.suppress(Exception):
+        await refresh_userbot_dialog_cache(force=True)
+
+    user_peers = list(app_peers)
+    for ch in active_source_channels():
+        user_peers.append((ch, f"source {ch}"))
+    for peer, label in user_peers:
+        ok = await warmup_peer(userbot, peer, f"userbot {label}")
+        if ok is False:
+            fake_error = RuntimeError("peer id invalid during startup warmup")
+            if str(label).startswith("source "):
+                log_event(f"Startup peer cache miss for {peer}; source remains active for deferred dialog refresh.")
+            else:
+                await try_refresh_channel_peer(peer, fake_error)
+        await asyncio.sleep(0.15)
+
+
+def quarantine_channel(cid, title="", reason="", status="unavailable"):
+    norm = normalize_channel_id(cid)
+    if is_reserved_source_channel(norm):
+        ACTIVE_CHANNELS.discard(norm)
+        record_channel(
+            norm,
+            title=title or str(norm),
+            status="ignored_system",
+            action="quarantine_system_skip",
+            reason="target/queue/report chat ignored during channel quarantine",
+        )
+        return "ignored_system"
+    if is_peer_id_error(RuntimeError(str(reason))) or status == "temporary_peer":
+        result = mark_peer_invalid_unresolved(norm, reason or status, context="quarantine_channel")
+        if result == "expired_or_deleted":
+            return result
+        return "active"
+    if maybe_retire_deleted_channel(norm, reason or status, status=status):
+        return "expired_or_deleted"
+    ACTIVE_CHANNELS.add(norm)
+    record_channel(norm, title=title, status="active", action="temporary_issue", reason=reason or status)
+    register_guard_temp_error(norm, reason or status)
+    return "active"
+
+
+async def handle_source_access_error(channel_id, error, title="", status="", context="source"):
+    if is_session_auth_error(error):
+        mark_session_auth_invalid(error)
+        with contextlib.suppress(Exception):
+            asyncio.create_task(notify_session_problem(error))
+        log_event(f"{context} source access paused for {guard_key(channel_id)}: session auth duplicated/invalid; source kept active.")
+        return "session_auth"
+    status = status or classify_channel_error(error)
+    if not status:
+        if is_temporary_network_error(error):
+            register_guard_temp_error(channel_id, error)
+        return ""
+    refreshed = await try_refresh_channel_peer(channel_id, error)
+    if refreshed:
+        return "resolved"
+    if not channel_is_active_record(channel_id):
+        return "expired_or_deleted"
+    result = quarantine_channel(channel_id, title=title, reason=str(error), status=status)
+    if SOURCE_ACCESS_FAILURE_RETIRE_ENABLED and result == "active":
+        key = guard_key(channel_id)
+        with state_mutex:
+            cursor = STATE["sync_source_manager"].setdefault("cursors", {}).get(key, {})
+            failure_count = int(cursor.get("temp_error_count") or 0)
+        if failure_count >= SOURCE_MAX_FAILURES_BEFORE_RETIRE:
+            norm = normalize_channel_id(channel_id)
+            ACTIVE_CHANNELS.discard(norm)
+            record_channel(
+                norm,
+                title=title or str(norm),
+                status="expired_or_deleted",
+                action="auto_retire_access_failure",
+                reason=f"{context} repeated access failure {failure_count}/{SOURCE_MAX_FAILURES_BEFORE_RETIRE}: {str(error)[:160]}",
+            )
+            return "expired_or_deleted"
+    return result
+
+
+def format_channel_issue_list(limit=40):
+    with state_mutex:
+        channels = list(STATE["channel_manager"].setdefault("channels", {}).values())
+    health = channel_status_counts()
+    issues = [c for c in channels if c.get("status") in {"removed", "expired_or_deleted"}]
+    header = [
+        "CHANNEL HEALTH",
+        "--------------",
+        f"Active sources : {health['active']}",
+        f"Issue sources  : {health['issues']}",
+        f"Temp issues    : {health['temp_issues']}",
+        "",
+    ]
+    if not issues:
+        return "\n".join(header + ["No removed/deleted source channel found.", "Temporary peer errors stay active and auto-retry."])
+    lines = header + [f"Removed/deleted channels: {len(issues)}", ""]
+    for item in issues[:limit]:
+        title = item.get("title") or "Unknown name"
+        cid = item.get("channel_id")
+        status = item.get("status", "unknown")
+        reason = item.get("last_reason") or "Telegram access removed or unavailable"
+        lines.append(f"- {title}")
+        lines.append(f"  ID: {cid}")
+        lines.append(f"  Status: {status}")
+        lines.append(f"  Reason: {reason[:120]}")
+    if len(issues) > limit:
+        lines.append(f"...and {len(issues) - limit} more")
+    return "\n".join(lines)[:3900]
+
+
+def message_meta(msg):
+    return {
+        "chat_id": getattr(msg.chat, "id", None),
+        "chat_title": getattr(msg.chat, "title", "") or "",
+        "chat_username": getattr(msg.chat, "username", "") or "",
+        "message_id": msg.id,
+        "media_uid": get_media_uid(msg),
+        "media_type": get_media_kind(msg),
+        "media_group_id": str(msg.media_group_id or ""),
+        "date": msg.date.isoformat() if getattr(msg, "date", None) else "",
+    }
+
+
+def serialize_runtime_job(job):
+    """Return a JSON-safe job descriptor; live Pyrogram objects never enter disk state."""
+    job = job or {}
+    messages = job.get("messages") or []
+    metas = []
+    for msg in messages:
+        if hasattr(msg, "chat") and hasattr(msg, "id"):
+            metas.append(message_meta(msg))
+        elif isinstance(msg, dict):
+            metas.append(dict(msg))
+    if not metas:
+        metas = [dict(item) for item in (job.get("message_metas") or []) if isinstance(item, dict)]
+    payload = {
+        "job_id": str(job.get("job_id") or ""),
+        "post_uid": str(job.get("post_uid") or job.get("job_id") or ""),
+        "type": str(job.get("type") or ""),
+        "source": str(job.get("source") or ""),
+        "ch_name": str(job.get("ch_name") or "")[:200],
+        "attempt": int(job.get("attempt") or 1),
+        "retries": int(job.get("retries") or 0),
+        "is_fallback": bool(job.get("is_fallback")),
+        "sync_run_id": job.get("sync_run_id"),
+        "force_upload": bool(job.get("force_upload")),
+        "manual_link_url": str(job.get("manual_link_url") or ""),
+        "status_chat_id": int(job.get("status_chat_id") or 0),
+        "status_message_id": int(job.get("status_message_id") or 0),
+        "messages": metas,
+        "files": [str(path) for path in (job.get("files") or []) if path],
+        "queued_at": str(job.get("queued_at") or ""),
+        "queue_name": str(job.get("_queue_name") or ""),
+        "queue_finish": float(job.get("_queue_finish") or 0),
+        "delivery_intent_id": str(job.get("_delivery_intent_id") or ""),
+        "persisted_source_ids": [
+            str(item) for item in (job.get("_persisted_source_ids") or []) if item
+        ],
+        "album_terminal_failures": [
+            str(item) for item in (job.get("_album_terminal_failures") or []) if item
+        ],
+        "partial_download_files": [
+            str(path) for path in (job.get("_partial_download_files") or []) if path
+        ],
+        "partial_download_messages": [
+            dict(item)
+            for item in (job.get("_partial_download_message_metas") or [])
+            if isinstance(item, dict)
+        ],
+    }
+    if job.get("url"):
+        payload["url"] = str(job.get("url") or "")
+        payload["platform"] = str(job.get("platform") or "telegram")
+        payload["requester_id"] = int(job.get("requester_id") or 0)
+        payload["retries"] = int(job.get("retries") or job.get("attempt") or 0)
+    return payload
+
+
+def serialize_album_messages(messages):
+    return [
+        message_meta(msg) if hasattr(msg, "chat") and hasattr(msg, "id") else dict(msg)
+        for msg in (messages or [])
+        if hasattr(msg, "chat") or isinstance(msg, dict)
+    ]
+
+
+def queue_fairness_snapshot(queue_obj):
+    return {
+        "served_floor": float(queue_obj._served_floor),
+        "source_finish": {
+            str(key): float(value)
+            for key, value in queue_obj._source_finish.items()
+        },
+    }
+
+
+def restore_queue_fairness(queue_obj, snapshot):
+    snapshot = snapshot or {}
+    queue_obj._served_floor = float(snapshot.get("served_floor") or 0)
+    queue_obj._source_finish = {
+        str(key): float(value)
+        for key, value in (snapshot.get("source_finish") or {}).items()
+    }
+
+
+def mark_runtime_checkpoint_dirty(reason="state change"):
+    global RUNTIME_CHECKPOINT_DIRTY, RUNTIME_CHECKPOINT_LAST_REASON
+    RUNTIME_CHECKPOINT_DIRTY = True
+    RUNTIME_CHECKPOINT_LAST_REASON = str(reason)[:160]
+    loop = RUNTIME_CHECKPOINT_LOOP
+    if loop and not loop.is_closed():
+        with contextlib.suppress(Exception):
+            loop.call_soon_threadsafe(RUNTIME_CHECKPOINT_WAKE.set)
+            return
+    with contextlib.suppress(Exception):
+        RUNTIME_CHECKPOINT_WAKE.set()
+
+
+def delivery_intents_snapshot():
+    with DELIVERY_INTENTS_LOCK:
+        return deepcopy(DELIVERY_INTENTS)
+
+
+def _persist_delivery_intents_sync():
+    with DELIVERY_INTENTS_LOCK:
+        payload = {
+            "updated_at": now_iso(),
+            "intents": deepcopy(DELIVERY_INTENTS),
+        }
+    sequence = int(time.time() * 1000)
+    atomic_checkpoint_save(
+        DELIVERY_INTENT_FILE,
+        payload,
+        sequence,
+        previous_path=DELIVERY_INTENT_PREVIOUS_FILE,
+    )
+
+
+async def begin_delivery_intent(job, messages, operation, files=None):
+    """Persist intent before Telegram accepts a media request."""
+    intent_id = stable_uid(
+        "delivery",
+        job.get("job_id") or "",
+        operation,
+        "|".join(
+            str(meta.get("media_uid") or f"{meta.get('chat_id')}:{meta.get('message_id')}")
+            for meta in serialize_album_messages(messages)
+        ),
+        uuid.uuid4().hex,
+    )
+    intent = {
+        "intent_id": intent_id,
+        "job_id": str(job.get("job_id") or ""),
+        "operation": str(operation),
+        "type": str(job.get("type") or "single"),
+        "source": str(job.get("source") or ""),
+        "ch_name": str(job.get("ch_name") or "")[:200],
+        "files": [str(path) for path in (files or job.get("files") or []) if path],
+        "messages": serialize_album_messages(messages),
+        "status": "pending",
+        "target_message_ids": [],
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    with DELIVERY_INTENTS_LOCK:
+        DELIVERY_INTENTS[intent_id] = intent
+    await run_blocking("persistence", _persist_delivery_intents_sync)
+    mark_runtime_checkpoint_dirty(f"delivery intent {intent_id} prepared")
+    return intent_id
+
+
+async def update_delivery_intent(intent_id, status=None, target_messages=None, error=""):
+    if not intent_id:
+        return
+    with DELIVERY_INTENTS_LOCK:
+        intent = DELIVERY_INTENTS.get(str(intent_id))
+        if not intent:
+            return
+        if status:
+            intent["status"] = str(status)
+        if target_messages is not None:
+            intent["target_message_ids"] = [
+                int(getattr(message, "id", message) or 0)
+                for message in (target_messages or [])
+                if getattr(message, "id", message)
+            ]
+        if error:
+            intent["last_error"] = str(error)[:500]
+        intent["updated_at"] = now_iso()
+    await run_blocking("persistence", _persist_delivery_intents_sync)
+    mark_runtime_checkpoint_dirty(f"delivery intent {intent_id} updated")
+
+
+async def complete_delivery_intent(intent_id):
+    if not intent_id:
+        return
+    with DELIVERY_INTENTS_LOCK:
+        DELIVERY_INTENTS.pop(str(intent_id), None)
+    await run_blocking("persistence", _persist_delivery_intents_sync)
+    mark_runtime_checkpoint_dirty(f"delivery intent {intent_id} completed")
+
+
+def load_delivery_intents_sync():
+    envelope, source = load_checkpoint_with_fallback(
+        DELIVERY_INTENT_FILE,
+        DELIVERY_INTENT_PREVIOUS_FILE,
+    )
+    if not envelope:
+        return {}, ""
+    payload = envelope.get("payload") or {}
+    intents = payload.get("intents") or {}
+    if not isinstance(intents, dict):
+        return {}, source
+    with DELIVERY_INTENTS_LOCK:
+        DELIVERY_INTENTS.clear()
+        DELIVERY_INTENTS.update(
+            {
+                str(key): value
+                for key, value in intents.items()
+                if isinstance(value, dict)
+            }
+        )
+    return delivery_intents_snapshot(), source
+
+
+async def complete_delivery_intents_for_job(job_id):
+    job_id = str(job_id or "")
+    if not job_id:
+        return 0
+    with DELIVERY_INTENTS_LOCK:
+        intent_ids = [
+            intent_id
+            for intent_id, intent in DELIVERY_INTENTS.items()
+            if str((intent or {}).get("job_id") or "") == job_id
+        ]
+    for intent_id in intent_ids:
+        await complete_delivery_intent(intent_id)
+    return len(intent_ids)
+
+
+def _intent_media_uids(intent):
+    return [
+        str(meta.get("media_uid") or "")
+        for meta in (intent or {}).get("messages", []) or []
+        if isinstance(meta, dict) and meta.get("media_uid")
+    ]
+
+
+async def find_recent_target_messages_for_uids(uids, limit=None):
+    needed = {str(uid) for uid in uids or [] if uid}
+    if not needed:
+        return {}
+    found = {}
+    limit = max(
+        50,
+        min(
+            RUNTIME_CHECKPOINT_CONFIRM_HISTORY_LIMIT,
+            int(limit or (len(needed) * 20)),
+        ),
+    )
+    await wait_for_telegram_client("delivery intent target scan")
+    await wait_global_flood_gate("delivery intent target scan")
+    async with telegram_api_semaphore:
+        async for target_message in userbot.get_chat_history(TARGET_CHAT_ID, limit=limit):
+            if not is_valid_media(target_message):
+                continue
+            uid = get_media_uid(target_message)
+            if uid in needed and uid not in found:
+                found[uid] = target_message
+                if len(found) == len(needed):
+                    break
+            await asyncio.sleep(0)
+    return found
+
+
+async def recover_delivery_intents_after_restart():
+    """Reconcile uploads that may have succeeded just before a crash or rebuild."""
+    intents = delivery_intents_snapshot()
+    if not intents:
+        return {"intents": 0, "committed": 0, "unresolved": 0}
+    committed = 0
+    unresolved = 0
+    for intent_id, intent in list(intents.items()):
+        if not isinstance(intent, dict):
+            await complete_delivery_intent(intent_id)
+            continue
+        uids = _intent_media_uids(intent)
+        if not uids:
+            unresolved += 1
+            continue
+        target_by_uid = await find_recent_target_messages_for_uids(
+            uids,
+            limit=max(100, len(uids) * 30),
+        )
+        if not target_by_uid:
+            unresolved += 1
+            continue
+        source_messages = await fetch_messages_from_meta(intent.get("messages", []))
+        pairs = []
+        for source_message in source_messages:
+            uid = get_media_uid(source_message)
+            target_message = target_by_uid.get(uid)
+            if uid and target_message:
+                pairs.append((source_message, target_message))
+        if pairs:
+            await mark_posted_many_queued(
+                [
+                    (
+                        source_message.chat.id,
+                        source_message,
+                        intent.get("ch_name", ""),
+                        target_message,
+                        intent.get("job_id", ""),
+                    )
+                    for source_message, target_message in pairs
+                ]
+            )
+            for source_message, _target_message in pairs:
+                remove_processing_keys(source_message.chat.id, source_message)
+            committed += len(pairs)
+            await complete_delivery_intent(intent_id)
+            continue
+        unresolved += 1
+    if committed or unresolved:
+        log_event(
+            f"Delivery-intent recovery: committed={committed}, unresolved={unresolved}, "
+            f"loaded_intents={len(intents)}."
+        )
+    return {"intents": len(intents), "committed": committed, "unresolved": unresolved}
+
+
+def runtime_checkpoint_payload(reason="periodic"):
+    """Capture every reconstructable in-memory state without live Telegram objects."""
+    with active_worker_jobs_lock:
+        active_workers = deepcopy(active_worker_jobs)
+    with TELEGRAM_INFLIGHT_LOCK:
+        inflight = deepcopy(TELEGRAM_INFLIGHT)
+    with state_mutex:
+        queue_records = {}
+        for state_name in ("download_queue", "upload_queue"):
+            queue_records[state_name] = {
+                str(job_id): deepcopy(record)
+                for job_id, record in STATE.get(state_name, {}).get("items", {}).items()
+                if record.get("status") in QUEUE_STUCK_STATUSES
+            }
+        sync_state = {
+            "cursors": deepcopy(STATE.get("sync_source_manager", {}).get("cursors", {})),
+            "startup_hot_scan": deepcopy(
+                STATE.get("sync_source_manager", {}).get("startup_hot_scan", {})
+            ),
+        }
+    retry_items = []
+    for entry in list(retry_admission_queue._queue):
+        if len(entry) < 7:
+            continue
+        due, sequence, key, generation, queue_name, job, retry_reason = entry
+        retry_items.append(
+            {
+                "due_at": time.time() + max(0.0, float(due) - time.monotonic()),
+                "sequence": int(sequence),
+                "key": str(key),
+                "generation": int(generation),
+                "queue_name": str(queue_name),
+                "job": serialize_runtime_job(job),
+                "reason": str(retry_reason or "")[:300],
+            }
+        )
+    link_items = [
+        serialize_runtime_job(item)
+        for item in list(link_process_queue._queue)
+        if isinstance(item, dict)
+    ]
+    album_items = []
+    for group_key, messages in list(auto_album_buffer.items()):
+        album_items.append(
+            {
+                "group_key": str(group_key),
+                "ch_name": str(
+                    getattr(getattr(messages[0], "chat", None), "title", "")
+                    if messages
+                    else ""
+                ),
+                "messages": serialize_album_messages(messages),
+                "deadline_at": float(auto_album_deadlines.get(group_key) or time.time()),
+            }
+        )
+    files = []
+    for path in list(active_download_files):
+        with contextlib.suppress(Exception):
+            stat = os.stat(path)
+            files.append(
+                {
+                    "path": str(path),
+                    "size": int(stat.st_size),
+                    "mtime": float(stat.st_mtime),
+                    "exists": True,
+                }
+            )
+    with DELIVERY_INTENTS_LOCK:
+        intents = deepcopy(DELIVERY_INTENTS)
+    flood_remaining = max(0.0, TELEGRAM_FLOOD_UNTIL - time.monotonic())
+    return {
+        "reason": str(reason)[:160],
+        "checkpointed_at": now_iso(),
+        "queues": {
+            "download": channel_download_queue.checkpoint_entries(),
+            "upload": upload_queue.checkpoint_entries(),
+            "link": link_items,
+            "retry": retry_items,
+            "admission": retry_items,
+            "processing": [
+                serialize_runtime_job(item.get("job") or item)
+                for item in active_workers.values()
+                if item.get("job") or item.get("job_id")
+            ],
+            "fairness": {
+                "download": queue_fairness_snapshot(channel_download_queue),
+                "upload": queue_fairness_snapshot(upload_queue),
+            },
+        },
+        "queue_records": queue_records,
+        "workers": active_workers,
+        "albums": {"auto": album_items},
+        "telegram": {
+            "inflight": inflight,
+            "transport_generation": int(TELEGRAM_TRANSPORT_GENERATION),
+            "flood_wait_until": time.time() + flood_remaining,
+        },
+        "cursors": {
+            "sync_source_manager": sync_state,
+            "source_guard_index": int(source_guard_index),
+            "auto_sync_index": int(auto_sync_index),
+            "pipeline": deepcopy(PIPELINE_SCAN_STATUS),
+            "last_auto_sync": deepcopy(last_auto_sync),
+            "last_source_guard": deepcopy(last_source_guard),
+        },
+        "caches": {
+            "processing": processing_cache.checkpoint_snapshot(),
+            "target_index_count": len(target_media_full_index),
+            "duplicate_index_count": len(STATE.get("clean_duplicate", {}).get("items", {})),
+        },
+        "temp_files": files,
+        "delivery_intents": intents,
+        "semaphores": {
+            "api_capacity": TELEGRAM_API_CONCURRENCY,
+            "control_capacity": max(2, env_int("ROYELLS_TELEGRAM_CONTROL_CONCURRENCY", "4")),
+            "media_capacity": 1,
+            "leases_reset_on_boot": True,
+        },
+    }
+
+
+def migrate_runtime_checkpoint_payload(payload, schema_version):
+    if not isinstance(payload, dict):
+        return {}
+    payload = deepcopy(payload)
+    if int(schema_version or 1) <= 1:
+        payload.setdefault("queues", {})
+        payload.setdefault("queue_records", {})
+        payload.setdefault("workers", {})
+        payload.setdefault("albums", {"auto": []})
+        payload.setdefault("telegram", {})
+        payload.setdefault("cursors", {})
+        payload.setdefault("caches", {})
+        payload.setdefault("temp_files", [])
+        payload.setdefault("delivery_intents", {})
+    payload["queues"].setdefault("admission", payload["queues"].get("retry", []))
+    payload["albums"].setdefault("auto", [])
+    return payload
+
+
+def load_runtime_checkpoint_sync():
+    global RUNTIME_CHECKPOINT_SEQUENCE, RUNTIME_CHECKPOINT_LOADED, RUNTIME_CHECKPOINT_LOADED_SOURCE
+    envelope, source = load_checkpoint_with_fallback(
+        RUNTIME_CHECKPOINT_FILE,
+        RUNTIME_CHECKPOINT_PREVIOUS_FILE,
+    )
+    if not envelope:
+        RUNTIME_CHECKPOINT_LOADED = {}
+        RUNTIME_CHECKPOINT_LOADED_SOURCE = ""
+        return {}, ""
+    RUNTIME_CHECKPOINT_SEQUENCE = int(envelope.get("sequence") or 0)
+    payload = migrate_runtime_checkpoint_payload(
+        envelope.get("payload") or {},
+        envelope.get("schema_version"),
+    )
+    RUNTIME_CHECKPOINT_LOADED = payload
+    RUNTIME_CHECKPOINT_LOADED_SOURCE = source
+    if source == "previous":
+        log_event("Runtime checkpoint primary was invalid; previous-good generation selected.")
+    return payload, source
+
+
+def merge_checkpoint_queue_records(payload):
+    records = payload.get("queue_records") or {}
+    merged = 0
+    with state_mutex:
+        for state_name, state_records in records.items():
+            if state_name not in ("download_queue", "upload_queue") or not isinstance(state_records, dict):
+                continue
+            items = STATE[state_name].setdefault("items", {})
+            for job_id, record in state_records.items():
+                if not isinstance(record, dict):
+                    continue
+                old = items.get(str(job_id), {})
+                if old.get("status") in QUEUE_TERMINAL_STATUSES:
+                    continue
+                items[str(job_id)] = {**record, **old}
+                items[str(job_id)]["status"] = record.get("status") or old.get("status") or "queued"
+                merged += 1
+            save_state(state_name)
+    return merged
+
+
+def restore_runtime_checkpoint_sync(payload):
+    global source_guard_index, auto_sync_index, TELEGRAM_FLOOD_UNTIL
+    if not payload:
+        return {"merged": 0, "intents": 0}
+    merged = merge_checkpoint_queue_records(payload)
+    caches = payload.get("caches") or {}
+    processing_cache.restore_checkpoint_snapshot(caches.get("processing") or {})
+    telegram_state = payload.get("telegram") or {}
+    TELEGRAM_FLOOD_UNTIL = time.monotonic() + max(
+        0.0,
+        float(telegram_state.get("flood_wait_until") or 0) - time.time(),
+    )
+    source_guard_index = int((payload.get("cursors") or {}).get("source_guard_index") or 0)
+    auto_sync_index = int((payload.get("cursors") or {}).get("auto_sync_index") or 0)
+    pipeline = (payload.get("cursors") or {}).get("pipeline") or {}
+    PIPELINE_SCAN_STATUS.update(pipeline)
+    if (payload.get("cursors") or {}).get("last_auto_sync"):
+        last_auto_sync.update((payload.get("cursors") or {}).get("last_auto_sync"))
+    if (payload.get("cursors") or {}).get("last_source_guard"):
+        last_source_guard.update((payload.get("cursors") or {}).get("last_source_guard"))
+    intents = payload.get("delivery_intents") or {}
+    with DELIVERY_INTENTS_LOCK:
+        for intent_id, intent in intents.items():
+            if isinstance(intent, dict):
+                DELIVERY_INTENTS[str(intent_id)] = intent
+    return {"merged": merged, "intents": len(intents)}
+
+
+def checkpoint_job_descriptor(entry):
+    if isinstance(entry, dict) and isinstance(entry.get("job"), dict):
+        return entry.get("job") or {}
+    return entry if isinstance(entry, dict) else {}
+
+
+async def hydrate_runtime_job_from_checkpoint(descriptor, queue_name="download"):
+    descriptor = descriptor or {}
+    if descriptor.get("url"):
+        return stamp_queue_job(
+            {
+                "url": str(descriptor.get("url") or ""),
+                "platform": str(descriptor.get("platform") or "telegram"),
+                "retries": int(descriptor.get("retries") or 0),
+                "requester_id": int(descriptor.get("requester_id") or OWNER_ID or 0),
+                "status_chat_id": int(descriptor.get("status_chat_id") or 0),
+                "status_message_id": int(descriptor.get("status_message_id") or 0),
+            },
+            "link",
+        )
+    messages = await fetch_messages_from_meta(descriptor.get("messages", []))
+    if not messages:
+        return None
+    files = [
+        str(path)
+        for path in descriptor.get("files", []) or []
+        if path and os.path.exists(path) and os.path.getsize(path) > 0
+    ]
+    if queue_name == "upload" and not files:
+        return None
+    job = {
+        "job_id": str(descriptor.get("job_id") or make_job_id(messages, descriptor.get("type") or "single")),
+        "post_uid": str(descriptor.get("post_uid") or descriptor.get("job_id") or ""),
+        "type": str(descriptor.get("type") or ("album" if len(messages) > 1 else "single")),
+        "messages": messages,
+        "ch_name": str(descriptor.get("ch_name") or ""),
+        "attempt": max(1, int(descriptor.get("attempt") or 1)),
+        "is_fallback": bool(descriptor.get("is_fallback")),
+        "source": str(descriptor.get("source") or "checkpoint"),
+        "sync_run_id": descriptor.get("sync_run_id"),
+        "force_upload": bool(descriptor.get("force_upload")),
+        "manual_link_url": str(descriptor.get("manual_link_url") or ""),
+        "status_chat_id": int(descriptor.get("status_chat_id") or 0),
+        "status_message_id": int(descriptor.get("status_message_id") or 0),
+        "_persisted_source_ids": [
+            str(item)
+            for item in descriptor.get("persisted_source_ids", []) or []
+            if item
+        ],
+        "_album_terminal_failures": [
+            str(item)
+            for item in descriptor.get("album_terminal_failures", []) or []
+            if item
+        ],
+        "_partial_download_files": [
+            str(path)
+            for path in descriptor.get("partial_download_files", []) or []
+            if path and os.path.exists(path) and os.path.getsize(path) > 0
+        ],
+        "_partial_download_message_metas": [
+            dict(item)
+            for item in descriptor.get("partial_download_messages", []) or []
+            if isinstance(item, dict)
+        ],
+    }
+    if files:
+        job["files"] = files
+    return stamp_queue_job(job, queue_name)
+
+
+async def restore_checkpoint_album_state(payload):
+    restored = 0
+    for item in ((payload.get("albums") or {}).get("auto") or []):
+        if not isinstance(item, dict):
+            continue
+        group_key = str(item.get("group_key") or "")
+        if not group_key:
+            continue
+        messages = await fetch_messages_from_meta(item.get("messages", []))
+        if not messages:
+            continue
+        deadline_at = float(item.get("deadline_at") or (time.time() + ALBUM_WAIT))
+        ch_name = str(item.get("ch_name") or getattr(messages[0].chat, "title", "") or group_key)
+        async with auto_album_lock:
+            if group_key in auto_album_tasks:
+                continue
+            auto_album_buffer[group_key] = messages
+            auto_album_deadlines[group_key] = deadline_at
+            auto_album_tasks[group_key] = asyncio.create_task(
+                _auto_flush_album(group_key, ch_name, delay=max(0.0, deadline_at - time.time()))
+            )
+            restored += 1
+    if restored:
+        mark_runtime_checkpoint_dirty("album checkpoint restored")
+    return restored
+
+
+async def restore_checkpoint_runtime_queues_after_telegram(payload):
+    global RUNTIME_CHECKPOINT_RESTORED_QUEUE_JOB_IDS
+    if not payload:
+        return {"download": 0, "upload": 0, "link": 0, "retry": 0, "processing": 0, "albums": 0}
+    queues = payload.get("queues") or {}
+    stats = {"download": 0, "upload": 0, "link": 0, "retry": 0, "processing": 0, "albums": 0}
+    restored_ids = set(RUNTIME_CHECKPOINT_RESTORED_QUEUE_JOB_IDS) | live_pipeline_job_ids()
+    restore_queue_fairness(channel_download_queue, (queues.get("fairness") or {}).get("download") or {})
+    restore_queue_fairness(upload_queue, (queues.get("fairness") or {}).get("upload") or {})
+
+    for queue_name, queue_obj in (("download", channel_download_queue), ("upload", upload_queue)):
+        for entry in queues.get(queue_name, []) or []:
+            descriptor = checkpoint_job_descriptor(entry)
+            job_id = str(descriptor.get("job_id") or "")
+            if job_id and job_id in restored_ids:
+                continue
+            if recovery_record_is_complete(descriptor):
+                continue
+            if queue_obj.full():
+                break
+            job = await hydrate_runtime_job_from_checkpoint(descriptor, queue_name)
+            if not job:
+                continue
+            for message in job.get("messages", []):
+                add_processing_keys(message.chat.id, message)
+            if queue_name == "upload":
+                for path in job.get("files", []):
+                    track_download_file(path)
+            queue_obj.restore_checkpoint_entry(
+                job,
+                finish=entry.get("finish") if isinstance(entry, dict) else None,
+                sequence=entry.get("sequence") if isinstance(entry, dict) else None,
+            )
+            restored_ids.add(str(job.get("job_id") or ""))
+            stats[queue_name] += 1
+
+    for descriptor in queues.get("link", []) or []:
+        job = await hydrate_runtime_job_from_checkpoint(descriptor, "link")
+        if not job:
+            continue
+        link_key = str(job.get("url") or "")
+        if not link_key or link_key in RUNTIME_CHECKPOINT_RESTORED_LINK_KEYS:
+            continue
+        if link_process_queue.full():
+            if schedule_queue_retry("link", job, 5, "checkpoint link queue backpressure"):
+                stats["retry"] += 1
+            continue
+        link_process_queue.put_nowait(job)
+        RUNTIME_CHECKPOINT_RESTORED_LINK_KEYS.add(link_key)
+        stats["link"] += 1
+
+    seen_retry_keys = set()
+    retry_items = list(queues.get("admission") or queues.get("retry") or [])
+    for item in retry_items:
+        if not isinstance(item, dict):
+            continue
+        queue_name = str(item.get("queue_name") or "")
+        descriptor = checkpoint_job_descriptor(item)
+        job = await hydrate_runtime_job_from_checkpoint(descriptor, queue_name or "download")
+        if not job:
+            continue
+        key = str(item.get("key") or retry_key(queue_name, job))
+        if not key or key in seen_retry_keys:
+            continue
+        if retry_admission_queue.full():
+            break
+        generation = max(
+            int(item.get("generation") or 1),
+            int(RETRY_GENERATIONS.get(key, 0)) + 1,
+        )
+        RETRY_GENERATIONS[key] = generation
+        due_at = float(item.get("due_at") or time.time())
+        retry_admission_queue.put_nowait(
+            (
+                time.monotonic() + max(0.0, due_at - time.time()),
+                next(RETRY_SEQUENCE),
+                key,
+                generation,
+                queue_name,
+                job,
+                str(item.get("reason") or "checkpoint retry restore"),
+            )
+        )
+        seen_retry_keys.add(key)
+        stats["retry"] += 1
+
+    for descriptor in queues.get("processing", []) or []:
+        descriptor = checkpoint_job_descriptor(descriptor)
+        job_id = str(descriptor.get("job_id") or "")
+        if job_id and job_id in restored_ids:
+            continue
+        queue_name = "upload" if descriptor.get("files") else "download"
+        queue_obj = upload_queue if queue_name == "upload" else channel_download_queue
+        if queue_obj.full():
+            continue
+        job = await hydrate_runtime_job_from_checkpoint(descriptor, queue_name)
+        if not job:
+            continue
+        if recovery_record_is_complete(descriptor):
+            continue
+        for message in job.get("messages", []):
+            add_processing_keys(message.chat.id, message)
+        if queue_name == "upload":
+            for path in job.get("files", []):
+                track_download_file(path)
+        queue_obj.put_nowait(job)
+        restored_ids.add(str(job.get("job_id") or ""))
+        stats["processing"] += 1
+
+    stats["albums"] = await restore_checkpoint_album_state(payload)
+    RUNTIME_CHECKPOINT_RESTORED_QUEUE_JOB_IDS = restored_ids
+    if any(stats.values()):
+        mark_runtime_checkpoint_dirty("runtime queues restored")
+        log_event(f"Runtime checkpoint queues restored: {stats}")
+    return stats
+
+
+def save_runtime_checkpoint_sync(payload, reason):
+    global RUNTIME_CHECKPOINT_SEQUENCE, RUNTIME_CHECKPOINT_LAST_WRITTEN
+    if not RUNTIME_CHECKPOINT_ENABLED:
+        return False
+    RUNTIME_CHECKPOINT_SEQUENCE += 1
+    atomic_checkpoint_save(
+        RUNTIME_CHECKPOINT_FILE,
+        payload,
+        RUNTIME_CHECKPOINT_SEQUENCE,
+        previous_path=RUNTIME_CHECKPOINT_PREVIOUS_FILE,
+    )
+    RUNTIME_CHECKPOINT_LAST_WRITTEN = time.time()
+    return True
+
+
+async def checkpoint_runtime_state(reason="periodic", force=False):
+    global RUNTIME_CHECKPOINT_DIRTY
+    if not RUNTIME_CHECKPOINT_ENABLED:
+        return False
+    if not force and not RUNTIME_CHECKPOINT_DIRTY:
+        return False
+    async with RUNTIME_CHECKPOINT_LOCK:
+        if not force and not RUNTIME_CHECKPOINT_DIRTY:
+            return False
+        payload = runtime_checkpoint_payload(reason)
+        saved = await run_blocking(
+            "persistence",
+            save_runtime_checkpoint_sync,
+            payload,
+            reason,
+        )
+        if saved:
+            RUNTIME_CHECKPOINT_DIRTY = False
+            RUNTIME_CHECKPOINT_WAKE.clear()
+        return bool(saved)
+
+
+async def runtime_checkpoint_loop():
+    if not RUNTIME_CHECKPOINT_ENABLED:
+        await asyncio.Event().wait()
+    while True:
+        try:
+            try:
+                await asyncio.wait_for(
+                    RUNTIME_CHECKPOINT_WAKE.wait(),
+                    timeout=RUNTIME_CHECKPOINT_INTERVAL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
+            await checkpoint_runtime_state("periodic")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event(f"Runtime checkpoint failed safely: {format_exception_for_log(exc)}")
+            await asyncio.sleep(5)
+
+
+def make_job_id(messages, job_type):
+    metas = [message_meta(m) for m in messages if m]
+    if not metas:
+        return stable_uid("job", uuid.uuid4().hex)
+    if job_type == "album":
+        first = metas[0]
+        group = first.get("media_group_id") or "-".join(str(m["message_id"]) for m in metas)
+        raw = f"{first.get('chat_id')}|{group}|" + "|".join(str(m.get("media_uid") or m["message_id"]) for m in metas)
+        return stable_uid("album", raw)
+    uid = metas[0].get("media_uid")
+    return stable_uid("post", uid or f"{metas[0].get('chat_id')}:{metas[0].get('message_id')}")
+
+
+def add_uid_to_target_full_index(uid, message_id=0, source="target_scan"):
+    if not uid:
+        return
+    target_media_full_index.add(uid)
+    with db_mutex:
+        conn = db_connect()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO target_media_full_index (uid, message_id, indexed_at, source)
+                VALUES (?,?,?,?)
+                """,
+                (uid, int(message_id or 0), now_iso(), source),
+            )
+            conn.execute("INSERT OR IGNORE INTO target_media (uid) VALUES (?)", (uid,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def load_target_full_index_from_db():
+    target_media_full_index.clear()
+    with db_mutex:
+        conn = db_connect()
+        try:
+            rows = conn.execute("SELECT uid FROM target_media_full_index").fetchall()
+            fallback_rows = conn.execute("SELECT uid FROM target_media").fetchall()
+        finally:
+            conn.close()
+    for (uid,) in rows + fallback_rows:
+        if uid:
+            target_media_full_index.add(uid)
+    with state_mutex:
+        for uid in STATE.get("target_media_index", {}).setdefault("items", {}):
+            if uid:
+                target_media_full_index.add(uid)
+    return len(target_media_full_index)
+
+
+def is_duplicate_in_target(uid):
+    if not uid:
+        return False
+    if uid in target_media_full_index:
+        return True
+    with state_mutex:
+        if uid in STATE.get("target_media_index", {}).setdefault("items", {}):
+            target_media_full_index.add(uid)
+            return True
+    with db_mutex:
+        conn = db_connect()
+        try:
+            res = conn.execute(
+                "SELECT 1 FROM target_media_full_index WHERE uid=? UNION SELECT 1 FROM target_media WHERE uid=? LIMIT 1",
+                (uid, uid),
+            ).fetchone()
+        finally:
+            conn.close()
+    if res:
+        target_media_full_index.add(uid)
+        return True
+    return False
+
+
+def known_duplicate_uid(uid):
+    if not uid:
+        return False
+    if is_dead_media_uid(uid):
+        return True
+    with state_mutex:
+        if uid in STATE["clean_duplicate"].setdefault("items", {}):
+            return True
+    return is_duplicate_in_target(uid) or is_uid_in_target(uid)
+
+
+def load_dead_media_from_state():
+    dead_media_uids.clear()
+    with state_mutex:
+        items = STATE.get("dead_media", {}).setdefault("items", {})
+    for uid, item in items.items():
+        if item.get("status") == "dead":
+            dead_media_uids[uid] = 0
+    return len(dead_media_uids)
+
+
+def is_dead_media_uid(uid):
+    if not uid:
+        return False
+    if uid in dead_media_uids:
+        expires_at = dead_media_uids.get(uid) or 0
+        if expires_at and expires_at <= time.time():
+            dead_media_uids.pop(uid, None)
+            return False
+        return True
+    with state_mutex:
+        item = STATE.get("dead_media", {}).setdefault("items", {}).get(uid)
+    if item and item.get("status") == "dead":
+        dead_media_uids[uid] = 0
+        return True
+    return False
+
+
+def remember_dead_media(messages, reason, force_dead=False):
+    marked = 0
+    reason_text = str(reason)[:300]
+    for msg in messages or []:
+        uid = get_media_uid(msg)
+        if not uid:
+            continue
+        source_chat_id = str(getattr(getattr(msg, "chat", None), "id", ""))
+        source_title = getattr(getattr(msg, "chat", None), "title", "") or ""
+        with state_mutex:
+            dead_state = STATE["dead_media"]
+            items = dead_state.setdefault("items", {})
+            old = items.get(uid, {})
+            failure_count = int(old.get("failure_count") or 0) + 1
+            if force_dead:
+                failure_count = max(failure_count, DEAD_MEDIA_FAILURE_THRESHOLD)
+            status = "dead" if failure_count >= DEAD_MEDIA_FAILURE_THRESHOLD else "watch"
+            items[uid] = {
+                **old,
+                "uid": uid,
+                "status": status,
+                "failure_count": failure_count,
+                "reason": reason_text,
+                "source_chat_id": source_chat_id,
+                "source_title": source_title,
+                "created_at": old.get("created_at", now_iso()),
+                "updated_at": now_iso(),
+            }
+            source_counts = dead_state.setdefault("source_counts", {})
+            source_item = source_counts.setdefault(source_chat_id, {"count": 0, "updated_at": now_iso(), "title": source_title})
+            if status == "dead" and old.get("status") != "dead":
+                source_item["count"] = int(source_item.get("count") or 0) + 1
+            source_item["updated_at"] = now_iso()
+            source_item["title"] = source_title or source_item.get("title", "")
+            dead_state.setdefault("events", []).append(
+                {"time": now_iso(), "uid": uid, "status": status, "failure_count": failure_count, "reason": reason_text[:160]}
+            )
+            if len(dead_state["events"]) > 1000:
+                dead_state["events"] = dead_state["events"][-1000:]
+            save_state("dead_media")
+        if status == "dead":
+            dead_media_uids[uid] = 0
+            marked += 1
+        remove_processing_keys(msg.chat.id, msg)
+    if marked:
+        diagnostic_stats["dead_media_added"] = int(diagnostic_stats.get("dead_media_added") or 0) + marked
+        log_event(f"Permanent dead-media skip activated for {marked} uid(s): {reason_text[:140]}")
+    return marked
+
+
+def all_messages_are_duplicates(messages):
+    uids = [get_media_uid(m) for m in messages if is_valid_media(m)]
+    return bool(uids) and all(known_duplicate_uid(uid) for uid in uids)
+
+
+def add_processing_keys(channel_id, msg):
+    uid = get_media_uid(msg)
+    old_hash = make_old_hash(channel_id, msg.id)
+    if uid:
+        processing_cache.add(uid)
+    processing_cache.add(old_hash)
+    mark_runtime_checkpoint_dirty("processing cache add")
+
+
+def remove_processing_keys(channel_id, msg):
+    uid = get_media_uid(msg)
+    old_hash = make_old_hash(channel_id, msg.id)
+    if uid:
+        processing_cache.discard(uid)
+    processing_cache.discard(old_hash)
+    mark_runtime_checkpoint_dirty("processing cache remove")
+
+
+def pipeline_job_count():
+    with active_worker_jobs_lock:
+        active_count = len(active_worker_jobs)
+    return (
+        channel_download_queue.qsize()
+        + upload_queue.qsize()
+        + link_process_queue.qsize()
+        + retry_admission_queue.qsize()
+        + active_count
+    )
+
+
+def live_pipeline_job_ids():
+    live_ids = set(channel_download_queue.job_ids()) | set(upload_queue.job_ids())
+    with active_worker_jobs_lock:
+        live_ids.update(
+            str(item.get("job_id") or "")
+            for item in active_worker_jobs.values()
+            if item.get("job_id")
+        )
+    for entry in list(retry_admission_queue._queue):
+        if len(entry) < 6:
+            continue
+        job = entry[5] or {}
+        job_id = str(job.get("job_id") or "")
+        if job_id:
+            live_ids.add(job_id)
+    return live_ids
+
+
+def mark_worker_job(worker_name, job):
+    with active_worker_jobs_lock:
+        active_worker_jobs[worker_name] = {
+            "worker": worker_name,
+            "job_id": str(job.get("job_id") or ""),
+            "source": str(job.get("source") or ""),
+            "ch_name": str(job.get("ch_name") or "")[:120],
+            "attempt": int(job.get("attempt") or 1),
+            "started_at": time.time(),
+            "started_iso": now_iso(),
+            "job": serialize_runtime_job(job),
+        }
+    mark_runtime_checkpoint_dirty(f"worker {worker_name} owns job")
+
+
+def clear_worker_job(worker_name):
+    with active_worker_jobs_lock:
+        active_worker_jobs.pop(worker_name, None)
+    mark_runtime_checkpoint_dirty(f"worker {worker_name} cleared")
+
+
+def stalled_worker_jobs(max_age=None):
+    max_age = max(60, int(max_age or WORKER_STALL_SECONDS))
+    now_ts = time.time()
+    with active_worker_jobs_lock:
+        items = list(active_worker_jobs.values())
+    return [item for item in items if now_ts - float(item.get("started_at") or now_ts) > max_age]
+
+
+QUEUE_STUCK_STATUSES = {
+    "queued",
+    "downloading",
+    "downloading_partial",
+    "processing",
+    "downloaded",
+    "queued_upload",
+    "uploading",
+    "retry",
+    "retry_later",
+    "queued_retry_later",
+    "recovered",
+    "queued_recovered",
+    "fallback_queued",
+    "worker_fallback_queued",
+}
+
+QUEUE_TERMINAL_STATUSES = {
+    "uploaded",
+    "uploaded_partial",
+    "skipped_duplicate",
+    "skipped_partial_album",
+    "skipped_content_filter",
+    "skipped_dead_media",
+    "skipped_source_retired",
+    "failed",
+    "failed_invalid_media",
+    "worker_pressure_offload",
+}
+
+
+def queue_record_reservation_keys(record):
+    keys = set()
+    for meta in record.get("messages", []) or []:
+        if not isinstance(meta, dict):
+            continue
+        uid = str(meta.get("media_uid") or "").strip()
+        if uid:
+            keys.add(f"uid:{uid}")
+        chat_id = meta.get("chat_id")
+        message_id = meta.get("message_id")
+        if chat_id not in (None, "") and message_id not in (None, ""):
+            keys.add(f"msg:{make_old_hash(chat_id, message_id)}")
+    return keys
+
+
+def message_reservation_keys(channel_id, msg):
+    keys = {f"msg:{make_old_hash(channel_id, msg.id)}"}
+    uid = get_media_uid(msg)
+    if uid:
+        keys.add(f"uid:{uid}")
+    return keys
+
+
+def persisted_reservation_blocks_message(channel_id, msg, owner=None):
+    return any(
+        persisted_queue_reservations.blocks(key, owner=owner)
+        for key in message_reservation_keys(channel_id, msg)
+    )
+
+
+def persisted_queue_job_is_recoverable(job_id):
+    job_id = str(job_id or "")
+    if not job_id:
+        return False
+    with state_mutex:
+        return any(
+            STATE.get(state_name, {}).setdefault("items", {}).get(job_id, {}).get("status")
+            in QUEUE_STUCK_STATUSES
+            for state_name in ("upload_queue", "download_queue")
+        )
+
+
+def refresh_persisted_queue_reservation(job_id):
+    job_id = str(job_id or "")
+    if not job_id:
+        return 0
+    keys = set()
+    recoverable = False
+    with state_mutex:
+        for state_name in ("upload_queue", "download_queue"):
+            record = STATE.get(state_name, {}).setdefault("items", {}).get(job_id, {})
+            if record.get("status") in QUEUE_STUCK_STATUSES:
+                recoverable = True
+                keys.update(queue_record_reservation_keys(record))
+    if recoverable:
+        return persisted_queue_reservations.reserve(job_id, keys)
+    return -persisted_queue_reservations.release(job_id)
+
+
+def initialize_persisted_queue_reservations():
+    persisted_queue_reservations.clear()
+    recoverable_jobs = set()
+    with state_mutex:
+        snapshots = {
+            state_name: deepcopy(STATE.get(state_name, {}).get("items", {}))
+            for state_name in ("upload_queue", "download_queue")
+        }
+    for state_name in ("upload_queue", "download_queue"):
+        for job_id, record in snapshots[state_name].items():
+            if record.get("status") not in QUEUE_STUCK_STATUSES:
+                continue
+            recoverable_jobs.add(str(job_id))
+            persisted_queue_reservations.reserve(job_id, queue_record_reservation_keys(record))
+    return len(recoverable_jobs), persisted_queue_reservations.key_count()
+
+
+def persisted_recovery_pending_job_ids():
+    live_ids = live_pipeline_job_ids()
+    with state_mutex:
+        upload_records = deepcopy(STATE.get("upload_queue", {}).get("items", {}))
+        download_records = deepcopy(STATE.get("download_queue", {}).get("items", {}))
+    upload_stuck_ids = {
+        str(job_id)
+        for job_id, record in upload_records.items()
+        if record.get("status") in QUEUE_STUCK_STATUSES
+    }
+    pending = {
+        str(job_id)
+        for job_id, record in upload_records.items()
+        if record.get("status") in QUEUE_STUCK_STATUSES and str(job_id) not in live_ids
+    }
+    pending.update(
+        str(job_id)
+        for job_id, record in download_records.items()
+        if record.get("status") in QUEUE_STUCK_STATUSES
+        and str(job_id) not in upload_stuck_ids
+        and str(job_id) not in live_ids
+    )
+    return pending
+
+
+def recovery_record_blocked_by_other_job(job_id, record):
+    return any(
+        persisted_queue_reservations.blocks(key, owner=job_id)
+        for key in queue_record_reservation_keys(record)
+    )
+
+
+def job_source_chat_id(job):
+    for msg in job.get("messages", []) or []:
+        chat = getattr(msg, "chat", None)
+        if chat and getattr(chat, "id", None) is not None:
+            return str(chat.id)
+    metas = job.get("message_metas") or []
+    if not metas and isinstance(job.get("messages"), list) and job.get("messages") and isinstance(job["messages"][0], dict):
+        metas = job["messages"]
+    for meta in metas:
+        chat_id = meta.get("chat_id") if isinstance(meta, dict) else ""
+        if chat_id not in (None, ""):
+            return str(chat_id)
+    return ""
+
+
+def record_job_state_db(job, stage, status, error=None):
+    """Durable job ledger used for diagnostics, stuck recovery decisions, and idempotency audits."""
+    if DB_DIAGNOSTIC_WRITES_DISABLED:
+        return
+    job_id = job.get("job_id")
+    if not job_id:
+        return
+    try:
+        metas = [message_meta(m) for m in job.get("messages", []) if hasattr(m, "chat")]
+        if not metas and isinstance(job.get("messages"), list) and job["messages"] and isinstance(job["messages"][0], dict):
+            metas = job["messages"]
+        with db_mutex:
+            conn = db_connect()
+            conn.execute(
+                """
+                INSERT INTO media_job_state (
+                    job_id, post_uid, stage, status, source, source_chat_id, ch_name,
+                    job_type, message_count, attempt, last_error, messages_json,
+                    created_at, updated_at
+                )
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    post_uid=excluded.post_uid,
+                    stage=excluded.stage,
+                    status=excluded.status,
+                    source=excluded.source,
+                    source_chat_id=excluded.source_chat_id,
+                    ch_name=excluded.ch_name,
+                    job_type=excluded.job_type,
+                    message_count=excluded.message_count,
+                    attempt=excluded.attempt,
+                    last_error=excluded.last_error,
+                    messages_json=excluded.messages_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    job_id,
+                    job.get("post_uid", job_id),
+                    stage,
+                    status,
+                    job.get("source", "unknown"),
+                    job_source_chat_id({**job, "message_metas": metas}),
+                    job.get("ch_name", ""),
+                    job.get("type", ""),
+                    len(job.get("messages", []) or metas),
+                    int(job.get("attempt", 1) or 1),
+                    str(error)[:500] if error else "",
+                    json.dumps(metas, ensure_ascii=True),
+                    now_iso(),
+                    now_iso(),
+                ),
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        log_event(f"Job state DB write skipped for {job_id}: {str(e)[:120]}")
+
+
+def queue_job_state_db(job, stage, status, error=None):
+    """Queue diagnostic DB writes without blocking the asyncio event loop."""
+    if DB_DIAGNOSTIC_WRITES_DISABLED:
+        return
+    try:
+        metas = [message_meta(m) for m in job.get("messages", []) if hasattr(m, "chat")]
+        payload_job = {
+            "job_id": job.get("job_id"),
+            "post_uid": job.get("post_uid", job.get("job_id")),
+            "source": job.get("source", "unknown"),
+            "ch_name": job.get("ch_name", ""),
+            "type": job.get("type", ""),
+            "attempt": job.get("attempt", 1),
+            "message_metas": metas,
+            "messages": metas,
+        }
+        payload = (payload_job, str(stage), str(status), str(error)[:500] if error else None)
+        job_state_db_queue.put_nowait(payload)
+    except asyncio.QueueFull:
+        log_event(f"Job state DB queue full; skipped diagnostic state write for {job.get('job_id', 'unknown')}.")
+    except RuntimeError:
+        record_job_state_db(job, stage, status, error)
+    except Exception as e:
+        log_event(f"Job state DB queue skipped: {str(e)[:120]}")
+
+
+def record_job_state_db_batch(entries):
+    if DB_DIAGNOSTIC_WRITES_DISABLED:
+        return
+    with db_mutex:
+        conn = db_connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for job, stage, status, error in entries:
+                job_id = job.get("job_id")
+                if not job_id:
+                    continue
+                metas = job.get("message_metas") or job.get("messages") or []
+                conn.execute("""INSERT INTO media_job_state (job_id, post_uid, stage, status, source, source_chat_id, ch_name, job_type, message_count, attempt, last_error, messages_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET post_uid=excluded.post_uid, stage=excluded.stage, status=excluded.status, source=excluded.source, source_chat_id=excluded.source_chat_id, ch_name=excluded.ch_name, job_type=excluded.job_type, message_count=excluded.message_count, attempt=excluded.attempt, last_error=excluded.last_error, messages_json=excluded.messages_json, updated_at=excluded.updated_at""", (job_id, job.get("post_uid", job_id), stage, status, job.get("source", "unknown"), job_source_chat_id({**job, "message_metas": metas}), job.get("ch_name", ""), job.get("type", ""), len(metas), int(job.get("attempt", 1) or 1), str(error)[:500] if error else "", json.dumps(metas, ensure_ascii=True), now_iso(), now_iso()))
+            conn.commit()
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+async def job_state_db_writer_loop():
+    global DB_DIAGNOSTIC_WRITES_DISABLED, DB_DEGRADED
+    while True:
+        first = await job_state_db_queue.get()
+        batch = [first]
+        while len(batch) < DB_WRITE_BATCH_SIZE:
+            try:
+                batch.append(job_state_db_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        try:
+            last_error = None
+            for write_attempt in range(1, 4):
+                try:
+                    await run_blocking("db", record_job_state_db_batch, batch)
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    log_event(
+                        f"Job state DB writer batch error ({len(batch)} item(s)) "
+                        f"attempt {write_attempt}/3: {str(exc)[:160]}"
+                    )
+                    if is_sqlite_corruption_error(exc):
+                        break
+                    await asyncio.sleep(min(5, write_attempt))
+            if last_error is not None:
+                DB_DIAGNOSTIC_WRITES_DISABLED = True
+                DB_DEGRADED = True
+                log_event(
+                    "SQLite diagnostic job-state writes disabled after bounded retries; "
+                    "authoritative JSON queue state remains active and will drive recovery."
+                )
+        finally:
+            for _item in batch:
+                job_state_db_queue.task_done()
+            await asyncio.sleep(0)
+
+
+def queue_state_stale_count(age_seconds=None, force=False):
+    age_seconds = max(60, int(age_seconds or QUEUE_STALE_SECONDS))
+    now_ts = time.time()
+    if not force and now_ts - float(queue_health_cache.get("loaded_at") or 0) < 20:
+        return int(queue_health_cache.get("stale") or 0)
+    cutoff = time.time() - age_seconds
+    stale = 0
+    live_job_ids = live_pipeline_job_ids()
+    with state_mutex:
+        snapshots = [
+            deepcopy(STATE["download_queue"].get("items", {})),
+            deepcopy(STATE["upload_queue"].get("items", {})),
+        ]
+    for records in snapshots:
+        for job_id, rec in records.items():
+            if rec.get("status") not in QUEUE_STUCK_STATUSES:
+                continue
+            if str(job_id) in live_job_ids:
+                continue
+            try:
+                updated_ts = parse_display_datetime(rec.get("updated_at")).timestamp()
+            except Exception:
+                updated_ts = 0
+            if updated_ts <= cutoff:
+                stale += 1
+    queue_health_cache["loaded_at"] = now_ts
+    queue_health_cache["stale"] = stale
+    return stale
+
+
+def source_circuit_record_failure(channel_id, error):
+    if not SOURCE_CIRCUIT_BREAKER_ENABLED or not channel_id:
+        return 0
+    key = guard_key(channel_id)
+    now_ts = time.time()
+    with state_mutex:
+        cursor = STATE["sync_source_manager"].setdefault("cursors", {}).setdefault(key, {})
+        failures = int(cursor.get("circuit_failures") or 0) + 1
+        cursor["circuit_failures"] = failures
+        cursor["circuit_last_error"] = str(error)[:180]
+        cursor["circuit_updated_at"] = now_iso()
+        if failures >= SOURCE_CIRCUIT_FAILURE_THRESHOLD:
+            scale = min(6, max(1, failures - SOURCE_CIRCUIT_FAILURE_THRESHOLD + 1))
+            jitter = random.randint(0, min(180, SOURCE_CIRCUIT_COOLDOWN_SECONDS // 6))
+            cooldown = min(SOURCE_CIRCUIT_MAX_COOLDOWN_SECONDS, (SOURCE_CIRCUIT_COOLDOWN_SECONDS * scale) + jitter)
+            open_until = now_ts + cooldown
+            cursor["circuit_open_until"] = open_until
+            cursor["next_check_after"] = max(float(cursor.get("next_check_after") or 0), open_until)
+            cursor["last_temp_error"] = f"source circuit open {failures}/{SOURCE_CIRCUIT_FAILURE_THRESHOLD}: {str(error)[:120]}"
+        save_state("sync_source_manager")
+    if failures == SOURCE_CIRCUIT_FAILURE_THRESHOLD or failures % 5 == 0:
+        log_event(f"Source circuit breaker for {key}: failure {failures}, cooldown active.")
+    return failures
+
+
+def source_circuit_record_success(channel_id):
+    if not SOURCE_CIRCUIT_BREAKER_ENABLED or not channel_id:
+        return
+    key = guard_key(channel_id)
+    with state_mutex:
+        cursor = STATE["sync_source_manager"].setdefault("cursors", {}).get(key, {})
+        if not cursor:
+            return
+        changed = False
+        for field in ("circuit_failures", "circuit_last_error", "circuit_updated_at", "circuit_open_until"):
+            if field in cursor:
+                cursor.pop(field, None)
+                changed = True
+        if changed:
+            save_state("sync_source_manager")
+
+
+def worker_route_available():
+    return bool(WORKER_HTTP_URLS or WORKER_QUEUE_GROUP_ID)
+
+
+def local_media_pressure():
+    return channel_download_queue.qsize() + upload_queue.qsize()
+
+
+def pressure_managed_source(source):
+    return source in {"auto_monitor", "source_guard", "sync", "startup_catchup", "startup_hot", "historical_backfill", "auto", "auto_recovery", "watchdog", "recovery"}
+
+
+async def wait_for_local_media_capacity(source, max_wait_seconds=None):
+    if not pressure_managed_source(source):
+        return True
+    sleep_for = max(1, min(5, SOURCE_GUARD_PRESSURE_SLEEP_SECONDS))
+    max_wait_seconds = max_wait_seconds if max_wait_seconds is not None else max(5, env_int("ROYELLS_QUEUE_ADMISSION_MAX_WAIT_SECONDS", "20"))
+    deadline = time.monotonic() + max_wait_seconds
+    logged = False
+    while local_media_pressure() >= max(1, MAIN_LOCAL_QUEUE_HARD_LIMIT):
+        stalled = stalled_worker_jobs()
+        if stalled:
+            job = stalled[0]
+            if WORKER_STALL_FORCE_RESTART:
+                request_automatic_process_restart(
+                    f"{source} pressure detected worker {job.get('worker')} on "
+                    f"job {job.get('job_id')} for >{WORKER_STALL_SECONDS}s"
+                )
+            if not logged:
+                log_event(
+                    f"{source} pressure sees long-running {job.get('worker')} job "
+                    f"{job.get('job_id')} from {job.get('ch_name')}; "
+                    "process restart is disabled and bounded operation timeouts remain active."
+                )
+        if not logged:
+            log_event(
+                f"{source} throttled: local media queue D{channel_download_queue.qsize()} "
+                f"U{upload_queue.qsize()} reached limit {MAIN_LOCAL_QUEUE_HARD_LIMIT}."
+            )
+            logged = True
+        if time.monotonic() >= deadline:
+            log_event(f"{source} admission deferred after {max_wait_seconds}s: local queue remains at hard limit.")
+            return False
+        await asyncio.sleep(min(sleep_for, max(0.1, deadline - time.monotonic())))
+    if logged:
+        log_event(f"{source} resumed: local media queue pressure cleared.")
+    return True
+
+
+def copy_restricted_cache_key(chat_id):
+    return str(normalize_channel_id(chat_id))
+
+
+def copy_restricted_cached(chat_id):
+    key = copy_restricted_cache_key(chat_id)
+    expires_at = copy_restricted_cache.get(key, 0)
+    if expires_at > time.time():
+        return True
+    copy_restricted_cache.pop(key, None)
+    return False
+
+
+def remember_copy_restricted(chat_id, error):
+    text = str(error).lower()
+    if "chat_forwards_restricted" not in text and "restricts forwarding" not in text:
+        return False
+    copy_restricted_cache[copy_restricted_cache_key(chat_id)] = time.time() + max(60, COPY_RESTRICTED_CACHE_TTL_SECONDS)
+    return True
+
+
+def should_pressure_offload_source_job(source, is_fallback=False):
+    if not SOURCE_PRESSURE_OFFLOAD_ENABLED or QUEUE_WORKER_MODE or is_fallback:
+        return False
+    if not WORKER_HAS_SOURCE_ACCESS:
+        return False
+    if not worker_route_available():
+        return False
+    if not pressure_managed_source(source):
+        return False
+    return local_media_pressure() >= max(1, MAIN_LOCAL_QUEUE_SOFT_LIMIT)
+
+
+def clear_processing_cache_if_idle(reason=""):
+    if pipeline_job_count() != 0 or not processing_cache:
+        return 0
+    cleared = len(processing_cache)
+    processing_cache.clear()
+    log_event(f"Cleared {cleared} stale processing cache key(s) while pipeline idle. {reason}".strip())
+    return cleared
+
+
+def source_job_retry_forever(job):
+    terminal_error = str(job.get("_last_error") or "").lower()
+    if "invalid media" in terminal_error or "no telegram-ready media" in terminal_error:
+        return False
+    return (
+        SOURCE_PERMANENT_RETRY_ENABLED
+        and pressure_managed_source(job.get("source", ""))
+        and not job.get("is_fallback")
+    )
+
+
+async def delayed_source_retry(job, reason):
+    reason_text = str(reason or "")
+    if is_invalid_media_upload_error(RuntimeError(reason_text)):
+        record_download_job(job, "failed_invalid_media", reason_text)
+        record_total_job(job, "failed_invalid_media", reason_text)
+        record_sync_item(job, "failed_invalid_media", reason_text)
+        log_event(f"Terminal invalid media quarantined; retry suppressed for {job.get('job_id', 'unknown')}.")
+        return False
+    retry_job = {k: v for k, v in job.items() if k != "files"}
+    retry_job["attempt"] = 1
+    delay = max(60, SOURCE_FAILED_RETRY_DELAY_SECONDS)
+    record_download_job(retry_job, "retry_later", reason)
+    record_total_job(retry_job, "retry_later", reason)
+    record_sync_item(retry_job, "retry_later", reason)
+    scheduled = schedule_queue_retry("download", retry_job, delay, reason)
+    if scheduled:
+        log_event(f"Source job retry scheduled in {delay}s for {retry_job.get('ch_name', '')}: {str(reason)[:140]}")
+    return scheduled
+
+
+def schedule_source_job_retry_later(job, reason):
+    if not source_job_retry_forever(job):
+        return False
+    retry_job = {k: v for k, v in job.items() if k != "files"}
+    retry_job["attempt"] = 1
+    delay = max(60, SOURCE_FAILED_RETRY_DELAY_SECONDS)
+    record_download_job(retry_job, "retry_later", reason)
+    record_total_job(retry_job, "retry_later", reason)
+    record_sync_item(retry_job, "retry_later", reason)
+    return schedule_queue_retry("download", retry_job, delay, reason)
+
+
+def record_download_job(job, status, error=None, files=None):
+    job_id = job["job_id"]
+    with state_mutex:
+        items = STATE["download_queue"].setdefault("items", {})
+        old = items.get(job_id, {})
+        terminal = status in QUEUE_TERMINAL_STATUSES
+        partial_files = [] if terminal else list(
+            job.get("_partial_download_files")
+            or old.get("partial_download_files", [])
+            or []
+        )
+        partial_messages = [] if terminal else list(
+            job.get("_partial_download_message_metas")
+            or old.get("partial_download_messages", [])
+            or []
+        )
+        items[job_id] = {
+            **old,
+            "job_id": job_id,
+            "post_uid": job.get("post_uid", job_id),
+            "type": job["type"],
+            "source": job.get("source", "unknown"),
+            "ch_name": job.get("ch_name", ""),
+            "attempt": job.get("attempt", 1),
+            "status": status,
+            "messages": [message_meta(m) for m in job.get("messages", [])],
+            "files": files if files is not None else old.get("files", []),
+            "is_fallback": bool(job.get("is_fallback")),
+            "sync_run_id": job.get("sync_run_id"),
+            "force_upload": bool(job.get("force_upload")),
+            "manual_link_url": job.get("manual_link_url", old.get("manual_link_url", "")),
+            "status_chat_id": job.get("status_chat_id", old.get("status_chat_id", 0)),
+            "status_message_id": job.get("status_message_id", old.get("status_message_id", 0)),
+            "partial_download_files": partial_files,
+            "partial_download_messages": partial_messages,
+            "last_error": str(error)[:500] if error else "",
+            "created_at": old.get("created_at", now_iso()),
+            "updated_at": now_iso(),
+        }
+        save_state("download_queue")
+    refresh_persisted_queue_reservation(job_id)
+    queue_job_state_db(job, "download", status, error)
+
+
+def record_upload_job(job, status, error=None):
+    job_id = job["job_id"]
+    with state_mutex:
+        items = STATE["upload_queue"].setdefault("items", {})
+        old = items.get(job_id, {})
+        items[job_id] = {
+            **old,
+            "job_id": job_id,
+            "post_uid": job.get("post_uid", job_id),
+            "type": job["type"],
+            "source": job.get("source", "unknown"),
+            "ch_name": job.get("ch_name", ""),
+            "attempt": job.get("attempt", 1),
+            "status": status,
+            "messages": [message_meta(m) for m in job.get("messages", [])],
+            "files": list(job.get("files", [])),
+            "is_fallback": bool(job.get("is_fallback")),
+            "sync_run_id": job.get("sync_run_id"),
+            "force_upload": bool(job.get("force_upload")),
+            "manual_link_url": job.get("manual_link_url", old.get("manual_link_url", "")),
+            "status_chat_id": job.get("status_chat_id", old.get("status_chat_id", 0)),
+            "status_message_id": job.get("status_message_id", old.get("status_message_id", 0)),
+            "last_error": str(error)[:500] if error else "",
+            "created_at": old.get("created_at", now_iso()),
+            "updated_at": now_iso(),
+        }
+        save_state("upload_queue")
+    refresh_persisted_queue_reservation(job_id)
+    queue_job_state_db(job, "upload", status, error)
+
+
+def record_total_job(job, status, error=None):
+    job_id = job["job_id"]
+    with state_mutex:
+        items = STATE["total_auto_upload"].setdefault("items", {})
+        old = items.get(job_id, {})
+        items[job_id] = {
+            **old,
+            "job_id": job_id,
+            "post_uid": job.get("post_uid", job_id),
+            "type": job.get("type", ""),
+            "source": job.get("source", "unknown"),
+            "ch_name": job.get("ch_name", ""),
+            "status": status,
+            "message_count": len(job.get("messages", [])),
+            "last_error": str(error)[:500] if error else "",
+            "created_at": old.get("created_at", now_iso()),
+            "updated_at": now_iso(),
+        }
+        STATE["total_auto_upload"].setdefault("events", []).append(
+            {"time": now_iso(), "job_id": job_id, "status": status}
+        )
+        trim_events("total_auto_upload")
+        save_state("total_auto_upload")
+    queue_job_state_db(job, "total", status, error)
+
+
+def record_sync_item(job, status, error=None):
+    run_id = job.get("sync_run_id")
+    if not run_id:
+        return
+    job_id = job["job_id"]
+    with state_mutex:
+        STATE["sync_source_manager"].setdefault("items", {})[job_id] = {
+            "job_id": job_id,
+            "run_id": run_id,
+            "status": status,
+            "ch_name": job.get("ch_name", ""),
+            "type": job.get("type", ""),
+            "messages": [message_meta(m) for m in job.get("messages", [])],
+            "last_error": str(error)[:500] if error else "",
+            "updated_at": now_iso(),
+        }
+        run = STATE["sync_source_manager"].setdefault("runs", {}).setdefault(
+            run_id,
+            {"run_id": run_id, "started_at": now_iso(), "queued": 0, "uploaded": 0, "skipped": 0, "failed": 0},
+        )
+        if status == "queued":
+            run["queued"] = run.get("queued", 0) + 1
+        elif status == "uploaded":
+            run["uploaded"] = run.get("uploaded", 0) + 1
+        elif status == "skipped_duplicate":
+            run["skipped"] = run.get("skipped", 0) + 1
+        elif str(status).startswith("failed"):
+            run["failed"] = run.get("failed", 0) + 1
+        run["updated_at"] = now_iso()
+        save_state("sync_source_manager")
+
+
+def record_clean_duplicate(uid, source_msg, target_msg=None, post_uid=None, channel_name=""):
+    if not uid:
+        return
+    target_id = getattr(target_msg, "id", None) if target_msg else None
+    with state_mutex:
+        items = STATE["clean_duplicate"].setdefault("items", {})
+        old = items.get(uid, {})
+        target_ids = set(old.get("target_message_ids", []))
+        if target_id:
+            target_ids.add(target_id)
+            STATE["clean_duplicate"].setdefault("target_messages", {})[str(target_id)] = uid
+        items[uid] = {
+            **old,
+            "uid": uid,
+            "post_uid": post_uid or old.get("post_uid", ""),
+            "source_chat_id": getattr(source_msg.chat, "id", old.get("source_chat_id", "")),
+            "source_message_id": getattr(source_msg, "id", old.get("source_message_id", "")),
+            "source_channel": channel_name or old.get("source_channel", ""),
+            "target_chat_id": TARGET_CHAT_ID,
+            "target_message_ids": sorted(target_ids),
+            "status": "active",
+            "created_at": old.get("created_at", now_iso()),
+            "updated_at": now_iso(),
+        }
+        STATE["clean_duplicate"].setdefault("events", []).append(
+            {"time": now_iso(), "action": "add", "uid": uid, "target_message_id": target_id}
+        )
+        trim_events("clean_duplicate")
+        save_state("clean_duplicate")
+
+
+def remove_clean_duplicate_by_target_ids(message_ids):
+    removed = []
+    ids = {str(i) for i in message_ids}
+    with state_mutex:
+        target_messages = STATE["clean_duplicate"].setdefault("target_messages", {})
+        items = STATE["clean_duplicate"].setdefault("items", {})
+        for mid in ids:
+            uid = target_messages.pop(mid, None)
+            if not uid:
+                continue
+            item = items.get(uid)
+            if not item:
+                continue
+            target_ids = [x for x in item.get("target_message_ids", []) if str(x) != mid]
+            if target_ids:
+                item["target_message_ids"] = target_ids
+                item["updated_at"] = now_iso()
+            else:
+                item["target_message_ids"] = []
+                item["status"] = "target_deleted"
+                item["updated_at"] = now_iso()
+                removed.append(uid)
+        if removed:
+            STATE["clean_duplicate"].setdefault("events", []).append(
+                {"time": now_iso(), "action": "target_delete_detected", "removed": removed}
+            )
+            trim_events("clean_duplicate")
+            save_state("clean_duplicate")
+    return removed
+
+
+def stamp_queue_job(job, queue_name):
+    job["_queue_name"] = queue_name
+    job["_queued_monotonic"] = time.monotonic()
+    job["queued_at"] = now_iso()
+    mark_runtime_checkpoint_dirty(f"{queue_name} queue stamped")
+    return job
+
+
+def observe_queue_wait(job, queue_name):
+    queued_at = float((job or {}).get("_queued_monotonic") or time.monotonic())
+    waited = max(0.0, time.monotonic() - queued_at)
+    metric_set_peak("queue_wait_peak_seconds", queue_name, waited)
+    threshold = float(os.getenv("ROYELLS_SLOW_QUEUE_WAIT_SECONDS", "5"))
+    if waited >= threshold:
+        log_event(f"Slow {queue_name} queue wait: {waited:.2f}s job={(job or {}).get('job_id', (job or {}).get('url', 'unknown'))}")
+    return waited
+
+
+def source_message_key_from_meta(meta):
+    if not isinstance(meta, dict):
+        return ""
+    chat_id = meta.get("chat_id")
+    message_id = meta.get("message_id")
+    if chat_id in (None, "") or message_id in (None, ""):
+        return ""
+    return f"{chat_id}:{message_id}"
+
+
+def source_message_key(msg):
+    chat = getattr(msg, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(msg, "id", None)
+    if chat_id in (None, "") or message_id in (None, ""):
+        return ""
+    return f"{chat_id}:{message_id}"
+
+
+def partial_download_file_for_message(job, msg):
+    metas = job.get("_partial_download_message_metas") or []
+    files = job.get("_partial_download_files") or []
+    wanted = source_message_key(msg)
+    if not wanted:
+        return ""
+    for meta, path in zip(metas, files):
+        if source_message_key_from_meta(meta) != wanted:
+            continue
+        if path and os.path.exists(path) and os.path.getsize(path) > 1024:
+            return str(path)
+    return ""
+
+
+def remember_partial_download(job, msg, path):
+    if not path or not os.path.exists(path) or os.path.getsize(path) <= 1024:
+        return False
+    key = source_message_key(msg)
+    if not key:
+        return False
+    metas = job.setdefault("_partial_download_message_metas", [])
+    files = job.setdefault("_partial_download_files", [])
+    existing = {
+        source_message_key_from_meta(meta)
+        for meta in metas
+        if isinstance(meta, dict)
+    }
+    if key not in existing:
+        metas.append(message_meta(msg))
+        files.append(str(path))
+        mark_runtime_checkpoint_dirty("partial download remembered")
+        return True
+    return False
+
+
+async def enqueue_media_job(
+    job_type,
+    messages,
+    ch_name,
+    attempt=1,
+    is_fallback=False,
+    source="auto",
+    sync_run_id=None,
+    status_msg=None,
+    force_upload=False,
+    manual_link_url="",
+    status_chat_id=0,
+    status_message_id=0,
+    reservation_owner=None,
+    recovery_job_id=None,
+    partial_download_files=None,
+    partial_download_message_metas=None,
+):
+    global last_successful_queue_time
+    valid = [m for m in messages if is_valid_media(m)]
+    if not valid:
+        return False
+
+    force_upload = bool(force_upload)
+    new_messages = (
+        valid
+        if force_upload
+        else await filter_new_messages_async(valid, reservation_owner=reservation_owner)
+    )
+    if not new_messages:
+        dummy = {"job_id": make_job_id(valid, job_type), "messages": valid, "type": job_type, "ch_name": ch_name, "source": source}
+        record_total_job(dummy, "skipped_duplicate")
+        record_sync_item(dummy, "skipped_duplicate")
+        source_brain_record_messages(valid, "duplicate", amount=len(valid), title=ch_name)
+        for m in valid:
+            remove_processing_keys(m.chat.id, m)
+        return False
+
+    if job_type == "album" and len(new_messages) < 2:
+        job_type = "single"
+        log_event(
+            f"Partial album from {ch_name}: Telegram album is impossible with one remaining "
+            "non-duplicate item; using terminal single-item fallback."
+        )
+
+    job_id = str(recovery_job_id or make_job_id(new_messages, job_type))
+    job = {
+        "job_id": job_id,
+        "post_uid": job_id,
+        "type": job_type,
+        "messages": new_messages,
+        "ch_name": ch_name,
+        "attempt": attempt,
+        "is_fallback": is_fallback,
+        "source": source,
+        "sync_run_id": sync_run_id,
+        "force_upload": force_upload,
+        "manual_link_url": manual_link_url,
+    }
+    if partial_download_files:
+        job["_partial_download_files"] = [
+            str(path)
+            for path in partial_download_files
+            if path and os.path.exists(path) and os.path.getsize(path) > 0
+        ]
+    if partial_download_message_metas:
+        job["_partial_download_message_metas"] = [
+            dict(item)
+            for item in partial_download_message_metas
+            if isinstance(item, dict)
+        ]
+    if status_msg:
+        job["status_msg"] = status_msg
+        job["status_chat_id"] = int(status_msg.chat.id)
+        job["status_message_id"] = int(status_msg.id)
+    elif status_chat_id and status_message_id:
+        job["status_chat_id"] = int(status_chat_id)
+        job["status_message_id"] = int(status_message_id)
+    if should_pressure_offload_source_job(source, is_fallback=is_fallback):
+        offloaded = await offload_source_media_job_to_worker(
+            job,
+            f"main local queue pressure D{channel_download_queue.qsize()} U{upload_queue.qsize()}",
+        )
+        if offloaded:
+            record_download_job(job, "worker_pressure_offload")
+            record_total_job(job, "worker_pressure_offload")
+            record_sync_item(job, "queued")
+            source_brain_record_messages(new_messages, "queued", amount=len(new_messages), title=ch_name)
+            for m in new_messages:
+                remove_processing_keys(m.chat.id, m)
+            last_successful_queue_time = time.time()
+            return True
+
+    async with media_admission_lock:
+        capacity_ready = await wait_for_local_media_capacity(source)
+        if not capacity_ready:
+            for m in new_messages:
+                remove_processing_keys(m.chat.id, m)
+            record_total_job(job, "deferred_backpressure")
+            record_sync_item(job, "deferred_backpressure")
+            return False
+        job["_admission_reserved"] = True
+
+    allow_fast_copy = SOURCE_FAST_COPY_ENABLED and not CONTENT_FILTER_ENABLED
+    if (
+        TRY_COPY_MESSAGE
+        and allow_fast_copy
+        and job_type == "single"
+        and len(new_messages) == 1
+        and not is_fallback
+        and not reservation_owner
+    ):
+        if await try_copy_message_fast_path(job, new_messages[0], ch_name):
+            last_successful_queue_time = time.time()
+            return True
+    if (
+        TRY_COPY_ALBUM_ITEMS
+        and not PRESERVE_ALBUMS
+        and allow_fast_copy
+        and job_type == "album"
+        and len(new_messages) > 1
+        and not is_fallback
+        and not reservation_owner
+    ):
+        if await try_copy_album_items_fast_path(job, new_messages, ch_name):
+            last_successful_queue_time = time.time()
+            return True
+
+    record_download_job(job, "queued")
+    record_total_job(job, "queued_download")
+    record_sync_item(job, "queued")
+    stamp_queue_job(job, "download")
+    if channel_download_queue.full() or local_media_pressure() >= MAIN_LOCAL_QUEUE_HARD_LIMIT:
+        scheduled = schedule_queue_retry("download", job, 1, "initial admission race")
+        if not scheduled:
+            for item in new_messages:
+                remove_processing_keys(item.chat.id, item)
+            record_download_job(job, "retry_admission_failed", "retry scheduler full")
+            record_total_job(job, "retry_admission_failed", "retry scheduler full")
+            return False
+    else:
+        channel_download_queue.put_nowait(job)
+    source_brain_record_messages(new_messages, "queued", amount=len(new_messages), title=ch_name)
+    last_successful_queue_time = time.time()
+    return True
+
+
+async def try_copy_message_fast_path(job, msg, ch_name):
+    global auto_count
+    if copy_restricted_cached(msg.chat.id):
+        return False
+    last_error = None
+    for label, client in copy_message_clients():
+        for protect_content in (True, False):
+            try:
+                sent = await tg_call(
+                    f"copyMessage {label}",
+                    client.copy_message,
+                    chat_id=TARGET_CHAT_ID,
+                    from_chat_id=msg.chat.id,
+                    message_id=msg.id,
+                    caption="",
+                    protect_content=protect_content,
+                )
+                if getattr(sent, "caption", None):
+                    await delete_target_messages(sent.id)
+                    raise RuntimeError("copyMessage preserved caption; falling back to captionless upload")
+                await mark_posted_queued(msg.chat.id, msg, ch_name, sent, job["job_id"])
+                record_total_job(job, "uploaded")
+                record_sync_item(job, "uploaded")
+                source_brain_record_messages([msg], "copy_uploaded", amount=1, title=ch_name)
+                auto_count += 1
+                diagnostic_stats["uploads"] = int(diagnostic_stats.get("uploads") or 0) + 1
+                with state_mutex:
+                    STATE["total_auto_upload"]["total_uploaded"] = STATE["total_auto_upload"].get("total_uploaded", 0) + 1
+                    save_state("total_auto_upload")
+                log_event(f"copyMessage uploaded 1 media from {ch_name} via {label}.")
+                return True
+            except Exception as e:
+                last_error = e
+                if remember_copy_restricted(msg.chat.id, e):
+                    return False
+                if should_reconnect_telegram_error(e):
+                    schedule_userbot_reconnect(f"copyMessage {label}: {e}")
+    if last_error:
+        log_event(f"copyMessage fallback to download for {ch_name}: {str(last_error)[:140]}")
+    return False
+
+
+async def try_copy_album_items_fast_path(job, messages, ch_name):
+    global auto_count
+    if not messages:
+        return False
+    if copy_restricted_cached(messages[0].chat.id):
+        return False
+
+    last_error = None
+    for label, client in copy_message_clients():
+        for protect_content in (True, False):
+            copied = []
+            try:
+                for msg in messages:
+                    sent = await tg_call(
+                        f"copy album {label}",
+                        client.copy_message,
+                        chat_id=TARGET_CHAT_ID,
+                        from_chat_id=msg.chat.id,
+                        message_id=msg.id,
+                        caption="",
+                        protect_content=protect_content,
+                    )
+                    if getattr(sent, "caption", None):
+                        await delete_target_messages(sent.id)
+                        raise RuntimeError("copyMessage preserved caption in album item")
+                    copied.append((msg, sent))
+                    await asyncio.sleep(max(0.05, COPY_MESSAGE_ITEM_DELAY))
+
+                await mark_posted_many_queued([
+                    (msg.chat.id, msg, ch_name, sent, job["job_id"])
+                    for msg, sent in copied
+                ])
+                record_total_job(job, "uploaded")
+                record_sync_item(job, "uploaded")
+                source_brain_record_messages([msg for msg, _sent in copied], "copy_uploaded", amount=len(copied), title=ch_name)
+                auto_count += 1
+                with state_mutex:
+                    STATE["total_auto_upload"]["total_uploaded"] = STATE["total_auto_upload"].get("total_uploaded", 0) + 1
+                    save_state("total_auto_upload")
+                log_event(f"copyMessage uploaded album items ({len(copied)}) from {ch_name} via {label}.")
+                return True
+            except Exception as e:
+                last_error = e
+                remember_copy_restricted(messages[0].chat.id, e)
+                if copied:
+                    with contextlib.suppress(Exception):
+                        await delete_target_messages([sent.id for _, sent in copied if sent])
+                if should_reconnect_telegram_error(e):
+                    schedule_userbot_reconnect(f"copy album {label}: {e}")
+
+    if last_error:
+        log_event(f"copyMessage album fallback to grouped upload for {ch_name}: {str(last_error)[:140]}")
+    return False
+
+
+def copy_message_clients():
+    clients = []
+    if COPY_MESSAGE_WITH_USERBOT:
+        clients.append(("userbot", userbot))
+    if COPY_MESSAGE_WITH_BOT:
+        clients.append(("bot", app))
+    return clients
+
+
+def fix_video_ext(path):
+    if not path:
+        return path
+    base, ext = os.path.splitext(path)
+    if ext.lower() in [".m4v", ".mkv", ".mov", ".3gp", ".avi", ".webm"]:
+        new = base + ".mp4"
+        try:
+            os.rename(path, new)
+            return new
+        except Exception:
+            pass
+    return path
+
+
+def get_video_meta(path):
+    meta = {"width": 0, "height": 0, "duration": 0, "codec": "", "pix_fmt": "", "audio_codec": ""}
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,codec_name,pix_fmt,duration",
+                "-of",
+                "json",
+                path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(2, VIDEO_META_PROBE_TIMEOUT_SECONDS),
+        )
+        data = json.loads(proc.stdout or "{}")
+        stream = (data.get("streams") or [{}])[0]
+        meta["width"] = int(stream.get("width") or 0)
+        meta["height"] = int(stream.get("height") or 0)
+        meta["codec"] = str(stream.get("codec_name") or "")
+        meta["pix_fmt"] = str(stream.get("pix_fmt") or "")
+        duration = stream.get("duration")
+        if duration:
+            meta["duration"] = int(float(duration))
+    except Exception:
+        pass
+
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "json",
+                path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(2, VIDEO_META_PROBE_TIMEOUT_SECONDS),
+        )
+        data = json.loads(proc.stdout or "{}")
+        stream = (data.get("streams") or [{}])[0]
+        meta["audio_codec"] = str(stream.get("codec_name") or "")
+    except Exception:
+        pass
+    return meta
+
+
+def video_is_telegram_friendly(path):
+    meta = get_video_meta(path)
+    ext_ok = Path(path).suffix.lower() == ".mp4"
+    video_ok = meta["codec"] in ("h264", "avc1") and meta["pix_fmt"] in ("yuv420p", "yuvj420p", "")
+    audio_ok = meta["audio_codec"] in ("aac", "mp4a", "")
+    dims_ok = (meta["width"] % 2 == 0 if meta["width"] else True) and (meta["height"] % 2 == 0 if meta["height"] else True)
+    return ext_ok and video_ok and audio_ok and dims_ok
+
+
+async def async_get_video_meta(path):
+    try:
+        return await asyncio.wait_for(
+            run_blocking("media", get_video_meta, path),
+            timeout=max(5, VIDEO_META_PROBE_TIMEOUT_SECONDS * 3),
+        )
+    except Exception as e:
+        log_event(f"Video metadata probe skipped for {Path(path).name}: {str(e)[:120]}")
+        return {"width": 0, "height": 0, "duration": 0, "codec": "", "pix_fmt": "", "audio_codec": ""}
+
+
+async def async_video_is_telegram_friendly(path):
+    meta = await async_get_video_meta(path)
+    ext_ok = Path(path).suffix.lower() == ".mp4"
+    video_ok = meta["codec"] in ("h264", "avc1") and meta["pix_fmt"] in ("yuv420p", "yuvj420p", "")
+    audio_ok = meta["audio_codec"] in ("aac", "mp4a", "")
+    dims_ok = (meta["width"] % 2 == 0 if meta["width"] else True) and (meta["height"] % 2 == 0 if meta["height"] else True)
+    return ext_ok and video_ok and audio_ok and dims_ok
+
+
+async def run_subprocess_safely(cmd, timeout_seconds, label):
+    process = None
+    try:
+        process = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            ),
+            timeout=min(30, max(5, timeout_seconds)),
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=max(5, timeout_seconds))
+        return process.returncode, stdout, stderr
+    except asyncio.CancelledError:
+        if process and process.returncode is None:
+            process.terminate()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(process.wait(), timeout=5)
+            if process.returncode is None:
+                process.kill()
+                with contextlib.suppress(Exception):
+                    await process.wait()
+        raise
+    except asyncio.TimeoutError as exc:
+        if process and process.returncode is None:
+            process.terminate()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(process.wait(), timeout=5)
+            if process.returncode is None:
+                process.kill()
+                with contextlib.suppress(Exception):
+                    await process.wait()
+        raise TimeoutError(f"{label} timed out after {timeout_seconds}s") from exc
+    except Exception:
+        if process and process.returncode is None:
+            process.kill()
+            with contextlib.suppress(Exception):
+                await process.wait()
+        raise
+
+
+async def fix_video_for_telegram(input_path, force=False):
+    if not force and await async_video_is_telegram_friendly(input_path):
+        return input_path
+    output_path = input_path.rsplit(".", 1)[0] + "_fixed.mp4"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        VIDEO_FIX_PRESET,
+        "-crf",
+        str(VIDEO_FIX_CRF),
+        "-threads",
+        str(max(1, FFMPEG_THREADS)),
+        "-pix_fmt",
+        "yuv420p",
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-ac",
+        "2",
+        "-map_metadata",
+        "0",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+    try:
+        timeout_seconds = max(60, env_int("ROYELLS_FFMPEG_CONVERSION_TIMEOUT_SECONDS", "1800"))
+        returncode, _stdout, stderr = await run_subprocess_safely(cmd, timeout_seconds, "video conversion")
+        if returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return output_path
+        log_event(f"ffmpeg conversion failed rc={returncode}: {stderr.decode(errors='ignore')[-300:]}")
+    except Exception as e:
+        cleanup(output_path)
+        log_event(f"ffmpeg error: {e}")
+    return input_path
+
+
+async def prepare_source_upload_items(messages, files, worker_id, ch_name):
+    prepared = []
+    generated_files = set()
+    for idx, (m, fp) in enumerate(zip(messages, files), 1):
+        await asyncio.sleep(0)
+        if not fp or not os.path.exists(fp) or os.path.getsize(fp) <= 1024:
+            raise RuntimeError(
+                f"source media preparation requires fresh download: item={idx} "
+                f"kind={get_media_kind(m)}"
+            )
+
+        try:
+            if m.video:
+                if SOURCE_VIDEO_UPLOAD_AS_DOCUMENT:
+                    prepared.append((m, fp))
+                    continue
+                send_fp = await fix_video_for_telegram(fp, force=FORCE_SOURCE_VIDEO_FIX)
+                if send_fp != fp:
+                    generated_files.add(send_fp)
+                meta = await async_get_video_meta(send_fp)
+                if (
+                    not os.path.exists(send_fp)
+                    or os.path.getsize(send_fp) <= 1024
+                    or not meta.get("width")
+                    or not meta.get("height")
+                ):
+                    raise Exception("video is not readable after Telegram preparation")
+                prepared.append((m, send_fp))
+            elif m.photo:
+                if SOURCE_PHOTO_UPLOAD_AS_DOCUMENT:
+                    prepared.append((m, fp))
+                    continue
+                send_fp = await ensure_photo_for_telegram(fp)
+                if send_fp != fp:
+                    generated_files.add(send_fp)
+                if (
+                    not os.path.exists(send_fp)
+                    or os.path.getsize(send_fp) <= 512
+                    or not await run_blocking("media", validate_photo_file_sync, send_fp)
+                ):
+                    raise Exception("photo is not readable after Telegram preparation")
+                prepared.append((m, send_fp))
+            else:
+                raise Exception("unsupported source media type")
+        except Exception as e:
+            raise RuntimeError(
+                f"source media preparation failed for item {idx} ({get_media_kind(m)}): "
+                f"{str(e)[:180]}"
+            ) from e
+    return prepared, generated_files
+
+
+async def build_source_media_group(prepared_items):
+    media_group = []
+    for m, fp in prepared_items:
+        if (m.video and SOURCE_VIDEO_UPLOAD_AS_DOCUMENT) or (m.photo and SOURCE_PHOTO_UPLOAD_AS_DOCUMENT):
+            media_group.append(InputMediaDocument(media=fp))
+        elif m.photo:
+            media_group.append(InputMediaPhoto(media=fp))
+        elif m.video:
+            meta = await async_get_video_meta(fp)
+            media_group.append(
+                InputMediaVideo(
+                    media=fp,
+                    width=meta.get("width", 0),
+                    height=meta.get("height", 0),
+                    duration=meta.get("duration", 0),
+                    supports_streaming=True,
+                )
+            )
+    return media_group
+
+
+async def telegram_media_call(label, awaitable, timeout_seconds):
+    inflight_token = begin_telegram_inflight(label, "media")
+    try:
+        effective_timeout = max(30, min(int(timeout_seconds), TELEGRAM_MEDIA_CALL_HARD_TIMEOUT_SECONDS))
+        async with telegram_media_semaphore:
+            global EVENT_LOOP_HEARTBEAT_TS
+            EVENT_LOOP_HEARTBEAT_TS = time.time()
+            started = time.monotonic()
+            result = await asyncio.wait_for(awaitable, timeout=effective_timeout)
+            duration = time.monotonic() - started
+            if duration >= float(os.getenv("ROYELLS_SLOW_MEDIA_SECONDS", "15")):
+                metric_increment("slow_media_operations")
+                log_event(f"Slow Telegram media call: {label} duration={duration:.2f}s")
+            EVENT_LOOP_HEARTBEAT_TS = time.time()
+            await asyncio.sleep(0)
+            return result
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"{label} timed out after {min(int(timeout_seconds), TELEGRAM_MEDIA_CALL_HARD_TIMEOUT_SECONDS)}s")
+    finally:
+        end_telegram_inflight(inflight_token)
+
+
+def target_media_clients():
+    clients = []
+    if TARGET_MEDIA_WITH_USERBOT:
+        clients.append(("userbot", userbot))
+    if TARGET_MEDIA_WITH_BOT:
+        clients.append(("bot", app))
+    return clients or [("userbot", userbot)]
+
+
+async def target_send_photo(label, photo, protect_content=True, job=None, messages=None, operation=None):
+    last_error = None
+    intent_id = ""
+    if job is not None:
+        intent_id = await begin_delivery_intent(
+            job,
+            messages or [],
+            operation or label,
+            files=[photo],
+        )
+    for client_label, client in target_media_clients():
+        try:
+            sent = await telegram_media_call(
+                f"{label} via {client_label}",
+                client.send_photo(TARGET_CHAT_ID, photo=photo, protect_content=protect_content),
+                UPLOAD_SEND_TIMEOUT_SECONDS,
+            )
+            await update_delivery_intent(intent_id, status="accepted", target_messages=[sent])
+            return sent
+        except Exception as e:
+            last_error = e
+            await update_delivery_intent(
+                intent_id,
+                status="ambiguous" if isinstance(e, TimeoutError) or is_temporary_network_error(e) else "failed",
+                error=e,
+            )
+            if not (is_peer_id_error(e) or is_temporary_network_error(e) or "forbidden" in str(e).lower()):
+                raise
+            log_event(f"{label} via {client_label} failed, trying next target sender: {str(e)[:140]}")
+    raise last_error
+
+
+async def target_send_video(label, video, protect_content=True, job=None, messages=None, operation=None, **kwargs):
+    last_error = None
+    intent_id = ""
+    if job is not None:
+        intent_id = await begin_delivery_intent(
+            job,
+            messages or [],
+            operation or label,
+            files=[video],
+        )
+    for client_label, client in target_media_clients():
+        try:
+            sent = await telegram_media_call(
+                f"{label} via {client_label}",
+                client.send_video(TARGET_CHAT_ID, video=video, protect_content=protect_content, **kwargs),
+                UPLOAD_SEND_TIMEOUT_SECONDS,
+            )
+            await update_delivery_intent(intent_id, status="accepted", target_messages=[sent])
+            return sent
+        except Exception as e:
+            last_error = e
+            await update_delivery_intent(
+                intent_id,
+                status="ambiguous" if isinstance(e, TimeoutError) or is_temporary_network_error(e) else "failed",
+                error=e,
+            )
+            if not (is_peer_id_error(e) or is_temporary_network_error(e) or "forbidden" in str(e).lower()):
+                raise
+            log_event(f"{label} via {client_label} failed, trying next target sender: {str(e)[:140]}")
+    raise last_error
+
+
+async def target_send_document(label, document, protect_content=True, job=None, messages=None, operation=None):
+    last_error = None
+    intent_id = ""
+    if job is not None:
+        intent_id = await begin_delivery_intent(
+            job,
+            messages or [],
+            operation or label,
+            files=[document],
+        )
+    for client_label, client in target_media_clients():
+        try:
+            sent = await telegram_media_call(
+                f"{label} via {client_label}",
+                client.send_document(
+                    TARGET_CHAT_ID,
+                    document=document,
+                    protect_content=protect_content,
+                ),
+                UPLOAD_SEND_TIMEOUT_SECONDS,
+            )
+            await update_delivery_intent(intent_id, status="accepted", target_messages=[sent])
+            return sent
+        except Exception as e:
+            last_error = e
+            await update_delivery_intent(
+                intent_id,
+                status="ambiguous" if isinstance(e, TimeoutError) or is_temporary_network_error(e) else "failed",
+                error=e,
+            )
+            if not (is_peer_id_error(e) or is_temporary_network_error(e) or "forbidden" in str(e).lower()):
+                raise
+            log_event(f"{label} via {client_label} failed, trying next target sender: {str(e)[:140]}")
+    raise last_error
+
+
+async def target_send_media_group(label, media, protect_content=True, job=None, messages=None, files=None, operation=None):
+    last_error = None
+    intent_id = ""
+    if job is not None:
+        intent_id = await begin_delivery_intent(
+            job,
+            messages or [],
+            operation or label,
+            files=files or [],
+        )
+    for client_label, client in target_media_clients():
+        try:
+            sent = await telegram_media_call(
+                f"{label} via {client_label}",
+                client.send_media_group(TARGET_CHAT_ID, media=media, protect_content=protect_content),
+                UPLOAD_SEND_TIMEOUT_SECONDS,
+            )
+            await update_delivery_intent(intent_id, status="accepted", target_messages=sent or [])
+            return sent
+        except Exception as e:
+            last_error = e
+            await update_delivery_intent(
+                intent_id,
+                status="ambiguous" if isinstance(e, TimeoutError) or is_temporary_network_error(e) else "failed",
+                error=e,
+            )
+            if isinstance(e, TimeoutError) or is_temporary_network_error(e):
+                raise
+            if not (is_peer_id_error(e) or "forbidden" in str(e).lower()):
+                raise
+            log_event(f"{label} via {client_label} failed, trying next target sender: {str(e)[:140]}")
+    raise last_error
+
+
+async def confirm_recent_target_album(prepared_items):
+    """Confirm an ambiguously timed-out album before allowing a whole-job retry."""
+    expected = [(message, get_media_uid(message)) for message, _path in prepared_items]
+    if not expected or any(not uid for _message, uid in expected):
+        return []
+    expected_uids = {uid for _message, uid in expected}
+
+    async def scan_recent():
+        matches = defaultdict(deque)
+        limit = max(30, min(100, len(prepared_items) * 8))
+        async for target_message in userbot.get_chat_history(TARGET_CHAT_ID, limit=limit):
+            if not is_valid_media(target_message):
+                continue
+            uid = get_media_uid(target_message)
+            if uid in expected_uids:
+                matches[uid].append(target_message)
+            await asyncio.sleep(0)
+        return matches
+
+    await asyncio.sleep(3)
+    try:
+        matches = await asyncio.wait_for(scan_recent(), timeout=45)
+    except Exception as exc:
+        log_event(f"Ambiguous album confirmation skipped: {str(exc)[:140]}")
+        return []
+
+    pairs = []
+    target_group_ids = set()
+    for source_message, uid in expected:
+        if not matches.get(uid):
+            return []
+        target_message = matches[uid].popleft()
+        group_id = str(getattr(target_message, "media_group_id", "") or "")
+        if not group_id:
+            return []
+        target_group_ids.add(group_id)
+        pairs.append((source_message, target_message))
+    return pairs if len(target_group_ids) == 1 else []
+
+
+async def confirm_recent_target_media_item(source_message):
+    """Resolve an ambiguous individual fallback without blindly uploading it twice."""
+    expected_uid = get_media_uid(source_message)
+    if not expected_uid:
+        return None
+
+    async def scan_recent():
+        async for target_message in userbot.get_chat_history(TARGET_CHAT_ID, limit=50):
+            if is_valid_media(target_message) and get_media_uid(target_message) == expected_uid:
+                return target_message
+            await asyncio.sleep(0)
+        return None
+
+    await asyncio.sleep(3)
+    try:
+        return await asyncio.wait_for(scan_recent(), timeout=45)
+    except Exception as exc:
+        log_event(f"Ambiguous individual fallback confirmation skipped: {str(exc)[:140]}")
+        return None
+
+
+async def send_prepared_source_single(m, fp, protect_content=True, job=None, ch_name="", operation=None):
+    if m.photo:
+        if SOURCE_PHOTO_UPLOAD_AS_DOCUMENT:
+            return await target_send_document(
+                "send_document_photo",
+                fp,
+                protect_content=protect_content,
+                job=job,
+                messages=[m],
+                operation=operation or "single_photo_document",
+            )
+        return await target_send_photo(
+            "send_photo",
+            fp,
+            protect_content=protect_content,
+            job=job,
+            messages=[m],
+            operation=operation or "single_photo",
+        )
+    if m.video:
+        if SOURCE_VIDEO_UPLOAD_AS_DOCUMENT:
+            return await target_send_document(
+                "send_document_video",
+                fp,
+                protect_content=protect_content,
+                job=job,
+                messages=[m],
+                operation=operation or "single_video_document",
+            )
+        meta = await async_get_video_meta(fp)
+        return await target_send_video(
+            "send_video",
+            fp,
+            width=meta.get("width", 0),
+            height=meta.get("height", 0),
+            duration=meta.get("duration", 0),
+            supports_streaming=True,
+            protect_content=protect_content,
+            job=job,
+            messages=[m],
+            operation=operation or "single_video",
+        )
+    raise Exception("unsupported prepared source media")
+
+
+async def send_source_album_chunk_resilient(prepared_items, worker_id, ch_name, job=None):
+    if not prepared_items:
+        return []
+    if len(prepared_items) == 1:
+        m, fp = prepared_items[0]
+        try:
+            return [(m, await send_prepared_source_single(m, fp, protect_content=True, job=job, ch_name=ch_name, operation="album_single_fallback"))]
+        except Exception as e:
+            log_event(f"[UP W{worker_id}] Single fallback rejected for {ch_name}: {str(e)[:160]}")
+            remove_processing_keys(m.chat.id, m)
+            return []
+
+    if PRESERVE_ALBUMS:
+        errors = []
+        error_objects = []
+        for attempt in range(1, SOURCE_ALBUM_SEND_ATTEMPTS + 1):
+            attempt_errors = []
+            for protect_content, label in ((True, "protected"), (False, "plain")):
+                media_group = await build_source_media_group(prepared_items)
+                try:
+                    sent = await target_send_media_group(
+                        f"send_media_group {label} attempt {attempt}",
+                        media_group,
+                        protect_content=protect_content,
+                        job=job,
+                        messages=[m for m, _fp in prepared_items],
+                        files=[fp for _m, fp in prepared_items],
+                        operation=f"album_group_{label}",
+                    )
+                    if not sent or len(sent) != len(prepared_items):
+                        raise RuntimeError(
+                            f"Telegram returned {len(sent or [])}/{len(prepared_items)} album messages"
+                        )
+                    return [(m, sent[idx]) for idx, (m, _) in enumerate(prepared_items)]
+                except Exception as exc:
+                    attempt_errors.append(exc)
+                    error_objects.append(exc)
+                    errors.append(f"{label} attempt {attempt}: {str(exc)[:180]}")
+                    log_event(
+                        f"[UP W{worker_id}] Album {label} attempt {attempt}/"
+                        f"{SOURCE_ALBUM_SEND_ATTEMPTS} failed for {ch_name}: {str(exc)[:160]}"
+                    )
+                    if isinstance(exc, TimeoutError) or is_temporary_network_error(exc):
+                        confirmed = await confirm_recent_target_album(prepared_items)
+                        if confirmed:
+                            log_event(
+                                f"[UP W{worker_id}] Confirmed {len(confirmed)} album item(s) "
+                                f"in target after ambiguous {label} failure for {ch_name}."
+                            )
+                            return confirmed
+                        raise RuntimeError(
+                            "grouped album delivery was ambiguous and could not be confirmed; "
+                            "album kept intact for delayed whole-job retry"
+                        ) from exc
+            if (
+                SOURCE_ALBUM_INDIVIDUAL_FALLBACK
+                and SOURCE_ALBUM_GROUP_FAILURE_INDIVIDUAL_FALLBACK
+                and attempt_errors
+                and all(is_invalid_media_upload_error(exc) for exc in attempt_errors)
+            ):
+                log_event(
+                    f"[UP W{worker_id}] Telegram rejected both protected and plain album modes "
+                    f"for {ch_name}; isolating invalid members with terminal item fallback."
+                )
+                return await send_source_items_individually(
+                    prepared_items,
+                    worker_id,
+                    ch_name,
+                    job=job,
+                )
+            if attempt < SOURCE_ALBUM_SEND_ATTEMPTS:
+                await asyncio.sleep(min(8, 2 * attempt))
+        if (
+            SOURCE_ALBUM_INDIVIDUAL_FALLBACK
+            and SOURCE_ALBUM_GROUP_FAILURE_INDIVIDUAL_FALLBACK
+            and error_objects
+            and all(is_invalid_media_upload_error(exc) for exc in error_objects)
+        ):
+            return await send_source_items_individually(
+                prepared_items,
+                worker_id,
+                ch_name,
+                job=job,
+            )
+        raise RuntimeError(
+            "grouped album upload failed; album kept intact for whole-job retry/quarantine: "
+            + " | ".join(errors[-4:])
+        )
+
+    media_group = await build_source_media_group(prepared_items)
+    try:
+        sent = await target_send_media_group(
+            "send_media_group protected",
+            media_group,
+            protect_content=True,
+            job=job,
+            messages=[m for m, _fp in prepared_items],
+            files=[fp for _m, fp in prepared_items],
+            operation="album_group_protected",
+        )
+        return [(m, sent[idx] if sent and idx < len(sent) else None) for idx, (m, _) in enumerate(prepared_items)]
+    except Exception as first_error:
+        first_text = str(first_error).lower()
+        direct_individual = (
+            SOURCE_ALBUM_INDIVIDUAL_FALLBACK
+            and (
+                "timed out" in first_text
+                or isinstance(first_error, TimeoutError)
+                or is_invalid_media_upload_error(first_error)
+                or "media_empty" in first_text
+            )
+        )
+        if direct_individual:
+            log_event(
+                f"[UP W{worker_id}] Protected album rejected for {ch_name}; "
+                "using item-by-item upload without plain album retry"
+            )
+            return await send_source_items_individually(prepared_items, worker_id, ch_name, job=job)
+        log_event(f"[UP W{worker_id}] Protected album rejected for {ch_name}, retrying plain album: {str(first_error)[:160]}")
+        try:
+            sent = await target_send_media_group(
+                "send_media_group plain",
+                media_group,
+                protect_content=False,
+                job=job,
+                messages=[m for m, _fp in prepared_items],
+                files=[fp for _m, fp in prepared_items],
+                operation="album_group_plain",
+            )
+            return [(m, sent[idx] if sent and idx < len(sent) else None) for idx, (m, _) in enumerate(prepared_items)]
+        except Exception as second_error:
+            if SOURCE_ALBUM_INDIVIDUAL_FALLBACK and (
+                SOURCE_ALBUM_GROUP_FAILURE_INDIVIDUAL_FALLBACK or is_invalid_media_upload_error(second_error)
+            ):
+                log_event(
+                    f"[UP W{worker_id}] Album group rejected for {ch_name}; "
+                    "falling back to item-by-item upload"
+                )
+                return await send_source_items_individually(prepared_items, worker_id, ch_name, job=job)
+            raise RuntimeError(
+                f"grouped album upload failed; keeping album intact for worker fallback: {str(second_error)[:160]}"
+            ) from second_error
+
+
+def split_source_album_chunks(prepared_items, max_size=10):
+    """Split Telegram albums into 2-10 item groups without creating a singleton tail."""
+    remaining = list(prepared_items)
+    chunks = []
+    max_size = max(2, min(10, int(max_size)))
+    while remaining:
+        size = min(max_size, len(remaining))
+        if len(remaining) - size == 1:
+            size -= 1
+        chunks.append(remaining[:size])
+        remaining = remaining[size:]
+    return chunks
+
+
+async def send_source_items_individually(prepared_items, worker_id, ch_name, job=None):
+    """Last-resort album fallback; persist each success before moving to the next item."""
+    sent_pairs = []
+    for index, (m, fp) in enumerate(prepared_items, start=1):
+        sent_msg = None
+        final_error = None
+        try:
+            sent_msg = await send_prepared_source_single(m, fp, protect_content=True, job=job, ch_name=ch_name, operation="album_item_protected")
+        except Exception as protected_error:
+            if isinstance(protected_error, TimeoutError) or is_temporary_network_error(protected_error):
+                sent_msg = await confirm_recent_target_media_item(m)
+                if not sent_msg:
+                    raise RuntimeError(
+                        "individual album fallback delivery was ambiguous and could not be confirmed"
+                    ) from protected_error
+                log_event(
+                    f"[UP W{worker_id}] Confirmed album item {index} after ambiguous "
+                    f"protected fallback for {ch_name}."
+                )
+            if not sent_msg:
+                final_error = protected_error
+                log_event(
+                    f"[UP W{worker_id}] Album item {index} protected upload rejected for {ch_name}, "
+                    f"retrying plain: {str(protected_error)[:120]}"
+                )
+                try:
+                    sent_msg = await send_prepared_source_single(m, fp, protect_content=False, job=job, ch_name=ch_name, operation="album_item_plain")
+                except Exception as plain_error:
+                    final_error = plain_error
+                    if isinstance(plain_error, TimeoutError) or is_temporary_network_error(plain_error):
+                        sent_msg = await confirm_recent_target_media_item(m)
+                        if not sent_msg:
+                            raise RuntimeError(
+                                "plain individual album fallback was ambiguous and could not be confirmed"
+                            ) from plain_error
+                    if not sent_msg:
+                        log_event(
+                            f"[UP W{worker_id}] Album item {index} rejected for {ch_name}: "
+                            f"{str(plain_error)[:160]}"
+                        )
+        if not sent_msg:
+            if final_error and (
+                is_invalid_media_upload_error(final_error)
+                or is_permanent_dead_media_error(final_error)
+            ):
+                remember_dead_media([m], final_error, force_dead=True)
+                remove_processing_keys(m.chat.id, m)
+                if job is not None:
+                    failure_id = f"{m.chat.id}:{m.id}"
+                    failures = job.setdefault("_album_terminal_failures", [])
+                    if failure_id not in failures:
+                        failures.append(failure_id)
+                continue
+            raise RuntimeError(
+                f"individual album fallback failed for item {index}: {str(final_error)[:180]}"
+            ) from final_error
+        if job is not None:
+            await mark_posted_queued(
+                m.chat.id,
+                m,
+                ch_name,
+                sent_msg,
+                job.get("job_id"),
+            )
+            persisted_id = f"{m.chat.id}:{m.id}"
+            persisted = job.setdefault("_persisted_source_ids", [])
+            if persisted_id not in persisted:
+                persisted.append(persisted_id)
+        sent_pairs.append((m, sent_msg))
+        await asyncio.sleep(1)
+    return sent_pairs
+
+
+# External platform cookie/session management removed.
+
+async def handle_ai_error(e, context=""):
+    tb_str = traceback.format_exc()
+    log_event(f"Error in {context}: {e}")
+    logging.error("Error in %s\n%s", context, tb_str)
+    return
+
+
+class ObservedConnection(sqlite3.Connection):
+    """SQLite connection that records slow SQL without logging parameters or secrets."""
+
+    def execute(self, sql, parameters=(), /):
+        started = time.monotonic()
+        try:
+            return super().execute(sql, parameters)
+        finally:
+            duration = time.monotonic() - started
+            threshold = float(os.getenv("ROYELLS_SLOW_DB_SECONDS", "0.5"))
+            if duration >= threshold:
+                metric_increment("slow_db_operations")
+                statement = " ".join(str(sql).strip().split())[:180]
+                log_event(f"Slow SQLite execute: {duration:.3f}s sql={statement}")
+
+    def commit(self):
+        started = time.monotonic()
+        try:
+            return super().commit()
+        finally:
+            duration = time.monotonic() - started
+            if duration >= float(os.getenv("ROYELLS_SLOW_DB_SECONDS", "0.5")):
+                metric_increment("slow_db_operations")
+                log_event(f"Slow SQLite commit: {duration:.3f}s")
+
+
+def db_connect():
+    global DB_JOURNAL_INITIALIZED
+    started = time.monotonic()
+    conn = sqlite3.connect(str(DB_FILE), timeout=30.0, factory=ObservedConnection)
+    conn.execute("PRAGMA busy_timeout=120000;")
+    synchronous = DB_SYNCHRONOUS if DB_SYNCHRONOUS in {"OFF", "NORMAL", "FULL", "EXTRA"} else "NORMAL"
+    # journal_mode is persistent and expensive on a mounted volume: configure once, not per connection.
+    if not DB_JOURNAL_INITIALIZED:
+        journal_mode = DB_JOURNAL_MODE if DB_JOURNAL_MODE in {"WAL", "DELETE", "TRUNCATE", "PERSIST", "MEMORY", "OFF"} else "WAL"
+        conn.execute(f"PRAGMA journal_mode={journal_mode};")
+        DB_JOURNAL_INITIALIZED = True
+    conn.execute(f"PRAGMA synchronous={synchronous};")
+    conn.execute("PRAGMA wal_autocheckpoint=1000;")
+    duration = time.monotonic() - started
+    if duration >= float(os.getenv("ROYELLS_SLOW_DB_SECONDS", "0.5")):
+        metric_increment("slow_db_operations")
+        log_event(f"Slow SQLite connection setup: {duration:.3f}s")
+    return conn
+
+
+def ensure_table_columns(conn, table, columns):
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for column_name, column_sql in columns.items():
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_sql}")
+
+
+def migrate_legacy_shared_db_once():
+    if DB_PENDING_SALVAGE_SOURCES or DB_FILE.exists() or not LEGACY_SHARED_DB_FILE.exists():
+        return
+    try:
+        shutil.copy2(str(LEGACY_SHARED_DB_FILE), str(DB_FILE))
+        log_event(f"Legacy shared DB copied to safe runtime DB: {DB_FILE}")
+    except Exception as e:
+        log_event(f"Legacy shared DB copy skipped: {e}")
+
+
+def init_db():
+    migrate_legacy_shared_db_once()
+    with db_mutex:
+        conn = db_connect()
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS posted (hash TEXT PRIMARY KEY, channel TEXT DEFAULT '', posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id TEXT PRIMARY KEY,
+                title TEXT DEFAULT '',
+                source_link TEXT DEFAULT '',
+                username TEXT DEFAULT '',
+                added_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT ''
+            )
+            """
+        )
+        ensure_table_columns(conn, "channels", {
+            "title": "TEXT DEFAULT ''",
+            "source_link": "TEXT DEFAULT ''",
+            "username": "TEXT DEFAULT ''",
+            "added_at": "TEXT DEFAULT ''",
+            "updated_at": "TEXT DEFAULT ''",
+        })
+        conn.execute("CREATE TABLE IF NOT EXISTS subscriptions (user_id TEXT PRIMARY KEY, expire_date TIMESTAMP)")
+        ensure_table_columns(conn, "subscriptions", {
+            "first_name": "TEXT DEFAULT ''",
+            "last_name": "TEXT DEFAULT ''",
+            "username": "TEXT DEFAULT ''",
+            "profile_updated_at": "TEXT DEFAULT ''",
+        })
+        conn.execute("CREATE TABLE IF NOT EXISTS target_media (uid TEXT PRIMARY KEY)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS target_media_full_index (
+                uid TEXT PRIMARY KEY,
+                message_id INTEGER DEFAULT 0,
+                indexed_at TEXT DEFAULT '',
+                source TEXT DEFAULT 'target_scan'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dead_media (
+                uid TEXT PRIMARY KEY,
+                failure_count INTEGER DEFAULT 0,
+                reason TEXT DEFAULT '',
+                source_chat_id TEXT DEFAULT '',
+                source_title TEXT DEFAULT '',
+                created_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS content_filter_hashes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hash TEXT NOT NULL,
+                type TEXT NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_job_state (
+                job_id TEXT PRIMARY KEY,
+                post_uid TEXT DEFAULT '',
+                stage TEXT DEFAULT '',
+                status TEXT DEFAULT '',
+                source TEXT DEFAULT '',
+                source_chat_id TEXT DEFAULT '',
+                ch_name TEXT DEFAULT '',
+                job_type TEXT DEFAULT '',
+                message_count INTEGER DEFAULT 0,
+                attempt INTEGER DEFAULT 1,
+                last_error TEXT DEFAULT '',
+                messages_json TEXT DEFAULT '',
+                created_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT ''
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_channels_username ON channels(username)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_expire ON subscriptions(expire_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_username ON subscriptions(username)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_posted_channel ON posted(channel)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_target_media_full_message ON target_media_full_index(message_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dead_media_source ON dead_media(source_chat_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_content_filter_type ON content_filter_hashes(type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_media_job_state_status ON media_job_state(status, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_media_job_state_source ON media_job_state(source_chat_id, status)")
+        conn.commit()
+        salvage_pending_database_rows(conn)
+        reserved_rows = conn.execute("SELECT channel_id, title, source_link, username FROM channels").fetchall()
+        purged_reserved = []
+        for cid, title, source_link, username in reserved_rows:
+            if is_reserved_source_channel(cid):
+                conn.execute("DELETE FROM channels WHERE channel_id=?", (str(cid),))
+                purged_reserved.append((cid, title, source_link, username))
+        if purged_reserved:
+            conn.commit()
+        if conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0] == 0:
+            for ch in DEFAULT_CHANNELS:
+                conn.execute(
+                    "INSERT OR IGNORE INTO channels (channel_id, title, updated_at) VALUES (?,?,?)",
+                    (str(ch), str(ch), now_iso()),
+                )
+            conn.commit()
+        conn.close()
+    for cid, title, source_link, username in purged_reserved:
+        record_channel(
+            cid,
+            title=title or str(cid),
+            status="ignored_system",
+            action="db_reserved_purge",
+            reason="target/queue/report chat purged from source database",
+            source_link=source_link or "",
+            username=username or "",
+        )
+    if purged_reserved:
+        log_event(f"Purged {len(purged_reserved)} reserved source row(s) from channels DB.")
+    reconciled = reconcile_active_json_sources_to_db()
+    if reconciled:
+        log_event(f"Reconciled {reconciled} active JSON source(s) into SQLite.")
+    load_channels()
+    sync_db_to_json()
+
+
+def content_filter_ready():
+    return bool(CONTENT_FILTER_ENABLED and Image is not None and imagehash is not None)
+
+
+def invalidate_content_filter_cache():
+    content_filter_cache["loaded_at"] = 0
+    content_filter_cache["items"] = []
+
+
+def load_content_filter_hashes(force=False):
+    if not CONTENT_FILTER_ENABLED:
+        return []
+    now = time.time()
+    if not force and content_filter_cache["loaded_at"] and now - content_filter_cache["loaded_at"] < CONTENT_FILTER_HASH_CACHE_SECONDS:
+        return list(content_filter_cache["items"])
+    with db_mutex:
+        conn = db_connect()
+        rows = conn.execute(
+            "SELECT id, hash, type, added_at FROM content_filter_hashes ORDER BY id DESC"
+        ).fetchall()
+        conn.close()
+    items = [
+        {"id": int(row[0]), "hash": str(row[1]), "type": str(row[2]), "added_at": str(row[3] or "")}
+        for row in rows
+        if row[1] and row[2] in ("photo", "video")
+    ]
+    content_filter_cache["loaded_at"] = now
+    content_filter_cache["items"] = items
+    return list(items)
+
+
+def add_content_filter_hash(media_hash, media_type):
+    if media_type not in {"photo", "video"} or not media_hash:
+        return 0
+    with db_mutex:
+        conn = db_connect()
+        conn.execute(
+            "INSERT INTO content_filter_hashes (hash, type, added_at) VALUES (?,?,?)",
+            (str(media_hash), media_type, now_iso()),
+        )
+        sample_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.commit()
+        conn.close()
+    invalidate_content_filter_cache()
+    return sample_id
+
+
+def delete_content_filter_hash(sample_id):
+    with db_mutex:
+        conn = db_connect()
+        cur = conn.execute("DELETE FROM content_filter_hashes WHERE id=?", (int(sample_id),))
+        removed = cur.rowcount
+        conn.commit()
+        conn.close()
+    invalidate_content_filter_cache()
+    return removed > 0
+
+
+def content_filter_hash_distance(left_hash, right_hash):
+    try:
+        return (int(str(left_hash), 16) ^ int(str(right_hash), 16)).bit_count()
+    except Exception:
+        if imagehash is None:
+            return 999
+        try:
+            return imagehash.hex_to_hash(str(left_hash)) - imagehash.hex_to_hash(str(right_hash))
+        except Exception:
+            return 999
+
+
+def compute_content_filter_hash_sync(path, media_type):
+    if not content_filter_ready():
+        raise RuntimeError("content filter dependencies missing: install Pillow and imagehash")
+    media_type = str(media_type or "").lower()
+    if media_type == "photo":
+        with Image.open(path) as image:
+            return str(imagehash.phash(image.convert("RGB")))
+    if media_type != "video":
+        return ""
+    frame_path = str(Path(tempfile.gettempdir()) / f"royells_cf_frame_{uuid.uuid4().hex}.jpg")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-ss",
+        str(CONTENT_FILTER_VIDEO_FRAME_SECONDS),
+        "-i",
+        str(path),
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        frame_path,
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45, check=False)
+        if not os.path.exists(frame_path) or os.path.getsize(frame_path) < 256:
+            raise RuntimeError("ffmpeg could not extract content-filter video frame")
+        with Image.open(frame_path) as image:
+            return str(imagehash.phash(image.convert("RGB")))
+    finally:
+        cleanup(frame_path)
+
+
+async def compute_content_filter_hash(path, media_type):
+    return await run_blocking("cpu", compute_content_filter_hash_sync, path, media_type)
+
+
+def content_filter_match(media_hash, media_type, samples=None):
+    items = [item for item in (samples if samples is not None else content_filter_cache.get("items", ())) if item.get("type") == media_type]
+    if not items:
+        return None
+    best = None
+    for item in items:
+        distance = content_filter_hash_distance(media_hash, item.get("hash"))
+        if best is None or distance < best["distance"]:
+            best = {**item, "distance": distance}
+    if best and int(best["distance"]) <= CONTENT_FILTER_THRESHOLD:
+        return best
+    return None
+
+
+async def content_filter_should_skip_file(path, media_type):
+    if not CONTENT_FILTER_ENABLED or media_type not in {"photo", "video"}:
+        return False, {}
+    samples = await run_blocking("db", load_content_filter_hashes)
+    if not samples:
+        return False, {}
+    if not content_filter_ready():
+        log_event("Content filter skipped: Pillow/imagehash dependency missing.")
+        return False, {}
+    try:
+        media_hash = await compute_content_filter_hash(path, media_type)
+        match = content_filter_match(media_hash, media_type, samples=samples)
+        if match:
+            return True, {"hash": media_hash, "sample": match}
+    except Exception as e:
+        log_event(f"Content filter hash check failed for {Path(str(path)).name}: {str(e)[:160]}")
+    return False, {}
+
+
+def get_content_filter_menu_text():
+    samples = load_content_filter_hashes(force=True) if CONTENT_FILTER_ENABLED else []
+    photo_count = sum(1 for item in samples if item.get("type") == "photo")
+    video_count = sum(1 for item in samples if item.get("type") == "video")
+    lines = [
+        "CONTENT FILTER",
+        "==============",
+        f"Status    {'on' if CONTENT_FILTER_ENABLED else 'off'}",
+        f"Ready     {'yes' if content_filter_ready() else 'missing Pillow/imagehash'}",
+        f"Threshold {CONTENT_FILTER_THRESHOLD}",
+        f"Samples   {len(samples)} total | photo {photo_count} | video {video_count}",
+        "",
+        "Add sample photos/videos that should be ignored.",
+        "Matching downloaded source media will be skipped before upload.",
+    ]
+    return format_dashboard_pre(lines, footer="")
+
+
+def content_filter_keyboard():
+    rows = [
+        [InlineKeyboardButton("Add Ignore Sample", callback_data="act_cf_add")],
+    ]
+    samples = load_content_filter_hashes()
+    for item in samples[:12]:
+        label = f"Remove #{item['id']} {item['type']} {short_dt(item.get('added_at'))}"
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"cf_del_{item['id']}")])
+    rows.append([InlineKeyboardButton("Refresh", callback_data="menu_content_filter")])
+    rows.append([InlineKeyboardButton("Back", callback_data="menu_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def add_content_filter_sample_from_message(client, message, status_msg=None):
+    media_type = get_media_kind(message)
+    if media_type not in {"photo", "video"} or is_gif_media(message):
+        target = status_msg or message
+        await telegram_gateway_await('target.reply_text', lambda: target.reply_text("Send or reply to one normal photo/video sample. GIF/animation is ignored."))
+        return False
+    if not content_filter_ready():
+        target = status_msg or message
+        await telegram_gateway_await('target.reply_text', lambda: target.reply_text("Content filter dependency missing. Add Pillow and ImageHash to requirements.txt, then rebuild."))
+        return False
+    sample_path = DOWNLOAD_DIR / f"content_filter_sample_{uuid.uuid4().hex}{'.mp4' if media_type == 'video' else '.jpg'}"
+    fp = None
+    try:
+        fp = await tg_call(
+            "content filter sample download",
+            client.download_media,
+            message,
+            file_name=str(sample_path),
+            retries=TELEGRAM_CALL_RETRIES,
+            _timeout_seconds=DOWNLOAD_MEDIA_TIMEOUT_SECONDS,
+        )
+        if not fp or not os.path.exists(fp) or os.path.getsize(fp) < 256:
+            raise RuntimeError("sample download failed or empty")
+        media_hash = await compute_content_filter_hash(fp, media_type)
+        sample_id = await run_blocking("db", add_content_filter_hash, media_hash, media_type)
+        log_event(f"Content filter sample added: #{sample_id} {media_type} {media_hash}")
+        text = f"Ignore sample saved.\nID: {sample_id}\nType: {media_type}\nHash: {media_hash}"
+        if status_msg:
+            await safe_edit(status_msg, text, reply_markup=content_filter_keyboard())
+        else:
+            await telegram_gateway_await('message.reply_text', lambda: message.reply_text(text, reply_markup=content_filter_keyboard()))
+        return True
+    except Exception as e:
+        log_event(f"Content filter sample add failed: {e}")
+        target = status_msg or message
+        await telegram_gateway_await('target.reply_text', lambda: target.reply_text(f"Sample add failed:\n{str(e)[:400]}", reply_markup=content_filter_keyboard()))
+        return False
+    finally:
+        cleanup(fp, str(sample_path))
+
+
+def load_channels():
+    global ACTIVE_CHANNELS
+    with db_mutex:
+        conn = db_connect()
+        rows = conn.execute("SELECT channel_id, title, source_link, username FROM channels").fetchall()
+        conn.close()
+    ACTIVE_CHANNELS.clear()
+    seen_keys = set()
+    for cid, title, source_link, username in rows:
+        norm = normalize_channel_id(cid)
+        if is_reserved_source_channel(norm):
+            record_channel(
+                norm,
+                title=title or "",
+                status="ignored_system",
+                action="system_skip",
+                reason="target/queue/report chat skipped from source scanner",
+                source_link=source_link or "",
+                username=username or "",
+            )
+            continue
+        keys = channel_dedupe_keys(norm, username or "", source_link or "") or {f"id:{norm}"}
+        if seen_keys & keys:
+            delete_channel_db_rows(norm)
+            record_channel(
+                norm,
+                title=title or str(norm),
+                status=RESOLVED_ALIAS_STATUS,
+                action="db_duplicate_purge",
+                reason="duplicate source row purged during DB load",
+                source_link=source_link or "",
+                username=username or "",
+            )
+            continue
+        seen_keys.update(keys)
+        existing = get_channel_record(norm)
+        if existing.get("status") in {"removed", "expired_or_deleted", "ignored_system"}:
+            continue
+        ACTIVE_CHANNELS.add(norm)
+        record_channel(
+            norm,
+            title=title or "",
+            status="active",
+            action="db_load",
+            source_link=source_link or "",
+            username=username or "",
+        )
+    sanitize_active_source_channels("load_channels")
+
+
+def reconcile_active_json_sources_to_db():
+    """Restore active JSON sources into SQLite without reviving retired aliases."""
+    inactive_statuses = {
+        "removed",
+        "expired_or_deleted",
+        "ignored_system",
+        RESOLVED_ALIAS_STATUS,
+    }
+    with state_mutex:
+        state_items = [
+            deepcopy(item)
+            for item in STATE.get("channel_manager", {}).setdefault("channels", {}).values()
+        ]
+
+    candidates = []
+    seen_keys = set()
+    for item in sorted(
+        state_items,
+        key=lambda value: (
+            value.get("added_at") or value.get("created_at") or value.get("updated_at") or "",
+            str(value.get("channel_id") or ""),
+        ),
+    ):
+        if str(item.get("status") or "active") in inactive_statuses:
+            continue
+        cid = normalize_channel_id(item.get("channel_id", ""))
+        if cid in (None, "") or is_reserved_source_channel(cid):
+            continue
+        keys = channel_item_dedupe_keys(item) or {f"id:{cid}"}
+        if seen_keys & keys:
+            continue
+        seen_keys.update(keys)
+        candidates.append((cid, item, keys))
+
+    if not candidates:
+        return 0
+
+    restored = 0
+    with db_mutex:
+        conn = db_connect()
+        try:
+            db_rows = conn.execute(
+                "SELECT channel_id, title, source_link, username FROM channels"
+            ).fetchall()
+            db_keys = set()
+            for cid, _title, source_link, username in db_rows:
+                db_keys.update(channel_dedupe_keys(cid, username or "", source_link or ""))
+
+            now = now_iso()
+            for cid, item, keys in candidates:
+                if db_keys & keys:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO channels (channel_id, title, source_link, username, added_at, updated_at)
+                    VALUES (?,?,?,?,?,?)
+                    ON CONFLICT(channel_id) DO UPDATE SET
+                        title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE channels.title END,
+                        source_link=CASE WHEN excluded.source_link<>'' THEN excluded.source_link ELSE channels.source_link END,
+                        username=CASE WHEN excluded.username<>'' THEN excluded.username ELSE channels.username END,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        str(cid),
+                        str(item.get("title") or cid),
+                        str(item.get("source_link") or ""),
+                        str(item.get("username") or "").lstrip("@"),
+                        str(item.get("added_at") or now),
+                        now,
+                    ),
+                )
+                db_keys.update(keys)
+                restored += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    return restored
+
+
+def source_retire_reason_is_recoverable(item):
+    if not item or item.get("status") != "expired_or_deleted":
+        return False
+    reason = str(item.get("last_reason") or "").lower()
+    recoverable_markers = (
+        "confirmed unresolved peer",
+        "peer id invalid during startup warmup",
+        "peer unresolved",
+        "auth_key_duplicated",
+        "same authorization key",
+        "session auth",
+    )
+    hard_delete_markers = (
+        "channel deleted",
+        "chat deleted",
+        "deleted channel",
+        "deleted chat",
+        "userbannedinchannel",
+    )
+    return any(marker in reason for marker in recoverable_markers) and not any(marker in reason for marker in hard_delete_markers)
+
+
+def reactivate_recoverable_peer_sources():
+    """Undo old false retire decisions caused by peer-cache/session errors."""
+    recovered = []
+    with state_mutex:
+        channels = STATE["channel_manager"].setdefault("channels", {})
+        for uid, item in list(channels.items()):
+            if not source_retire_reason_is_recoverable(item):
+                continue
+            cid = normalize_channel_id(item.get("channel_id", ""))
+            if not cid or is_reserved_source_channel(cid):
+                continue
+            item["status"] = "active"
+            item["updated_at"] = now_iso()
+            item["last_reason"] = "reactivated after recoverable peer/session startup issue"
+            channels[uid] = item
+            cursor = STATE["sync_source_manager"].setdefault("cursors", {}).setdefault(guard_key(cid), {})
+            for field in (
+                "next_check_after",
+                "peer_invalid_count",
+                "peer_invalid_last_error",
+                "peer_invalid_context",
+                "peer_invalid_updated_at",
+                "delete_confirm_kind",
+                "delete_confirm_count",
+                "delete_confirm_last_error",
+            ):
+                cursor.pop(field, None)
+            cursor["last_temp_error"] = ""
+            cursor["last_checked_at"] = now_iso()
+            recovered.append(deepcopy(item))
+        if recovered:
+            STATE["channel_manager"].setdefault("events", []).append(
+                {
+                    "time": now_iso(),
+                    "action": "reactivate_recoverable_peer_sources",
+                    "count": len(recovered),
+                }
+            )
+            trim_events("channel_manager")
+            save_state("channel_manager")
+    if not recovered:
+        return 0
+    with db_mutex:
+        conn = db_connect()
+        try:
+            for item in recovered:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO channels (channel_id, title, source_link, username, added_at, updated_at)
+                    VALUES (?,?,?,?,?,?)
+                    """,
+                    (
+                        str(normalize_channel_id(item.get("channel_id", ""))),
+                        item.get("title", "") or str(item.get("channel_id", "")),
+                        item.get("source_link", ""),
+                        item.get("username", ""),
+                        item.get("added_at") or now_iso(),
+                        now_iso(),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    log_event(f"Reactivated {len(recovered)} recoverable peer/session source(s) from previous false retire state.")
+    return len(recovered)
+
+
+def add_channel_db(cid, title="", source_link="", username=""):
+    norm = normalize_channel_id(cid)
+    if is_reserved_source_channel(norm):
+        record_channel(
+            norm,
+            title=title or str(norm),
+            status="ignored_system",
+            action="system_skip",
+            reason="target/queue/report chat cannot be used as a source",
+            source_link=source_link,
+            username=username,
+        )
+        return False
+    with db_mutex:
+        conn = db_connect()
+        try:
+            for variant in channel_id_variants(cid):
+                if variant != str(norm):
+                    conn.execute("DELETE FROM channels WHERE channel_id=?", (variant,))
+            now = now_iso()
+            conn.execute(
+                "INSERT OR IGNORE INTO channels (channel_id, title, source_link, username, added_at, updated_at) VALUES (?,?,?,?,?,?)",
+                (str(norm), title or str(norm), source_link or "", username or "", now, now),
+            )
+            updates = ["updated_at=?"]
+            values = [now]
+            if title:
+                updates.append("title=?")
+                values.append(title)
+            if source_link:
+                updates.append("source_link=?")
+                values.append(source_link)
+            if username:
+                updates.append("username=?")
+                values.append(username)
+            values.append(str(norm))
+            conn.execute(f"UPDATE channels SET {', '.join(updates)} WHERE channel_id=?", values)
+            conn.commit()
+            ok = conn.total_changes >= 0
+        except Exception:
+            ok = False
+        finally:
+            conn.close()
+    if ok:
+        record_channel(norm, title=title, status="active", action="add", source_link=source_link, username=username)
+    return ok
+
+
+def rm_channel_db(cid):
+    norm = normalize_channel_id(cid)
+    targets = source_removal_targets(norm)
+    with db_mutex:
+        conn = db_connect()
+        for target in targets:
+            for variant in channel_id_variants(target):
+                conn.execute("DELETE FROM channels WHERE channel_id=?", (str(variant),))
+        conn.commit()
+        conn.close()
+    clear_source_runtime_tracking(norm)
+    remove_channel_state(norm)
+
+
+def subscription_expire_date(days):
+    if days >= 999:
+        return datetime.now() + timedelta(days=36500)
+    return datetime.now() + timedelta(days=days)
+
+
+def clean_subscription_profile_text(value, limit=80):
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:limit]
+
+
+def subscription_profile_display(item):
+    first_name = clean_subscription_profile_text(item.get("first_name") or "")
+    last_name = clean_subscription_profile_text(item.get("last_name") or "")
+    legacy_name = clean_subscription_profile_text(item.get("name") or "")
+    username = clean_subscription_profile_text(item.get("username") or "").lstrip("@")
+    full_name = " ".join(part for part in (first_name, last_name) if part).strip() or legacy_name
+    if not full_name:
+        full_name = "Deleted Account"
+    if username:
+        return f"{full_name} (@{username})"
+    return full_name
+
+
+def format_subscription_expiry(value):
+    if not value:
+        return "N/A"
+    try:
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            dt = datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%B %d, %Y")
+    except Exception:
+        return str(value)
+
+
+def upsert_subscription_db_profile(user_id, first_name="", last_name="", username="", profile_updated_at=None):
+    uid = str(user_id)
+    updated_at = profile_updated_at or now_iso()
+    with db_mutex:
+        conn = db_connect()
+        conn.execute(
+            """
+            UPDATE subscriptions
+            SET first_name=?, last_name=?, username=?, profile_updated_at=?
+            WHERE user_id=?
+            """,
+            (
+                clean_subscription_profile_text(first_name),
+                clean_subscription_profile_text(last_name),
+                clean_subscription_profile_text(username).lstrip("@"),
+                updated_at,
+                uid,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+
+def upsert_subscription_state(user_id, expire_date, status="active", name="", username="", first_name="", last_name="", profile_updated_at=""):
+    uid = str(user_id)
+    clean_first = clean_subscription_profile_text(first_name)
+    clean_last = clean_subscription_profile_text(last_name)
+    clean_username = clean_subscription_profile_text(username).lstrip("@")
+    clean_name = clean_subscription_profile_text(name)
+    if clean_name and not clean_first:
+        parts = clean_name.split(" ", 1)
+        clean_first = parts[0]
+        clean_last = clean_last or (parts[1] if len(parts) > 1 else "")
+    item = {
+        "user_id": uid,
+        "name": " ".join(part for part in (clean_first, clean_last) if part) or clean_name,
+        "first_name": clean_first,
+        "last_name": clean_last,
+        "username": clean_username,
+        "status": status,
+        "expire_date": expire_date.strftime("%Y-%m-%d %H:%M:%S") if isinstance(expire_date, datetime) else str(expire_date),
+        "profile_updated_at": profile_updated_at or "",
+        "updated_at": now_iso(),
+    }
+    with state_mutex:
+        old = STATE["manage_subscribe"].setdefault("users", {}).get(uid, {})
+        item["created_at"] = old.get("created_at", now_iso())
+        STATE["manage_subscribe"]["users"][uid] = {**old, **item}
+        STATE["manage_subscribe"].setdefault("events", []).append(
+            {"time": now_iso(), "action": status, "user_id": uid}
+        )
+        trim_events("manage_subscribe")
+        save_state("manage_subscribe")
+    rebuild_subscription_lists()
+
+
+def mark_subscription_banned(user_id, days):
+    uid = str(user_id)
+    until = "permanent" if days >= 999 else (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with db_mutex:
+        conn = db_connect()
+        conn.execute("DELETE FROM subscriptions WHERE user_id=?", (uid,))
+        conn.commit()
+        conn.close()
+    with state_mutex:
+        old = STATE["manage_subscribe"].setdefault("users", {}).get(uid, {})
+        STATE["manage_subscribe"]["users"][uid] = {
+            **old,
+            "user_id": uid,
+            "status": "banned",
+            "ban_until": until,
+            "updated_at": now_iso(),
+            "created_at": old.get("created_at", now_iso()),
+        }
+        STATE["manage_subscribe"].setdefault("events", []).append(
+            {"time": now_iso(), "action": "banned", "user_id": uid, "ban_until": until}
+        )
+        trim_events("manage_subscribe")
+        save_state("manage_subscribe")
+    rebuild_subscription_lists()
+
+
+def remove_subscription(user_id, reason="removed"):
+    uid = str(user_id)
+    with db_mutex:
+        conn = db_connect()
+        conn.execute("DELETE FROM subscriptions WHERE user_id=?", (uid,))
+        conn.commit()
+        conn.close()
+    with state_mutex:
+        old = STATE["manage_subscribe"].setdefault("users", {}).get(uid, {})
+        STATE["manage_subscribe"]["users"][uid] = {
+            **old,
+            "user_id": uid,
+            "status": "removed",
+            "removed_at": now_iso(),
+            "remove_reason": reason,
+            "updated_at": now_iso(),
+            "created_at": old.get("created_at", now_iso()),
+        }
+        STATE["manage_subscribe"].setdefault("events", []).append(
+            {"time": now_iso(), "action": "removed", "user_id": uid, "reason": reason}
+        )
+        trim_events("manage_subscribe")
+        save_state("manage_subscribe")
+    rebuild_subscription_lists()
+
+
+def add_subscription(user_id, days, name="", username=""):
+    expire_date = subscription_expire_date(days)
+    clean_name = clean_subscription_profile_text(name)
+    clean_username = clean_subscription_profile_text(username).lstrip("@")
+    first_name, last_name = "", ""
+    if clean_name:
+        parts = clean_name.split(" ", 1)
+        first_name = parts[0]
+        last_name = parts[1] if len(parts) > 1 else ""
+    with db_mutex:
+        conn = db_connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO subscriptions
+            (user_id, expire_date, first_name, last_name, username, profile_updated_at)
+            VALUES (?,?,?,?,?,?)
+            """,
+            (
+                str(user_id),
+                expire_date.strftime("%Y-%m-%d %H:%M:%S"),
+                first_name,
+                last_name,
+                clean_username,
+                now_iso() if (first_name or last_name or clean_username) else "",
+            ),
+        )
+        conn.commit()
+        conn.close()
+    upsert_subscription_state(user_id, expire_date, "active", name=clean_name, username=clean_username, first_name=first_name, last_name=last_name)
+    return expire_date
+
+
+def get_user_subscription(user_id):
+    with db_mutex:
+        conn = db_connect()
+        res = conn.execute("SELECT expire_date FROM subscriptions WHERE user_id=?", (str(user_id),)).fetchone()
+        conn.close()
+    if not res:
+        return None
+    try:
+        if datetime.strptime(res[0], "%Y-%m-%d %H:%M:%S") < datetime.now():
+            return None
+    except Exception:
+        return None
+    return res[0]
+
+
+def subscription_profile_cache_fresh(item):
+    updated = str((item or {}).get("profile_updated_at") or "").strip()
+    if not updated:
+        return False
+    try:
+        return (datetime.now() - datetime.fromisoformat(updated)).total_seconds() < SUB_PROFILE_CACHE_SECONDS
+    except Exception:
+        try:
+            return (datetime.now() - datetime.strptime(updated, "%Y-%m-%d %H:%M:%S")).total_seconds() < SUB_PROFILE_CACHE_SECONDS
+        except Exception:
+            return False
+
+
+def update_subscription_profile_cache(user_id, first_name="", last_name="", username="", deleted=False):
+    uid = str(user_id)
+    updated_at = now_iso()
+    first_name = "" if deleted else clean_subscription_profile_text(first_name)
+    last_name = "" if deleted else clean_subscription_profile_text(last_name)
+    username = "" if deleted else clean_subscription_profile_text(username).lstrip("@")
+    with state_mutex:
+        users = STATE["manage_subscribe"].setdefault("users", {})
+        old = users.get(uid, {"user_id": uid, "status": "active"})
+        users[uid] = {
+            **old,
+            "user_id": uid,
+            "name": " ".join(part for part in (first_name, last_name) if part),
+            "first_name": first_name,
+            "last_name": last_name,
+            "username": username,
+            "profile_updated_at": updated_at,
+            "profile_status": "deleted" if deleted else "ok",
+            "updated_at": now_iso(),
+            "created_at": old.get("created_at", now_iso()),
+        }
+        save_state("manage_subscribe")
+    upsert_subscription_db_profile(uid, first_name, last_name, username, updated_at)
+    return STATE["manage_subscribe"]["users"].get(uid, {})
+
+
+async def fetch_subscription_profile(user_id):
+    uid = str(user_id)
+    if not uid.lstrip("-").isdigit():
+        return None
+    for client_name, client in (("bot", app), ("userbot", userbot)):
+        try:
+            user = await tg_call(
+                f"subscription profile {client_name} {uid}",
+                client.get_users,
+                int(uid),
+                retries=1,
+                _timeout_seconds=20,
+            )
+            if user:
+                return user
+        except Exception as e:
+            if is_session_auth_error(e):
+                raise
+            log_event(f"Subscription profile refresh skipped via {client_name} for {uid}: {str(e)[:120]}")
+    return None
+
+
+async def refresh_subscription_profile(user_id, force=False):
+    uid = str(user_id)
+    with state_mutex:
+        item = deepcopy(STATE["manage_subscribe"].setdefault("users", {}).get(uid, {"user_id": uid}))
+    if not force and subscription_profile_cache_fresh(item):
+        return item
+    user = await fetch_subscription_profile(uid)
+    if not user:
+        return item
+    deleted = bool(getattr(user, "is_deleted", False))
+    return await run_blocking(
+        "db", update_subscription_profile_cache,
+        uid,
+        first_name=getattr(user, "first_name", "") or "",
+        last_name=getattr(user, "last_name", "") or "",
+        username=getattr(user, "username", "") or "",
+        deleted=deleted,
+    )
+
+
+async def refresh_subscription_profiles_for_items(items, force=False):
+    limited_items = list(items)[:SUB_PROFILE_REFRESH_LIMIT]
+    changed = 0
+    for uid, _item in limited_items:
+        try:
+            before = subscription_profile_display(_item)
+            refreshed = await refresh_subscription_profile(uid, force=force)
+            if subscription_profile_display(refreshed) != before:
+                changed += 1
+        except Exception as e:
+            if is_session_auth_error(e):
+                raise
+            log_event(f"Subscription profile refresh failed for {uid}: {str(e)[:160]}")
+        await asyncio.sleep(0.05)
+    if changed:
+        await run_blocking("control", rebuild_subscription_lists)
+    return changed
+
+
+def rebuild_subscription_lists():
+    now = datetime.now()
+    active, expired, banned, removed = {}, {}, {}, {}
+    with state_mutex:
+        for uid, item in STATE["manage_subscribe"].setdefault("users", {}).items():
+            if item.get("status") == "banned":
+                banned[uid] = item
+                continue
+            if item.get("status") == "removed":
+                removed[uid] = item
+                continue
+            exp = item.get("expire_date")
+            try:
+                exp_dt = datetime.strptime(exp, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                expired[uid] = item
+                continue
+            if exp_dt >= now and item.get("status") == "active":
+                active[uid] = item
+            else:
+                expired[uid] = {**item, "status": "expired"}
+        STATE["subscriptions_list"]["active"] = active
+        STATE["subscriptions_list"]["expired"] = expired
+        STATE["subscriptions_list"]["banned"] = banned
+        STATE["subscriptions_list"]["removed"] = removed
+        save_state("subscriptions_list")
+
+
+def is_uid_in_target(uid):
+    if not uid:
+        return False
+    with db_mutex:
+        conn = db_connect()
+        res = conn.execute("SELECT 1 FROM target_media WHERE uid=?", (uid,)).fetchone()
+        conn.close()
+    return res is not None
+
+
+def add_uid_to_target(uid):
+    if not uid:
+        return
+    with db_mutex:
+        conn = db_connect()
+        conn.execute("INSERT OR IGNORE INTO target_media (uid) VALUES (?)", (uid,))
+        conn.execute(
+            "INSERT OR IGNORE INTO target_media_full_index (uid, message_id, indexed_at, source) VALUES (?,?,?,?)",
+            (uid, 0, now_iso(), "ledger"),
+        )
+        conn.commit()
+        conn.close()
+    target_media_full_index.add(uid)
+
+
+def remove_uid_from_target(uid):
+    if not uid:
+        return
+    with db_mutex:
+        conn = db_connect()
+        conn.execute("DELETE FROM target_media WHERE uid=?", (uid,))
+        conn.execute("DELETE FROM posted WHERE hash=?", (uid,))
+        conn.execute("DELETE FROM target_media_full_index WHERE uid=?", (uid,))
+        conn.commit()
+        conn.close()
+    target_media_full_index.discard(uid)
+    with state_mutex:
+        STATE.get("target_media_index", {}).setdefault("items", {}).pop(uid, None)
+        target_messages = STATE.get("target_media_index", {}).setdefault("target_messages", {})
+        for msg_id, mapped_uid in list(target_messages.items()):
+            if mapped_uid == uid:
+                target_messages.pop(msg_id, None)
+        save_state("target_media_index")
+
+
+def make_old_hash(channel_id, msg_id):
+    return hashlib.md5(f"{channel_id}_{msg_id}".encode()).hexdigest()
+
+
+def check_and_mark_processing(channel_id, msg, reservation_owner=None):
+    uid = get_media_uid(msg)
+    if not uid:
+        return True
+    if persisted_reservation_blocks_message(channel_id, msg, owner=reservation_owner):
+        return True
+    if uid in processing_cache or known_duplicate_uid(uid):
+        return True
+    old_hash = make_old_hash(channel_id, msg.id)
+    if old_hash in processing_cache:
+        return True
+
+    with db_mutex:
+        conn = db_connect()
+        res = conn.execute("SELECT 1 FROM posted WHERE hash=? OR hash=?", (old_hash, uid)).fetchone()
+        conn.close()
+
+    if res:
+        return True
+    processing_cache.add(uid)
+    processing_cache.add(old_hash)
+    return False
+
+
+async def check_and_mark_processing_async(channel_id, msg, reservation_owner=None):
+    return await run_blocking(
+        "db",
+        check_and_mark_processing,
+        channel_id,
+        msg,
+        reservation_owner,
+    )
+
+
+async def known_duplicate_uid_async(uid):
+    return await run_blocking("db", known_duplicate_uid, uid)
+
+
+async def filter_new_messages_async(messages, reservation_owner=None):
+    result = []
+    for msg in messages:
+        if (
+            not persisted_reservation_blocks_message(msg.chat.id, msg, owner=reservation_owner)
+            and not await known_duplicate_uid_async(get_media_uid(msg))
+        ):
+            result.append(msg)
+        await asyncio.sleep(0)
+    return result
+
+
+def _commit_mark_posted_batch(entries):
+    """One SQLite transaction for many completed Telegram uploads."""
+    with db_mutex:
+        conn = db_connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for item in entries:
+                conn.execute("INSERT OR IGNORE INTO posted (hash, channel) VALUES (?,?)", (item["old_hash"], item["channel_name"]))
+                uid = item.get("uid")
+                if uid:
+                    conn.execute("INSERT OR IGNORE INTO posted (hash, channel) VALUES (?,?)", (uid, item["channel_name"]))
+                    conn.execute("INSERT OR IGNORE INTO target_media (uid) VALUES (?)", (uid,))
+                    conn.execute("INSERT OR REPLACE INTO target_media_full_index (uid, message_id, indexed_at, source) VALUES (?,?,?,?)", (uid, item["target_id"], item["indexed_at"], "upload"))
+            conn.commit()
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def _finalize_mark_posted_memory(item):
+    uid = item.get("uid")
+    msg = item["msg"]
+    if uid:
+        target_media_full_index.add(uid)
+        with state_mutex:
+            STATE["target_media_index"].setdefault("items", {})[uid] = {"uid": uid, "message_id": item["target_id"], "target_chat_id": TARGET_CHAT_ID, "source": "upload", "updated_at": now_iso()}
+            if item["target_id"]:
+                STATE["target_media_index"].setdefault("target_messages", {})[str(item["target_id"])] = uid
+            save_state("target_media_index")
+        record_clean_duplicate(uid, msg, target_msg=item.get("target_msg"), post_uid=item.get("post_uid"), channel_name=item["channel_name"])
+    remove_processing_keys(item["channel_id"], msg)
+
+
+async def mark_posted_queued(channel_id, msg, channel_name="", target_msg=None, post_uid=None):
+    """Durably serialize upload-ledger commits through the single batched DB writer."""
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    item = {"channel_id": channel_id, "msg": msg, "target_msg": target_msg, "post_uid": post_uid, "channel_name": channel_name, "old_hash": make_old_hash(channel_id, msg.id), "uid": get_media_uid(msg), "target_id": int(getattr(target_msg, "id", 0) or 0), "indexed_at": now_iso(), "future": future}
+    await critical_db_write_queue.put(item)
+    await future
+    _finalize_mark_posted_memory(item)
+    return True
+
+
+async def mark_posted_many_queued(entries):
+    await asyncio.gather(*(mark_posted_queued(*entry) for entry in entries))
+
+
+async def critical_db_writer_loop():
+    """Single owner, batched transactions, bounded queue, and caller acknowledgement."""
+    global DB_DEGRADED
+    while True:
+        first = await critical_db_write_queue.get()
+        batch = [first]
+        while len(batch) < DB_WRITE_BATCH_SIZE:
+            try:
+                batch.append(critical_db_write_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        try:
+            last_error = None
+            for write_attempt in range(1, 4):
+                try:
+                    await run_blocking("db", _commit_mark_posted_batch, batch)
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    log_event(
+                        f"Critical DB writer batch failed ({len(batch)} item(s)) "
+                        f"attempt {write_attempt}/3: {str(exc)[:180]}"
+                    )
+                    if is_sqlite_corruption_error(exc):
+                        break
+                    await asyncio.sleep(min(5, write_attempt))
+            if last_error is not None:
+                DB_DEGRADED = True
+                log_event(
+                    "Critical SQLite ledger is degraded; completed Telegram uploads are being "
+                    "committed to JSON duplicate indexes until the next controlled DB repair."
+                )
+            for item in batch:
+                future = item["future"]
+                if future.done():
+                    continue
+                if last_error is not None:
+                    future.set_result(False)
+                else:
+                    future.set_result(True)
+        finally:
+            for _item in batch:
+                critical_db_write_queue.task_done()
+            await asyncio.sleep(0)
+
+
+def mark_posted(channel_id, msg, channel_name="", target_msg=None, post_uid=None):
+    old_hash = make_old_hash(channel_id, msg.id)
+    uid = get_media_uid(msg)
+    with db_mutex:
+        conn = db_connect()
+        try:
+            conn.execute("INSERT OR IGNORE INTO posted (hash, channel) VALUES (?,?)", (old_hash, channel_name))
+            if uid:
+                conn.execute("INSERT OR IGNORE INTO posted (hash, channel) VALUES (?,?)", (uid, channel_name))
+                conn.execute("INSERT OR IGNORE INTO target_media (uid) VALUES (?)", (uid,))
+                conn.execute(
+                    "INSERT OR REPLACE INTO target_media_full_index (uid, message_id, indexed_at, source) VALUES (?,?,?,?)",
+                    (uid, int(getattr(target_msg, "id", 0) or 0), now_iso(), "upload"),
+                )
+            conn.commit()
+        except Exception:
+            logging.exception("mark_posted failed")
+        finally:
+            conn.close()
+    if uid:
+        target_media_full_index.add(uid)
+        with state_mutex:
+            STATE["target_media_index"].setdefault("items", {})[uid] = {
+                "uid": uid,
+                "message_id": int(getattr(target_msg, "id", 0) or 0),
+                "target_chat_id": TARGET_CHAT_ID,
+                "source": "upload",
+                "updated_at": now_iso(),
+            }
+            if getattr(target_msg, "id", None):
+                STATE["target_media_index"].setdefault("target_messages", {})[str(target_msg.id)] = uid
+            save_state("target_media_index")
+        record_clean_duplicate(uid, msg, target_msg=target_msg, post_uid=post_uid, channel_name=channel_name)
+    remove_processing_keys(channel_id, msg)
+
+
+def get_db_stats():
+    with db_mutex:
+        conn = db_connect()
+        subs = conn.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0]
+        posted = conn.execute("SELECT COUNT(*) FROM target_media").fetchone()[0]
+        conn.close()
+    return subs, posted
+
+
+def short_dt(value):
+    if not value:
+        return "N/A"
+    dt = parse_display_datetime(value)
+    return f"{dt.strftime('%B')} - {dt.day} | {format_display_time(dt)}"
+
+
+def format_dashboard_pre(lines, footer="Choose a control:"):
+    text = "<pre>" + html.escape("\n".join(lines)) + "</pre>"
+    if footer:
+        text += "\n" + html.escape(footer)
+    return text
+
+
+def sync_db_to_json():
+    with db_mutex:
+        conn = db_connect()
+        channels = conn.execute("SELECT channel_id FROM channels").fetchall()
+        subs = conn.execute(
+            "SELECT user_id, expire_date, first_name, last_name, username, profile_updated_at FROM subscriptions"
+        ).fetchall()
+        media = conn.execute("SELECT uid FROM target_media").fetchall()
+        conn.close()
+    for (cid,) in channels:
+        record_channel(cid, status="active", action="db_sync")
+    for user_id, expire, first_name, last_name, username, profile_updated_at in subs:
+        with contextlib.suppress(Exception):
+            exp = datetime.strptime(expire, "%Y-%m-%d %H:%M:%S")
+            upsert_subscription_state(
+                user_id,
+                exp,
+                "active",
+                username=username or "",
+                first_name=first_name or "",
+                last_name=last_name or "",
+                profile_updated_at=profile_updated_at or "",
+            )
+    with state_mutex:
+        items = STATE["clean_duplicate"].setdefault("items", {})
+        for (uid,) in media:
+            items.setdefault(
+                uid,
+                {
+                    "uid": uid,
+                    "status": "active",
+                    "source_channel": "legacy_db",
+                    "target_chat_id": TARGET_CHAT_ID,
+                    "target_message_ids": [],
+                    "created_at": now_iso(),
+                    "updated_at": now_iso(),
+                },
+            )
+        save_state("clean_duplicate")
+
+
+def source_channel_open_url(item):
+    """Build the best available Telegram open URL for source list buttons."""
+    username = str(item.get("username") or "").strip().lstrip("@")
+    if username:
+        return f"tg://resolve?domain={username}"
+    source_link = str(item.get("source_link") or "").strip()
+    if source_link.startswith("http"):
+        public_match = re.match(r"https?://(?:t\.me|telegram\.me|telegram\.dog)/([A-Za-z0-9_]{5,})(?:/\d+)?/?$", source_link, flags=re.I)
+        if public_match and not public_match.group(1).lower().startswith(("c", "+")):
+            return f"tg://resolve?domain={public_match.group(1)}"
+        private_base = re.match(r"https?://(?:t\.me|telegram\.me)/c/(\d+)(?:/\d+)?/?$", source_link, flags=re.I)
+        if private_base:
+            return f"https://t.me/c/{private_base.group(1)}"
+        return source_link
+    cid = str(item.get("channel_id") or "").strip()
+    if cid.startswith("-100") and cid[4:].isdigit():
+        return f"https://t.me/c/{cid[4:]}"
+    return ""
+
+
+SOURCE_PAGE_SIZE = 10
+
+
+def source_page_bounds(page, total, per_page=SOURCE_PAGE_SIZE):
+    page = max(0, int(page or 0))
+    max_page = max(0, (max(0, total) - 1) // per_page)
+    page = min(page, max_page)
+    start = page * per_page
+    end = min(total, start + per_page)
+    return page, max_page, start, end
+
+
+def short_channel_label(item, max_len=30):
+    title = str(item.get("title") or item.get("username") or item.get("channel_id") or "Unknown source").strip()
+    username = str(item.get("username") or "").strip()
+    if username and not username.startswith("@"):
+        username = f"@{username}"
+    label = f"{title} {username}".strip()
+    return label[:max_len]
+
+
+def format_source_channel_list(page=0):
+    health = channel_status_counts()
+    channels = active_channel_state_items()
+    page, max_page, start, end = source_page_bounds(page, len(channels))
+    lines = [
+        "SOURCE CHANNELS",
+        "---------------",
+        f"Active {health['active']} | Issue {health['issues']}",
+        f"Page {page + 1}/{max_page + 1}",
+        "",
+    ]
+    if not channels:
+        lines.append("No active channel added.")
+        return "\n".join(lines)
+    for idx, item in enumerate(channels[start:end], start + 1):
+        title = item.get("title") or "Unknown source"
+        cid = item.get("channel_id")
+        username = item.get("username") or ""
+        if username and not str(username).startswith("@"):
+            username = f"@{username}"
+        lines.append(f"{idx}. {title[:38]} {username}".rstrip())
+        lines.append(f"   ID: {cid}")
+        lines.append(f"   Added: {short_dt(item.get('added_at')) if item.get('added_at') else 'N/A'}")
+    return "\n".join(lines)
+
+
+def source_item_by_uid(uid):
+    uid = str(uid or "")
+    for item in active_channel_state_items(include_issues=True):
+        cid = normalize_channel_id(item.get("channel_id", ""))
+        if channel_uid(cid) == uid:
+            item["channel_id"] = cid
+            return item
+    return {}
+
+
+def format_source_channel_detail(item):
+    cid = normalize_channel_id(item.get("channel_id", ""))
+    title = item.get("title") or str(cid)
+    username = str(item.get("username") or "").strip().lstrip("@")
+    source_link = str(item.get("source_link") or "").strip()
+    open_url = source_channel_open_url(item)
+    lines = [
+        "SOURCE DETAILS",
+        "==============",
+        f"Name    {title[:60]}",
+        f"ID      {cid}",
+        f"User    {('@' + username) if username else '-'}",
+        f"Status  {item.get('status', 'active')}",
+        f"Added   {short_dt(item.get('added_at')) if item.get('added_at') else 'N/A'}",
+        f"Updated {short_dt(item.get('updated_at')) if item.get('updated_at') else 'N/A'}",
+        f"Reason  {str(item.get('last_reason') or '-')[:80]}",
+        "",
+        f"Saved link: {source_link or '-'}",
+        f"Open link : {'button below' if open_url else 'not available'}",
+        "",
+        "DANGER ACTION:",
+    ]
+    return format_dashboard_pre(lines, footer="") + "\n<b>REMOVE SOURCE</b>"
+
+
+def source_channel_detail_keyboard(item):
+    cid = normalize_channel_id(item.get("channel_id", ""))
+    uid = channel_uid(cid)
+    rows = []
+    open_url = source_channel_open_url(item)
+    if open_url:
+        rows.append([InlineKeyboardButton("Open Source", url=open_url)])
+    rows.append([InlineKeyboardButton("Remove Source", callback_data=f"src_rm_{uid}")])
+    rows.append([InlineKeyboardButton("Back to Sources", callback_data="menu_channels")])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_main_menu_text(live=False):
+    subs, posted = get_db_stats()
+
+    with state_mutex:
+        clean_count = len(STATE["clean_duplicate"].get("items", {}))
+        target_index_count = len(STATE.get("target_media_index", {}).get("items", {}))
+        total_uploaded = STATE["total_auto_upload"].get("total_uploaded", 0)
+    health = channel_status_counts()
+    running_jobs = channel_download_queue.qsize() + upload_queue.qsize() + link_process_queue.qsize()
+    stale_jobs = queue_state_stale_count()
+    health_label = "OK" if health["issues"] == 0 else f"{health['issues']} issue"
+    queue_label = "Clear" if running_jobs == 0 else f"{running_jobs} waiting"
+    link_report_label = "on" if SOURCE_LINK_DISCOVERY_ENABLED and SOURCE_LINK_REPORT_CHAT_ID else "off"
+    control = runtime_control_snapshot()
+    lines = [
+        "ROYELLS CONTROL",
+        "===============",
+        "Profile COPY-FIRST • CONTINUOUS",
+        f"Live    {'ON' if live else 'OFF'} | refresh {LIVE_DASHBOARD_INTERVAL_SECONDS}s",
+        f"Target  {target_direct_id_text(control['target_chat_id'])} | Admins {len(control['admins'])}",
+        f"Session {'ACTION REQUIRED' if SESSION_AUTH_INVALID else 'HEALTHY'}",
+        f"Uptime  {uptime()}",
+        f"Phase   {str(PIPELINE_SCAN_STATUS.get('phase', 'boot'))[:30]}",
+        f"Hot500  {PIPELINE_SCAN_STATUS.get('hot_done', 0)}/{PIPELINE_SCAN_STATUS.get('hot_total', 0)} sources",
+        f"History {PIPELINE_SCAN_STATUS.get('backfill_done', 0)}/{PIPELINE_SCAN_STATUS.get('backfill_total', 0)} sources",
+        f"Pipe    {queue_label}",
+        f"Queue   D{channel_download_queue.qsize()} • U{upload_queue.qsize()} • L{link_process_queue.qsize()}",
+        f"Workers {len(active_worker_jobs)}/{DOWNLOAD_WORKERS + UPLOAD_WORKERS} active • API {TELEGRAM_API_CONCURRENCY}",
+        f"Healer  {'on' if QUEUE_HEALER_ENABLED else 'off'} | stale {stale_jobs}",
+        f"LinkRpt {link_report_label} | {SOURCE_LINK_REPORT_CHAT_ID or 'not set'}",
+        "",
+        f"Guard   {last_source_guard.get('status', 'starting')[:26]}",
+        f"Seen    {short_dt(last_source_guard.get('time'))}",
+        f"Sync    {last_auto_sync.get('status', 'waiting')[:26]}",
+        f"Ran     {short_dt(last_auto_sync.get('time'))}",
+        f"Recover {'on' if AUTO_RECOVERY_ENABLED else 'off'} | lastQ {short_dt(last_successful_queue_time)}",
+        "",
+        f"Posts   {max(auto_count, total_uploaded)}",
+        f"Ledger  {clean_count} | DB {posted} | TargetIdx {target_index_count}",
+        f"Source  {health['active']} live | {health_label}",
+        f"Subs    {subs} active",
+        "",
+        "Links   Telegram only",
+    ]
+    return format_dashboard_pre(lines)
+
+
+def get_worker_menu_text(live=False):
+    lines = [
+        "WORKER REMOVED",
+        "==============",
+        f"Live    {'ON' if live else 'OFF'}",
+        f"Up      {uptime()}",
+        "Mode    main bot only",
+    ]
+    return format_dashboard_pre(lines)
+
+
+def get_command_menu_text():
+    if QUEUE_WORKER_MODE:
+        lines = [
+            "WORKER COMMANDS",
+            "===============",
+            "/start   open worker dashboard",
+            "/backup  send worker state backup",
+            "/restore reply to backup zip/json",
+            "",
+            "Inline buttons:",
+            "Status, Logs, Backup, Health, Close",
+            "",
+            "Queue:",
+            "Worker accepts JSON tasks from HTTP /queue or private queue group.",
+        ]
+    else:
+        lines = [
+            "MAIN BOT COMMANDS",
+            "=================",
+            "/start   open dashboard",
+            "/backup  send bot state backup",
+            "/restore reply to backup zip/json",
+            "",
+            "User action:",
+            "Paste Telegram post link in bot private chat.",
+            "",
+            "Inline buttons:",
+            "Sources, Subs, Tools, Logs, Refresh, Close",
+        ]
+    return format_dashboard_pre(lines, footer="")
+
+
+def get_tools_menu_text():
+    report_cfg = get_source_link_report_config()
+    control = runtime_control_snapshot()
+    lines = [
+        "TOOLS",
+        "=====",
+        "Mode    main",
+        f"Admins  {len(control['admins'])}",
+        f"Target  {target_direct_id_text(control['target_chat_id'])}",
+        f"Backup  {'on' if TELEGRAM_BACKUP_ENABLED else 'off'}",
+        f"LinkRpt {report_cfg['chat_id'] if report_cfg['chat_id'] != '0' else 'off'}",
+        f"Queue   D{channel_download_queue.qsize()} U{upload_queue.qsize()} L{link_process_queue.qsize()}",
+        f"Healer  {'on' if QUEUE_HEALER_ENABLED else 'off'} | stale {queue_state_stale_count()}",
+        "",
+        "Use the buttons below for health, backup, restore, access, and source-link reporting.",
+    ]
+    return format_dashboard_pre(lines, footer="")
+
+
+def target_direct_id_text(chat_id):
+    text = str(chat_id or "").strip()
+    if text.startswith("-100") and text[4:].isdigit():
+        return text[4:]
+    return text or "not set"
+
+
+def get_access_menu_text():
+    control = runtime_control_snapshot()
+    lines = [
+        "BOT ACCESS",
+        "==========",
+        f"Primary owner : {OWNER_ID or 'not set'}",
+        f"Admins        : {len(control['admins'])}",
+        f"Target full   : {control['target_chat_id'] or 'not set'}",
+        f"Target direct : {target_direct_id_text(control['target_chat_id'])}",
+        "",
+        "Extra admins:",
+    ]
+    extras = control["extra_admins"]
+    if extras:
+        lines.extend(f"- {uid}" for uid in extras[:20])
+        if len(extras) > 20:
+            lines.append(f"...and {len(extras) - 20} more")
+    else:
+        lines.append("- none")
+    lines.extend(["", "Paste target channel ID with or without -100."])
+    return format_dashboard_pre(lines, footer="")
+
+
+def get_source_link_report_menu_text():
+    cfg = get_source_link_report_config()
+    title = cfg.get("title") or "Unknown"
+    chat_id = cfg.get("chat_id") or "0"
+    username = cfg.get("username") or ""
+    link = cfg.get("link") or ""
+    updated = short_dt(cfg.get("updated_at")) if cfg.get("updated_at") else "N/A"
+    lines = [
+        "SOURCE LINK REPORT",
+        "==================",
+        f"Status  {'on' if SOURCE_LINK_DISCOVERY_ENABLED and SOURCE_LINK_REPORT_CHAT_ID else 'off'}",
+        f"Chat ID {chat_id}",
+        f"Name    {title[:40]}",
+        f"User    {('@' + username.lstrip('@')) if username else '-'}",
+        f"Link    {link[:70] if link else '-'}",
+        f"Updated {updated}",
+        "",
+        "Source messages are scanned for Telegram links.",
+        "Discovered channel info is sent to this report channel.",
+    ]
+    return format_dashboard_pre(lines, footer="")
+
+
+def brain_pending_unique_values(statuses=None):
+    statuses = set(statuses or [])
+    with state_mutex:
+        brain = brain_state()
+        removed_existing = brain_filter_existing_sources_locked(brain)
+        removed = brain_dedupe_pending_locked(brain)
+        if removed or removed_existing:
+            save_state("brain_dictionary")
+        pending = list(brain.setdefault("pending_channels", {}).values())
+    if statuses:
+        pending = [item for item in pending if item.get("status") in statuses]
+    pending.sort(key=lambda item: (-float(item.get("score") or 0), item.get("updated_at", ""), item.get("created_at", "")), reverse=False)
+    return pending
+
+
+def brain_pending_items(limit=10, statuses=None, offset=0):
+    pending = brain_pending_unique_values(statuses=statuses)
+    offset = max(0, int(offset or 0))
+    return pending[offset : offset + limit]
+
+
+def brain_pending_count(statuses=None):
+    return len(brain_pending_unique_values(statuses=statuses))
+
+
+def brain_status_filter(status_key):
+    mapping = {
+        "all": None,
+        "recommended": {"recommended"},
+        "review": {"pending", "review", "validation_failed", "review_safety"},
+        "rejected_low": {"rejected_low_relevance"},
+    }
+    return mapping.get(str(status_key or "all"), None)
+
+
+def brain_status_title(status_key):
+    return {
+        "all": "ALL",
+        "recommended": "RECOMMENDED",
+        "review": "REVIEW",
+        "rejected_low": "LOW RELEVANCE",
+    }.get(str(status_key or "all"), "ALL")
+
+
+def brain_get_pending_item(uid):
+    with state_mutex:
+        return deepcopy(brain_state().setdefault("pending_channels", {}).get(uid, {}))
+
+
+def brain_candidate_open_url(item):
+    username = str(item.get("username") or "").strip().lstrip("@")
+    if username:
+        return f"tg://resolve?domain={username}"
+    identifier = str(item.get("identifier") or "").strip()
+    public_match = re.match(r"https?://(?:t\.me|telegram\.me|telegram\.dog)/([A-Za-z0-9_]{5,})(?:/\d+)?/?$", identifier, flags=re.I)
+    if public_match and not public_match.group(1).lower().startswith(("c", "+")):
+        return f"tg://resolve?domain={public_match.group(1)}"
+    if identifier.startswith("http"):
+        return identifier
+    if identifier.startswith("@"):
+        return f"tg://resolve?domain={identifier.lstrip('@')}"
+    chat_id = str(item.get("chat_id") or identifier).strip()
+    if chat_id.startswith("-100") and chat_id[4:].isdigit():
+        return f"https://t.me/c/{chat_id[4:]}"
+    return ""
+
+
+def get_brain_menu_text():
+    if not BRAIN_DICTIONARY_ENABLED:
+        return format_dashboard_pre(["BRAIN", "=====", "Status  off"], footer="")
+    with state_mutex:
+        brain = deepcopy(brain_state())
+    pending_total = brain_pending_count()
+    recommended_total = brain_pending_count({"recommended"})
+    review_total = brain_pending_count({"pending", "review", "validation_failed", "review_safety"})
+    rejected = brain.get("rejected_channels", {})
+    blacklisted = brain.get("blacklisted_channels", {})
+    media_profile = brain.get("global_media_profile", {}) or brain_media_empty_counts()
+    category_profile = brain.get("global_category_profile", {}) or brain_semantic_empty_profile()
+    lines = [
+        "BRAIN DICTIONARY",
+        "================",
+        f"Mode    learn {'on' if BRAIN_DICTIONARY_ENABLED else 'off'} | discovery {'on' if BRAIN_DISCOVERY_ENABLED else 'off'}",
+        f"AutoJoin {'on' if BRAIN_AUTO_JOIN_ENABLED else 'off'} | limit {BRAIN_JOIN_LIMIT_PER_HOUR}/h",
+        f"Score   {source_brain_summary()}",
+        f"Trend   photo {int(float(media_profile.get('photo_ratio') or 0) * 100)}% | video {int(float(media_profile.get('video_ratio') or 0) * 100)}% | learned {int(media_profile.get('total') or 0)}",
+        f"TopCat  {brain_top_categories_text(category_profile, limit=3)}",
+        "",
+        f"Keywords {len(brain.get('keywords', []))}",
+        f"Hashtags {len(brain.get('hashtags', []))}",
+        f"Pending  {pending_total} | recommended {recommended_total} | review {review_total}",
+        f"Rejected {len(rejected)} | blacklisted {len(blacklisted)}",
+        f"LastDisc {short_dt(brain.get('last_discovery_scan')) if brain.get('last_discovery_scan') else 'N/A'}",
+        f"LastVal  {short_dt(brain.get('last_validation')) if brain.get('last_validation') else 'N/A'}",
+        "",
+        "Safe default: bot learns and recommends. Auto-join runs only if enabled by env.",
+    ]
+    return format_dashboard_pre(lines, footer="")
+
+
+def get_brain_terms_text(page=0, per_page=30):
+    with state_mutex:
+        brain = deepcopy(brain_state())
+    keywords = sorted(set(brain.get("keywords", [])))
+    hashtags = sorted(set(brain.get("hashtags", [])))
+    terms = [("keyword", item) for item in keywords] + [("hashtag", item) for item in hashtags]
+    total = len(terms)
+    page = max(0, int(page or 0))
+    start = page * per_page
+    items = terms[start : start + per_page]
+    pages = max(1, (total + per_page - 1) // per_page)
+    lines = [
+        "BRAIN TERMS",
+        "===========",
+        f"Keywords {len(keywords)} | Hashtags {len(hashtags)}",
+        f"Page {page + 1}/{pages}",
+        "",
+    ]
+    if not items:
+        lines.append("No terms saved yet.")
+    for idx, (kind, term) in enumerate(items, start + 1):
+        prefix = "#" if kind == "hashtag" and not str(term).startswith("#") else ""
+        lines.append(f"{idx}. {prefix}{term}")
+    return format_dashboard_pre(lines, footer="")
+
+
+def brain_terms_keyboard(page=0, per_page=30):
+    total = len(brain_state().get("keywords", [])) + len(brain_state().get("hashtags", []))
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(int(page or 0), pages - 1))
+    rows = [[InlineKeyboardButton("New Terms", callback_data="act_brain_new_terms")]]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("Prev", callback_data=f"brain_terms_{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton("Next", callback_data=f"brain_terms_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("Back", callback_data="menu_brain")])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_brain_pending_text(page=0, per_page=6, status_key="all"):
+    statuses = brain_status_filter(status_key)
+    total = brain_pending_count(statuses=statuses)
+    page = max(0, int(page or 0))
+    max_page = max(0, (total - 1) // per_page)
+    page = min(page, max_page)
+    items = brain_pending_items(limit=per_page, statuses=statuses, offset=page * per_page)
+    lines = [
+        f"BRAIN {brain_status_title(status_key)} SOURCES",
+        "======================",
+        f"Total {total} | Page {page + 1}/{max_page + 1}",
+        "",
+    ]
+    if not items:
+        lines.append("No pending channel candidate.")
+        return format_dashboard_pre(lines, footer="")
+    for idx, item in enumerate(items, page * per_page + 1):
+        ident = item.get("identifier", "")
+        title = item.get("title") or ident
+        lines.append(f"{idx}. {title[:38]}")
+        lines.append(f"   {item.get('status', 'pending')} | score {item.get('score', 0)} | {item.get('uid')}")
+        if item.get("note"):
+            lines.append(f"   {str(item.get('note'))[:80]}")
+    return format_dashboard_pre(lines, footer="")
+
+
+def get_brain_candidate_text(uid):
+    item = brain_get_pending_item(uid)
+    if not item:
+        return format_dashboard_pre(["BRAIN CANDIDATE", "===============", "Candidate not found."], footer="")
+    profile = item.get("media_profile", {}) or {}
+    media_line = "Media  -"
+    if int(profile.get("total") or 0) > 0:
+        media_line = (
+            f"Media  photo {int(float(profile.get('photo_ratio') or 0) * 100)}% | "
+            f"video {int(float(profile.get('video_ratio') or 0) * 100)}% | "
+            f"match {float(item.get('media_score') or 0):.2f}"
+        )
+    semantic_profile = item.get("semantic_profile", {}) or {}
+    category_line = f"Cat    {brain_top_categories_text(semantic_profile, limit=3)} | match {float(item.get('semantic_score') or 0):.2f}"
+    lines = [
+        "BRAIN CANDIDATE",
+        "===============",
+        f"Title  {(item.get('title') or '-')[:60]}",
+        f"Status {item.get('status', 'pending')}",
+        f"Score  {item.get('score', 0)}",
+        media_line,
+        category_line,
+        f"UID    {uid}",
+        f"User   {('@' + item.get('username').lstrip('@')) if item.get('username') else '-'}",
+        f"ChatID {item.get('chat_id') or '-'}",
+        f"Origin {item.get('origin') or '-'}",
+        f"Link   {str(item.get('identifier') or '-')[:80]}",
+        "",
+        f"Note   {str(item.get('note') or '-')[:220]}",
+        f"Valid  {short_dt(item.get('validated_at')) if item.get('validated_at') else 'not checked'}",
+        "",
+        "Open the source first, check manually, then approve/reject/block.",
+    ]
+    return format_dashboard_pre(lines, footer="")
+
+
+def get_brain_report_text():
+    with state_mutex:
+        brain = deepcopy(brain_state())
+    pending_items = brain_pending_unique_values()
+    statuses = defaultdict(int)
+    for item in pending_items:
+        statuses[item.get("status", "pending")] += 1
+    media_profile = brain.get("global_media_profile", {}) or brain_media_empty_counts()
+    category_profile = brain.get("global_category_profile", {}) or brain_semantic_empty_profile()
+    lines = [
+        "BRAIN REPORT",
+        "============",
+        f"Learning     {'on' if BRAIN_DICTIONARY_ENABLED else 'off'}",
+        f"Discovery    {'on' if BRAIN_DISCOVERY_ENABLED else 'off'}",
+        f"Auto join    {'on' if BRAIN_AUTO_JOIN_ENABLED else 'off'}",
+        f"Media trend  photo {int(float(media_profile.get('photo_ratio') or 0) * 100)}% | video {int(float(media_profile.get('video_ratio') or 0) * 100)}% | total {int(media_profile.get('total') or 0)}",
+        f"Media rule   recommend >= {BRAIN_MEDIA_PROFILE_THRESHOLD:.2f}",
+        f"Categories   {brain_top_categories_text(category_profile, limit=5)}",
+        f"Cat rule     recommend >= {BRAIN_SEMANTIC_THRESHOLD:.2f}",
+        f"Cache        {len(brain.get('recommendation_cache', {}))} candidate(s)",
+        f"Keywords     {len(brain.get('keywords', []))}",
+        f"Hashtags     {len(brain.get('hashtags', []))}",
+        f"Pending all  {len(pending_items)}",
+        f"Recommended  {statuses.get('recommended', 0)}",
+        f"Review       {statuses.get('review', 0) + statuses.get('pending', 0)}",
+        f"Rejected     {len(brain.get('rejected_channels', {}))}",
+        f"Blacklisted  {len(brain.get('blacklisted_channels', {}))}",
+        f"Last discover {short_dt(brain.get('last_discovery_scan')) if brain.get('last_discovery_scan') else 'N/A'}",
+        f"Last validate {short_dt(brain.get('last_validation')) if brain.get('last_validation') else 'N/A'}",
+        "",
+        "Validate checks pending source candidates and scores relevance.",
+        "Discover searches from learned terms only when discovery is enabled and accessible.",
+    ]
+    return format_dashboard_pre(lines, footer="")
+
+
+def brain_keyboard():
+    rows = [
+        [
+            InlineKeyboardButton("Terms", callback_data="brain_terms_0"),
+            InlineKeyboardButton("Pending", callback_data="menu_brain_pending"),
+        ],
+        [
+            InlineKeyboardButton("Validate", callback_data="act_brain_validate_pending"),
+            InlineKeyboardButton("Discover", callback_data="act_brain_force_discovery"),
+        ],
+        [
+            InlineKeyboardButton("Brain Report", callback_data="act_brain_report"),
+            InlineKeyboardButton("Back", callback_data="menu_main"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def brain_pending_keyboard(page=0, per_page=6, status_key="all"):
+    statuses = brain_status_filter(status_key)
+    total = brain_pending_count(statuses=statuses)
+    max_page = max(0, (total - 1) // per_page)
+    page = max(0, min(int(page or 0), max_page))
+    rows = [
+        [
+            InlineKeyboardButton("All", callback_data="brain_filter_all_0"),
+            InlineKeyboardButton("Recommended", callback_data="brain_filter_recommended_0"),
+        ],
+        [
+            InlineKeyboardButton("Review", callback_data="brain_filter_review_0"),
+            InlineKeyboardButton("Low", callback_data="brain_filter_rejected_low_0"),
+        ],
+    ]
+    for item in brain_pending_items(limit=per_page, statuses=statuses, offset=page * per_page):
+        uid = item.get("uid")
+        title = (item.get("title") or item.get("identifier") or uid)[:24]
+        rows.append(
+            [
+                InlineKeyboardButton(f"Details {title}", callback_data=f"brain_view_{uid}"),
+                InlineKeyboardButton("Validate", callback_data=f"brain_val_{uid}"),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton("Approve", callback_data=f"brain_app_{uid}"),
+                InlineKeyboardButton("Reject", callback_data=f"brain_rej_{uid}"),
+                InlineKeyboardButton("Block", callback_data=f"brain_blk_{uid}"),
+            ]
+        )
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("Prev", callback_data=f"brain_filter_{status_key}_{page - 1}"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton("Next", callback_data=f"brain_filter_{status_key}_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("Back", callback_data="menu_brain")])
+    return InlineKeyboardMarkup(rows)
+
+
+def brain_candidate_keyboard(uid):
+    item = brain_get_pending_item(uid)
+    rows = []
+    open_url = brain_candidate_open_url(item)
+    if open_url:
+        rows.append([InlineKeyboardButton("Open Source", url=open_url)])
+    rows.extend(
+        [
+            [InlineKeyboardButton("Validate", callback_data=f"brain_val_{uid}")],
+            [
+                InlineKeyboardButton("Approve", callback_data=f"brain_app_{uid}"),
+                InlineKeyboardButton("Reject", callback_data=f"brain_rej_{uid}"),
+                InlineKeyboardButton("Block", callback_data=f"brain_blk_{uid}"),
+            ],
+            [InlineKeyboardButton("Back to Pending", callback_data="menu_brain_pending")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def get_queue_menu_text():
+    lines = [
+        "LOCAL QUEUE",
+        "===========",
+        "Route   local",
+        "",
+        f"LocalQ  D{channel_download_queue.qsize()} U{upload_queue.qsize()} L{link_process_queue.qsize()}",
+        f"Stale   {queue_state_stale_count()}",
+    ]
+    return format_dashboard_pre(lines, footer="")
+
+
+def runtime_worker_limits():
+    if IS_HUGGINGFACE_SPACE and not env_bool("ROYELLS_ALLOW_AGGRESSIVE_MAIN_WORKERS", True):
+        return {"download": None, "upload": None, "link": None, "button": None}
+    return {"download": None, "upload": None, "link": None, "button": None}
+
+
+def runtime_queue_limits():
+    if IS_HUGGINGFACE_SPACE and not env_bool("ROYELLS_ALLOW_AGGRESSIVE_MAIN_WORKERS", True):
+        return {"soft": None, "hard": None}
+    return {"soft": None, "hard": None}
+
+
+def clamp_runtime_worker_value(name, value):
+    return max(1, int(value))
+
+
+def clamp_runtime_queue_value(name, value):
+    value = max(1, int(value))
+    snap = runtime_queue_snapshot()
+    if name == "soft":
+        return min(value, max(1, int(snap.get("hard", MAIN_LOCAL_QUEUE_HARD_LIMIT)) - 1))
+    return max(value, int(snap.get("soft", MAIN_LOCAL_QUEUE_SOFT_LIMIT)) + 1)
+
+
+def runtime_worker_snapshot():
+    workers = STATE.get("runtime_config", {}).get("workers", {}) if STATE else {}
+    return {
+        "download": int(workers.get("download", DOWNLOAD_WORKERS)),
+        "upload": int(workers.get("upload", UPLOAD_WORKERS)),
+        "link": int(workers.get("link", LINK_WORKERS)),
+        "button": int(workers.get("button", BUTTON_WORKERS)),
+    }
+
+
+def runtime_queue_snapshot():
+    queue_cfg = STATE.get("runtime_config", {}).get("queue", {}) if STATE else {}
+    return {
+        "soft": int(queue_cfg.get("soft", MAIN_LOCAL_QUEUE_SOFT_LIMIT)),
+        "hard": int(queue_cfg.get("hard", MAIN_LOCAL_QUEUE_HARD_LIMIT)),
+    }
+
+
+def save_runtime_worker_setting(name, value):
+    value = clamp_runtime_worker_value(name, value)
+    with state_mutex:
+        cfg = STATE.setdefault("runtime_config", default_state("runtime_config"))
+        workers = cfg.setdefault("workers", {})
+        workers[name] = value
+        cfg.setdefault("events", []).append({"time": now_iso(), "action": "set_worker", "name": name, "value": value})
+        cfg["events"] = cfg["events"][-200:]
+        save_state("runtime_config")
+    return value
+
+
+def save_runtime_queue_setting(name, value):
+    value = clamp_runtime_queue_value(name, value)
+    with state_mutex:
+        cfg = STATE.setdefault("runtime_config", default_state("runtime_config"))
+        queue_cfg = cfg.setdefault("queue", {})
+        queue_cfg[name] = value
+        if name == "soft" and int(queue_cfg.get("hard", MAIN_LOCAL_QUEUE_HARD_LIMIT)) <= value:
+            queue_cfg["hard"] = value + 1
+        if name == "hard" and int(queue_cfg.get("soft", MAIN_LOCAL_QUEUE_SOFT_LIMIT)) >= value:
+            queue_cfg["soft"] = max(1, value - 1)
+        cfg.setdefault("events", []).append({"time": now_iso(), "action": "set_queue", "name": name, "value": value})
+        cfg["events"] = cfg["events"][-200:]
+        save_state("runtime_config")
+    return value
+
+
+def normalize_target_channel_id(value):
+    norm = normalize_channel_id(value)
+    text = str(norm)
+    if not text.startswith("-100") or not text[4:].isdigit():
+        raise ValueError("Target channel must be a channel/supergroup ID. Paste it with or without -100.")
+    return int(text)
+
+
+def runtime_control_snapshot():
+    control = STATE.get("runtime_config", {}).get("control", {}) if STATE else {}
+    admins = sorted(runtime_admin_ids())
+    target = control.get("target_chat_id") or str(TARGET_CHAT_ID or "")
+    return {
+        "admins": admins,
+        "extra_admins": [uid for uid in admins if uid != OWNER_ID],
+        "target_chat_id": str(target),
+    }
+
+
+def save_runtime_admin_id(user_id):
+    uid = _coerce_user_id(user_id)
+    if not uid:
+        raise ValueError("Admin user ID must be a positive numeric Telegram user ID.")
+    with state_mutex:
+        cfg = STATE.setdefault("runtime_config", default_state("runtime_config"))
+        control = cfg.setdefault("control", {})
+        current = {str(admin_id) for admin_id in runtime_admin_ids() if admin_id != OWNER_ID}
+        if uid != OWNER_ID:
+            current.add(str(uid))
+        control["admin_ids"] = sorted(current, key=lambda value: int(value))
+        control.setdefault("target_chat_id", str(TARGET_CHAT_ID or ""))
+        cfg.setdefault("events", []).append({"time": now_iso(), "action": "add_admin", "user_id": str(uid)})
+        cfg["events"] = cfg["events"][-200:]
+        save_state("runtime_config")
+    return uid
+
+
+def remove_runtime_admin_id(user_id):
+    uid = _coerce_user_id(user_id)
+    if not uid:
+        raise ValueError("Admin user ID must be numeric.")
+    if uid == OWNER_ID:
+        raise ValueError("Primary owner cannot be removed from the dashboard.")
+    with state_mutex:
+        cfg = STATE.setdefault("runtime_config", default_state("runtime_config"))
+        control = cfg.setdefault("control", {})
+        current = {str(admin_id) for admin_id in runtime_admin_ids() if admin_id != OWNER_ID}
+        current.discard(str(uid))
+        control["admin_ids"] = sorted(current, key=lambda value: int(value))
+        cfg.setdefault("events", []).append({"time": now_iso(), "action": "remove_admin", "user_id": str(uid)})
+        cfg["events"] = cfg["events"][-200:]
+        save_state("runtime_config")
+    return uid
+
+
+def save_runtime_target_chat_id(value):
+    global TARGET_CHAT_ID, DB_REQUIRES_TARGET_REINDEX
+    new_target = normalize_target_channel_id(value)
+    old_target = TARGET_CHAT_ID
+    TARGET_CHAT_ID = new_target
+    target_media_full_index.clear()
+    DB_REQUIRES_TARGET_REINDEX = True
+    with db_mutex:
+        conn = db_connect()
+        try:
+            conn.execute("DELETE FROM target_media")
+            conn.execute("DELETE FROM target_media_full_index")
+            conn.commit()
+        finally:
+            conn.close()
+    with state_mutex:
+        cfg = STATE.setdefault("runtime_config", default_state("runtime_config"))
+        control = cfg.setdefault("control", {})
+        control["target_chat_id"] = str(new_target)
+        target_state = STATE.setdefault("target_media_index", default_state("target_media_index"))
+        target_state["items"] = {}
+        target_state["target_messages"] = {}
+        target_state["last_full_scan"] = ""
+        target_state.setdefault("events", []).append(
+            {"time": now_iso(), "action": "target_changed", "old": str(old_target), "new": str(new_target)}
+        )
+        trim_events("target_media_index")
+        save_state("target_media_index")
+        cfg.setdefault("events", []).append(
+            {"time": now_iso(), "action": "set_target_chat", "old": str(old_target), "new": str(new_target)}
+        )
+        cfg["events"] = cfg["events"][-200:]
+        save_state("runtime_config")
+    return old_target, new_target
+
+
+def apply_runtime_config():
+    global DOWNLOAD_WORKERS, UPLOAD_WORKERS, LINK_WORKERS, BUTTON_WORKERS, MAIN_LOCAL_QUEUE_SOFT_LIMIT, MAIN_LOCAL_QUEUE_HARD_LIMIT, TARGET_CHAT_ID
+    if "runtime_config" not in STATE:
+        return
+    control = STATE.get("runtime_config", {}).get("control", {})
+    saved_target = control.get("target_chat_id")
+    if saved_target:
+        with contextlib.suppress(Exception):
+            TARGET_CHAT_ID = normalize_target_channel_id(saved_target)
+    snap = runtime_worker_snapshot()
+    queue_snap = runtime_queue_snapshot()
+    worker_fields = (
+        ("download", "ROYELLS_DOWNLOAD_WORKERS", DOWNLOAD_WORKERS),
+        ("upload", "ROYELLS_UPLOAD_WORKERS", UPLOAD_WORKERS),
+        ("link", "ROYELLS_LINK_WORKERS", LINK_WORKERS),
+        ("button", "ROYELLS_BUTTON_WORKERS", BUTTON_WORKERS),
+    )
+    applied_workers = {}
+    env_pinned = []
+    for name, env_name, current_value in worker_fields:
+        if env_name in os.environ:
+            value = clamp_runtime_worker_value(name, current_value)
+            env_pinned.append(name)
+        else:
+            value = clamp_runtime_worker_value(name, snap[name])
+        applied_workers[name] = value
+
+    soft_candidate = (
+        MAIN_LOCAL_QUEUE_SOFT_LIMIT
+        if "ROYELLS_MAIN_LOCAL_QUEUE_SOFT_LIMIT" in os.environ
+        else queue_snap["soft"]
+    )
+    hard_candidate = (
+        MAIN_LOCAL_QUEUE_HARD_LIMIT
+        if "ROYELLS_MAIN_LOCAL_QUEUE_HARD_LIMIT" in os.environ
+        else queue_snap["hard"]
+    )
+    queue_soft = max(1, int(soft_candidate))
+    queue_hard = max(queue_soft + 1, int(hard_candidate))
+    if E2_MICRO_SAFE_PROFILE:
+        applied_workers["download"] = 1
+        applied_workers["upload"] = 1
+        applied_workers["link"] = 1
+        applied_workers["button"] = max(1, min(2, applied_workers.get("button", 1)))
+        queue_soft = min(queue_soft, 16)
+        queue_hard = min(max(queue_soft + 1, queue_hard), 24)
+    if "ROYELLS_MAIN_LOCAL_QUEUE_SOFT_LIMIT" in os.environ:
+        env_pinned.append("queue_soft")
+    if "ROYELLS_MAIN_LOCAL_QUEUE_HARD_LIMIT" in os.environ:
+        env_pinned.append("queue_hard")
+
+    DOWNLOAD_WORKERS = applied_workers["download"]
+    UPLOAD_WORKERS = applied_workers["upload"]
+    LINK_WORKERS = applied_workers["link"]
+    BUTTON_WORKERS = applied_workers["button"]
+    MAIN_LOCAL_QUEUE_SOFT_LIMIT = queue_soft
+    MAIN_LOCAL_QUEUE_HARD_LIMIT = queue_hard
+
+    with state_mutex:
+        cfg = STATE.setdefault("runtime_config", default_state("runtime_config"))
+        cfg["workers"] = dict(applied_workers)
+        cfg["queue"] = {"soft": queue_soft, "hard": queue_hard}
+        control = cfg.setdefault("control", {})
+        control.setdefault("target_chat_id", str(TARGET_CHAT_ID or ""))
+        control["admin_ids"] = sorted(
+            {str(uid) for uid in runtime_admin_ids() if uid != OWNER_ID},
+            key=lambda value: int(value),
+        )
+        cfg.setdefault("events", []).append(
+            {
+                "time": now_iso(),
+                "action": "startup_apply",
+                "env_pinned": env_pinned,
+            }
+        )
+        cfg["events"] = cfg["events"][-200:]
+        save_state("runtime_config")
+    log_event(
+        "Runtime config applied: "
+        f"download={DOWNLOAD_WORKERS}, upload={UPLOAD_WORKERS}, link={LINK_WORKERS}, button={BUTTON_WORKERS}, "
+        f"queue_soft={MAIN_LOCAL_QUEUE_SOFT_LIMIT}, queue_hard={MAIN_LOCAL_QUEUE_HARD_LIMIT}; "
+        f"environment pinned={','.join(env_pinned) or 'none'}."
+    )
+
+
+def get_settings_menu_text():
+    snap = runtime_worker_snapshot()
+    qsnap = runtime_queue_snapshot()
+    lines = [
+        "BOT SETTINGS",
+        "============",
+        f"Download workers : {DOWNLOAD_WORKERS} | saved {snap['download']}",
+        f"Upload workers   : {UPLOAD_WORKERS} | saved {snap['upload']}",
+        f"Link workers     : {LINK_WORKERS} | saved {snap['link']}",
+        f"Button workers   : {BUTTON_WORKERS} | saved {snap['button']}",
+        "",
+        f"API concurrency  : {TELEGRAM_API_CONCURRENCY}",
+        f"Transmission     : {MAX_CONCURRENT_TRANSMISSIONS}",
+        f"Queue soft       : {MAIN_LOCAL_QUEUE_SOFT_LIMIT} | saved {qsnap['soft']}",
+        f"Queue hard       : {MAIN_LOCAL_QUEUE_HARD_LIMIT} | saved {qsnap['hard']}",
+        f"Worker stall     : {WORKER_STALL_SECONDS}s",
+        "",
+        "Worker and queue values have no dashboard max cap.",
+        "Worker changes need a controlled restart.",
+    ]
+    return format_dashboard_pre(lines, footer="")
+
+
+def settings_keyboard():
+    rows = [
+        [
+            InlineKeyboardButton("DL -", callback_data="set_worker_download_dec"),
+            InlineKeyboardButton("DL +", callback_data="set_worker_download_inc"),
+        ],
+        [
+            InlineKeyboardButton("UP -", callback_data="set_worker_upload_dec"),
+            InlineKeyboardButton("UP +", callback_data="set_worker_upload_inc"),
+        ],
+        [
+            InlineKeyboardButton("Link -", callback_data="set_worker_link_dec"),
+            InlineKeyboardButton("Link +", callback_data="set_worker_link_inc"),
+        ],
+        [
+            InlineKeyboardButton("Button -", callback_data="set_worker_button_dec"),
+            InlineKeyboardButton("Button +", callback_data="set_worker_button_inc"),
+        ],
+        [
+            InlineKeyboardButton("Q Soft -", callback_data="set_queue_soft_dec"),
+            InlineKeyboardButton("Q Soft +", callback_data="set_queue_soft_inc"),
+        ],
+        [
+            InlineKeyboardButton("Q Hard -", callback_data="set_queue_hard_dec"),
+            InlineKeyboardButton("Q Hard +", callback_data="set_queue_hard_inc"),
+        ],
+        [
+            InlineKeyboardButton("Safe 1/1", callback_data="set_preset_safe"),
+            InlineKeyboardButton("Balanced 2/2", callback_data="set_preset_balanced"),
+        ],
+        [
+            InlineKeyboardButton("Restart Apply", callback_data="act_restart_apply"),
+            InlineKeyboardButton("Back", callback_data="menu_main"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def live_dashboard_key(chat_id, message_id):
+    return f"{chat_id}:{message_id}"
+
+
+def is_live_dashboard(chat_id, message_id):
+    item = live_dashboard_tasks.get(live_dashboard_key(chat_id, message_id))
+    task = item.get("task") if isinstance(item, dict) else item
+    return bool(task and not task.done())
+
+
+def dashboard_text_for_mode(live=False):
+    return get_worker_menu_text(live=live) if QUEUE_WORKER_MODE else get_main_menu_text(live=live)
+
+
+def dashboard_keyboard_for_mode(live=False):
+    return worker_keyboard(live=live) if QUEUE_WORKER_MODE else main_keyboard(live=live)
+
+
+async def live_dashboard_loop(chat_id, message_id):
+    key = live_dashboard_key(chat_id, message_id)
+    try:
+        while True:
+            await asyncio.sleep(max(5, LIVE_DASHBOARD_INTERVAL_SECONDS))
+            if key not in live_dashboard_tasks:
+                return
+            try:
+                await telegram_gateway_await('app.edit_message_text', lambda: app.edit_message_text(
+                    int(chat_id),
+                    int(message_id),
+                    dashboard_text_for_mode(live=True),
+                    reply_markup=dashboard_keyboard_for_mode(live=True),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                ))
+            except MessageNotModified:
+                pass
+            await asyncio.sleep(0)
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        log_event(f"Live dashboard stopped for {key}: {str(e)[:140]}")
+    finally:
+        live_dashboard_tasks.pop(key, None)
+
+
+async def start_live_dashboard(chat_id, message_id):
+    if not LIVE_DASHBOARD_ENABLED:
+        return False
+    key = live_dashboard_key(chat_id, message_id)
+    existing = live_dashboard_tasks.get(key, {})
+    task = existing.get("task") if isinstance(existing, dict) else existing
+    if task and not task.done():
+        return True
+    live_dashboard_tasks[key] = {"task": asyncio.create_task(live_dashboard_loop(chat_id, message_id))}
+    return True
+
+
+async def stop_live_dashboard(chat_id, message_id, edit=False):
+    key = live_dashboard_key(chat_id, message_id)
+    existing = live_dashboard_tasks.pop(key, None)
+    task = existing.get("task") if isinstance(existing, dict) else existing
+    if task:
+        task.cancel()
+        with contextlib.suppress(Exception):
+            await task
+    if edit:
+        await telegram_gateway_await('app.edit_message_text', lambda: app.edit_message_text(
+            int(chat_id),
+            int(message_id),
+            dashboard_text_for_mode(live=False),
+            reply_markup=dashboard_keyboard_for_mode(live=False),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        ))
+
+
+async def stop_all_live_dashboards():
+    keys = list(live_dashboard_tasks.keys())
+    for key in keys:
+        try:
+            chat_id, message_id = key.split(":", 1)
+            await stop_live_dashboard(chat_id, message_id)
+        except Exception:
+            live_dashboard_tasks.pop(key, None)
+
+
+def live_log_key(chat_id, message_id):
+    return f"{chat_id}:{message_id}"
+
+
+def get_logs_text(live=False):
+    lines = [
+        "LIVE CONSOLE LOGS" + ("  ON" if live else ""),
+        "------------------------------",
+    ]
+    if console_logs:
+        lines.extend(list(console_logs)[-30:])
+    else:
+        lines.append("No recent activity.")
+    return "\n".join(lines)[-3900:]
+
+
+def logs_keyboard(live=False):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Refresh", callback_data="menu_logs")],
+            [InlineKeyboardButton("Back to Dashboard", callback_data="menu_main")],
+        ]
+    )
+
+
+async def live_logs_loop(chat_id, message_id):
+    key = live_log_key(chat_id, message_id)
+    try:
+        while True:
+            await asyncio.sleep(max(3, min(15, LIVE_DASHBOARD_INTERVAL_SECONDS)))
+            if key not in live_log_tasks:
+                return
+            try:
+                await telegram_gateway_await('app.edit_message_text', lambda: app.edit_message_text(
+                    int(chat_id),
+                    int(message_id),
+                    get_logs_text(live=True),
+                    reply_markup=logs_keyboard(live=True),
+                    disable_web_page_preview=True,
+                ))
+            except MessageNotModified:
+                continue
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log_event(f"Live logs stopped for {key}: {str(e)[:140]}")
+    finally:
+        live_log_tasks.pop(key, None)
+
+
+async def start_live_logs(chat_id, message_id):
+    return False
+
+
+async def stop_live_logs(chat_id, message_id):
+    key = live_log_key(chat_id, message_id)
+    task = live_log_tasks.pop(key, None)
+    if task:
+        task.cancel()
+        with contextlib.suppress(Exception):
+            await task
+    return True
+
+
+async def stop_all_live_logs():
+    keys = list(live_log_tasks.keys())
+    for key in keys:
+        try:
+            chat_id, message_id = key.split(":", 1)
+            await stop_live_logs(chat_id, message_id)
+        except Exception:
+            live_log_tasks.pop(key, None)
+
+
+def main_keyboard(live=False):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Sources", callback_data="menu_channels"),
+                InlineKeyboardButton("Subs", callback_data="menu_subs"),
+            ],
+            [
+                InlineKeyboardButton("Tools", callback_data="menu_tools"),
+                InlineKeyboardButton("Logs", callback_data="menu_logs"),
+            ],
+            [
+                InlineKeyboardButton("Settings", callback_data="menu_settings"),
+                InlineKeyboardButton("Refresh", callback_data="menu_main"),
+            ],
+            [
+                InlineKeyboardButton("Close", callback_data="close_menu"),
+            ],
+        ]
+    )
+
+
+def worker_keyboard(live=False):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Status", callback_data="worker_status"),
+                InlineKeyboardButton("Tools", callback_data="menu_tools"),
+            ],
+            [
+                InlineKeyboardButton("Health", callback_data="worker_health"),
+                InlineKeyboardButton("Logs", callback_data="menu_logs"),
+            ],
+            [
+                InlineKeyboardButton("Close", callback_data="close_menu"),
+            ],
+        ]
+    )
+
+
+def back_to_current_dashboard_keyboard():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Back", callback_data="worker_status" if QUEUE_WORKER_MODE else "menu_main")]]
+    )
+
+
+def tools_keyboard():
+    rows = [
+        [
+            InlineKeyboardButton("Clean", callback_data="menu_clean"),
+            InlineKeyboardButton("Health", callback_data="act_check_channels"),
+        ],
+        [
+            InlineKeyboardButton("Access", callback_data="menu_access"),
+            InlineKeyboardButton("Report", callback_data="act_diag_now"),
+        ],
+        [
+            InlineKeyboardButton("Backup", callback_data="act_backup_now"),
+            InlineKeyboardButton("Restore", callback_data="act_restore"),
+        ],
+        [
+            InlineKeyboardButton("Link Report", callback_data="menu_link_report"),
+        ],
+    ]
+    rows.append([InlineKeyboardButton("Back", callback_data="worker_status" if QUEUE_WORKER_MODE else "menu_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def access_keyboard():
+    rows = [
+        [
+            InlineKeyboardButton("Add Admin", callback_data="act_add_admin"),
+            InlineKeyboardButton("Set Target", callback_data="act_set_target"),
+        ],
+    ]
+    extras = runtime_control_snapshot()["extra_admins"]
+    for uid in extras[:8]:
+        rows.append([InlineKeyboardButton(f"Remove Admin {uid}", callback_data=f"adm_rm_{uid}")])
+    rows.append([InlineKeyboardButton("Back", callback_data="menu_tools")])
+    return InlineKeyboardMarkup(rows)
+
+
+def source_link_report_keyboard():
+    rows = [
+        [
+            InlineKeyboardButton("Set Channel", callback_data="act_set_link_report"),
+            InlineKeyboardButton("Test", callback_data="act_test_link_report"),
+        ],
+        [
+            InlineKeyboardButton("Disable", callback_data="act_disable_link_report"),
+            InlineKeyboardButton("Back", callback_data="menu_tools"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def channels_keyboard(page=0):
+    rows = []
+    channels = active_channel_state_items()
+    page, max_page, start, end = source_page_bounds(page, len(channels))
+    for item in channels[start:end]:
+        title = (item.get("title") or str(item.get("channel_id", "source")))[:32]
+        cid = normalize_channel_id(item.get("channel_id", ""))
+        rows.append([InlineKeyboardButton(title, callback_data=f"src_view_{channel_uid(cid)}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("Prev", callback_data=f"src_page_{page - 1}"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton("Next", callback_data=f"src_page_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton("Add One", callback_data="act_addchannel"),
+                InlineKeyboardButton("Add Multiple", callback_data="act_addchannels_bulk"),
+            ],
+            [
+                InlineKeyboardButton("Status", callback_data="menu_channel_issues"),
+            ],
+            [InlineKeyboardButton("Back", callback_data="menu_main")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def source_status_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Check Sources", callback_data="act_check_channels")],
+            [InlineKeyboardButton("Back", callback_data="menu_channels")],
+        ]
+    )
+
+
+def remove_channels_keyboard(page=0):
+    channels = active_channel_state_items()
+    page, max_page, start, end = source_page_bounds(page, len(channels))
+    rows = []
+    for idx, item in enumerate(channels[start:end], start + 1):
+        cid = item.get("channel_id")
+        label = f"{idx}. {short_channel_label(item, 24)}"
+        rows.append([InlineKeyboardButton(f"Remove {label}", callback_data=f"rmc_{cid}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("Prev", callback_data=f"rm_page_{page - 1}"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton("Next", callback_data=f"rm_page_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("Back", callback_data="menu_channels")])
+    return InlineKeyboardMarkup(rows)
+
+
+SUBS_PAGE_SIZE = 8
+
+
+def active_subscription_items():
+    rebuild_subscription_lists()
+    with state_mutex:
+        active = deepcopy(STATE["subscriptions_list"].get("active", {}))
+    items = list(active.items())
+    items.sort(key=lambda pair: (subscription_profile_display(pair[1]).lower(), str(pair[0])))
+    return items
+
+
+def subscription_page_bounds(page, total, per_page=SUBS_PAGE_SIZE):
+    page = max(0, int(page or 0))
+    max_page = max(0, (max(0, total) - 1) // per_page)
+    page = min(page, max_page)
+    start = page * per_page
+    end = min(total, start + per_page)
+    return page, max_page, start, end
+
+
+def subscriber_button_label(uid, item):
+    label = subscription_profile_display(item)
+    return f"{label[:34]} | {uid}"[:60]
+
+
+def get_subscribers_dashboard_text(page=0, note=""):
+    items = active_subscription_items()
+    page, max_page, start, end = subscription_page_bounds(page, len(items))
+    with state_mutex:
+        expired = len(STATE["subscriptions_list"].get("expired", {}))
+        banned = len(STATE["subscriptions_list"].get("banned", {}))
+        removed = len(STATE["subscriptions_list"].get("removed", {}))
+    lines = [
+        "SUBSCRIBERS DASHBOARD",
+        "=====================",
+        f"Active  {len(items)}",
+        f"Expired {expired} | Banned {banned} | Removed {removed}",
+        f"Page    {page + 1}/{max_page + 1}",
+        "",
+    ]
+    if note:
+        lines.extend(["Status  " + str(note)[:100], ""])
+    if not items:
+        lines.append("No active subscriber found.")
+    else:
+        for idx, (uid, item) in enumerate(items[start:end], start + 1):
+            lines.append(f"{idx}. {subscription_profile_display(item)[:36]}")
+            lines.append(f"   ID: {uid} | Exp: {format_subscription_expiry(item.get('expire_date'))}")
+    return format_dashboard_pre(lines, footer="")
+
+
+async def get_subscribers_dashboard_text_live(page=0, note=""):
+    items = active_subscription_items()
+    page, _max_page, start, end = subscription_page_bounds(page, len(items))
+    if items:
+        await refresh_subscription_profiles_for_items(items[start:end], force=False)
+    return get_subscribers_dashboard_text(page=page, note=note)
+
+
+def subscribers_dashboard_keyboard(page=0):
+    items = active_subscription_items()
+    page, max_page, start, end = subscription_page_bounds(page, len(items))
+    rows = []
+    for uid, item in items[start:end]:
+        rows.append([InlineKeyboardButton(subscriber_button_label(uid, item), callback_data=f"subv_{uid}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("Prev", callback_data=f"subs_page_{page - 1}"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton("Next", callback_data=f"subs_page_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("Add Member", callback_data="act_addsub")])
+    rows.append([InlineKeyboardButton("Back", callback_data="menu_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def subs_keyboard():
+    return subscribers_dashboard_keyboard(0)
+
+
+def subscriber_detail_text(uid, item=None):
+    uid = str(uid)
+    if item is None:
+        rebuild_subscription_lists()
+        with state_mutex:
+            item = deepcopy(STATE["manage_subscribe"].setdefault("users", {}).get(uid, {}))
+    name = subscription_profile_display(item or {"user_id": uid})
+    username = str((item or {}).get("username") or "").strip().lstrip("@")
+    expire = (item or {}).get("expire_date", "")
+    lines = [
+        "SUBSCRIBER DETAILS",
+        "==================",
+        f"Name    {name}",
+        f"ID      {uid}",
+        f"User    {('@' + username) if username else '-'}",
+        f"Status  {(item or {}).get('status', 'unknown')}",
+        f"Expire  {format_subscription_expiry(expire)}",
+        f"Added   {short_dt((item or {}).get('created_at')) if (item or {}).get('created_at') else 'N/A'}",
+        f"Updated {short_dt((item or {}).get('updated_at')) if (item or {}).get('updated_at') else 'N/A'}",
+        "",
+        "Actions below affect this subscriber only.",
+    ]
+    return format_dashboard_pre(lines, footer="")
+
+
+def subscriber_detail_keyboard(uid):
+    uid = str(uid)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Remove", callback_data=f"rmsub_{uid}"),
+                InlineKeyboardButton("Ban", callback_data=f"subban_{uid}"),
+            ],
+            [InlineKeyboardButton("Back to Subs", callback_data="menu_subs")],
+        ]
+    )
+
+
+async def render_subscribers_dashboard(message, page=0, note=""):
+    text = await get_subscribers_dashboard_text_live(page=page, note=note)
+    await safe_edit(message, text, reply_markup=subscribers_dashboard_keyboard(page), parse_mode=ParseMode.HTML)
+
+
+def members_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Remove Member", callback_data="act_remmember")],
+            [InlineKeyboardButton("Back", callback_data="menu_subs")],
+        ]
+    )
+
+
+def sync_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Check Sources", callback_data="act_check_channels"),
+                InlineKeyboardButton("Issues", callback_data="menu_channel_issues"),
+            ],
+            [
+                InlineKeyboardButton("Refresh", callback_data="menu_sync"),
+                InlineKeyboardButton("Back", callback_data="menu_main"),
+            ],
+        ]
+    )
+
+
+def clean_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Index + Remove Duplicates", callback_data="act_target_index_clean")],
+            [InlineKeyboardButton("Deep Clean", callback_data="act_deepclean")],
+            [InlineKeyboardButton("Remove GIFs", callback_data="act_remove_gifs")],
+            [InlineKeyboardButton("Back", callback_data="menu_main")],
+        ]
+    )
+
+
+def cancel_keyboard(back="menu_main"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Cancel Action", callback_data=back)]])
+
+
+def subscription_duration_keyboard(uid):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("7 Days", callback_data=f"sub_{uid}_7"), InlineKeyboardButton("15 Days", callback_data=f"sub_{uid}_15")],
+            [InlineKeyboardButton("1 Month", callback_data=f"sub_{uid}_30"), InlineKeyboardButton("3 Months", callback_data=f"sub_{uid}_90")],
+            [InlineKeyboardButton("1 Year", callback_data=f"sub_{uid}_365"), InlineKeyboardButton("Lifetime", callback_data=f"sub_{uid}_999")],
+            [InlineKeyboardButton("Cancel", callback_data="menu_subs")],
+        ]
+    )
+
+
+def ban_duration_keyboard(uid):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("1 Day", callback_data=f"ban_{uid}_1"), InlineKeyboardButton("7 Days", callback_data=f"ban_{uid}_7")],
+            [InlineKeyboardButton("1 Month", callback_data=f"ban_{uid}_30"), InlineKeyboardButton("Permanent", callback_data=f"ban_{uid}_999")],
+            [InlineKeyboardButton("Cancel", callback_data="menu_subs")],
+        ]
+    )
+
+
+def confirm_remove_subscription_keyboard(uid):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Remove", callback_data=f"rmsub_{uid}")],
+            [InlineKeyboardButton("Cancel", callback_data="menu_subs")],
+        ]
+    )
+
+
+def confirm_remove_member_keyboard(uid):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Remove Member", callback_data=f"kick_{uid}")],
+            [InlineKeyboardButton("Cancel", callback_data="menu_subs")],
+        ]
+    )
+
+
+async def public_keyboard(user=None):
+    rows = []
+    subscribed = await run_blocking("control", get_user_subscription, user.id) if user else None
+    if user and subscribed:
+        join_link = await get_target_join_link()
+        if isinstance(join_link, str) and join_link.startswith("http"):
+            rows.append([InlineKeyboardButton("Join Channel", url=join_link)])
+    rows.append([InlineKeyboardButton("Refresh", callback_data="pub_refresh")])
+    rows.append([InlineKeyboardButton("Contact Admin", callback_data="pub_contact")])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_expiry_parts(sub_end):
+    if not sub_end:
+        return "N/A", "N/A"
+    dt = parse_display_datetime(sub_end)
+    return format_display_date(dt), format_display_time(dt)
+
+
+async def get_target_join_link():
+    if TARGET_JOIN_LINK:
+        return TARGET_JOIN_LINK
+    if JOIN_LINK_CACHE["link"] and time.time() - JOIN_LINK_CACHE["time"] < 600:
+        return JOIN_LINK_CACHE["link"]
+    try:
+        link = await telegram_gateway_await('app.export_chat_invite_link', lambda: app.export_chat_invite_link(TARGET_CHAT_ID))
+        if link:
+            JOIN_LINK_CACHE["link"] = link
+            JOIN_LINK_CACHE["time"] = time.time()
+            return link
+    except Exception:
+        pass
+    try:
+        invite = await telegram_gateway_await('app.create_chat_invite_link', lambda: app.create_chat_invite_link(TARGET_CHAT_ID, name=f"royells_sub_{int(time.time())}"))
+        link = invite.invite_link
+        JOIN_LINK_CACHE["link"] = link
+        JOIN_LINK_CACHE["time"] = time.time()
+        return link
+    except Exception as e:
+        log_event(f"Invite link create/export failed: {e}")
+        return "Join link unavailable. Please contact admin."
+
+
+async def get_public_menu_text(user):
+    sub_end = await run_blocking("control", get_user_subscription, user.id)
+    status = "ACTIVE" if sub_end else "EXPIRED"
+    expiry_date, expiry_time = format_expiry_parts(sub_end)
+    remaining = "Renewal required"
+    if sub_end:
+        try:
+            delta = parse_display_datetime(sub_end) - datetime.now()
+            total_hours = max(0, int(delta.total_seconds() // 3600))
+            remaining = f"{total_hours // 24}d {total_hours % 24}h"
+        except Exception:
+            remaining = "Active"
+    lines = [
+        "ROYELLS MEMBER PORTAL",
+        "=====================",
+        f"Account  {(user.first_name or 'Member')[:28]}",
+        f"User ID  {user.id}",
+        f"Access   {status}",
+        f"Remaining {remaining}",
+        f"Expires  {expiry_date} • {expiry_time}",
+        "",
+        "Secure Telegram access • Instant status refresh",
+    ]
+    return format_dashboard_pre(lines, footer="Use buttons below:")
+
+
+async def fetch_members_with_client(client, label):
+    members = []
+    async for m in client.get_chat_members(TARGET_CHAT_ID):
+        if not m.user.is_bot:
+            members.append(m.user)
+        if len(members) >= max(1, MEMBER_FETCH_LIMIT):
+            break
+        await asyncio.sleep(0)
+    return members
+
+
+async def refresh_members_cache():
+    last_error = None
+    for client, label in [(userbot, "userbot"), (app, "bot")]:
+        try:
+            members = await asyncio.wait_for(fetch_members_with_client(client, label), timeout=max(10, MEMBER_FETCH_TIMEOUT_SECONDS))
+            MEMBERS_CACHE["data"] = members
+            MEMBERS_CACHE["time"] = time.time()
+            MEMBERS_CACHE["error"] = ""
+            return members, ""
+        except Exception as e:
+            last_error = e
+            if should_reconnect_telegram_error(e):
+                schedule_userbot_reconnect(f"member fetch {label}: {e}")
+            log_event(f"Member fetch via {label} failed: {e}")
+    MEMBERS_CACHE["error"] = str(last_error)[:180] if last_error else "unknown member fetch error"
+    return MEMBERS_CACHE["data"], MEMBERS_CACHE["error"]
+
+
+async def get_cached_members(force=False):
+    if force or time.time() - MEMBERS_CACHE["time"] > 300:
+        members, _ = await refresh_members_cache()
+        return members
+    return MEMBERS_CACHE["data"]
+
+
+def subscription_member_fallback_items():
+    rebuild_subscription_lists()
+    with state_mutex:
+        active = list(STATE["subscriptions_list"].get("active", {}).items())
+    items = []
+    for uid, item in active:
+        label = subscription_profile_display(item)
+        items.append((str(uid), str(label)))
+    return items
+
+
+def member_button_label(label, uid):
+    label = (label or "Unknown").strip() or "Unknown"
+    return f"{label[:20]} | {uid}"[:58]
+
+
+async def build_member_keyboard(action, page=0):
+    members = await get_cached_members()
+    items = [(str(u.id), (u.first_name or u.username or "Unknown User")) for u in members]
+    if not items:
+        items = subscription_member_fallback_items()
+    items_per_page = 8
+    total_pages = max(1, (len(items) + items_per_page - 1) // items_per_page)
+    page = max(0, min(page, total_pages - 1))
+    page_items = items[page * items_per_page : (page + 1) * items_per_page]
+
+    kb = [[InlineKeyboardButton(member_button_label(label, uid), callback_data=f"sel_{action}_{uid}")] for uid, label in page_items]
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("Prev", callback_data=f"page_{action}_{page-1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next", callback_data=f"page_{action}_{page+1}"))
+    if nav_row:
+        kb.append(nav_row)
+    kb.append([InlineKeyboardButton("Enter ID Manually", callback_data=f"manual_{action}")])
+    kb.append([InlineKeyboardButton("Back to Menu", callback_data="menu_subs")])
+    return InlineKeyboardMarkup(kb), len(items), page + 1, total_pages
+
+
+def build_subscription_keyboard(action, page=0):
+    rebuild_subscription_lists()
+    with state_mutex:
+        active = list(STATE["subscriptions_list"].get("active", {}).items())
+    items_per_page = 8
+    total_pages = max(1, (len(active) + items_per_page - 1) // items_per_page)
+    page = max(0, min(page, total_pages - 1))
+    page_items = active[page * items_per_page : (page + 1) * items_per_page]
+    kb = []
+    for uid, item in page_items:
+        label = subscription_profile_display(item)
+        kb.append([InlineKeyboardButton(f"{label[:22]} | {uid}", callback_data=f"selsub_{action}_{uid}")])
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("Prev", callback_data=f"subpage_{action}_{page-1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next", callback_data=f"subpage_{action}_{page+1}"))
+    if nav_row:
+        kb.append(nav_row)
+    kb.append([InlineKeyboardButton("Enter ID Manually", callback_data=f"manual_{action}")])
+    kb.append([InlineKeyboardButton("Back to Menu", callback_data="menu_subs")])
+    return InlineKeyboardMarkup(kb), len(active), page + 1, total_pages
+
+
+def format_subscription_list(limit=60):
+    rebuild_subscription_lists()
+    with state_mutex:
+        active = STATE["subscriptions_list"].get("active", {})
+        expired = STATE["subscriptions_list"].get("expired", {})
+        banned = STATE["subscriptions_list"].get("banned", {})
+        removed = STATE["subscriptions_list"].get("removed", {})
+    lines = [
+        "SUBSCRIPTIONS",
+        "-------------",
+        f"Active  : {len(active)}",
+        f"Expired : {len(expired)}",
+        f"Banned  : {len(banned)}",
+        f"Removed : {len(removed)}",
+        "",
+    ]
+    for uid, item in list(active.items())[:limit]:
+        name = subscription_profile_display(item)
+        expire_text = format_subscription_expiry(item.get("expire_date"))
+        lines.append(f"{uid} | {name[:42]} | {expire_text}")
+    if len(active) > limit:
+        lines.append(f"...and {len(active) - limit} more active")
+    return "\n".join(lines)[:3900]
+
+
+async def format_subscription_list_live(limit=60):
+    rebuild_subscription_lists()
+    with state_mutex:
+        active_items = list(STATE["subscriptions_list"].get("active", {}).items())
+    if active_items:
+        await refresh_subscription_profiles_for_items(active_items[:limit], force=False)
+    return format_subscription_list(limit=limit)
+
+
+async def format_member_list(limit=80):
+    members, err = await refresh_members_cache()
+    items = [(str(user.id), (user.first_name or user.username or "Unknown").strip()) for user in members]
+    source = "Telegram channel"
+    if not items:
+        items = subscription_member_fallback_items()
+        source = "subscriptions fallback"
+    lines = ["TARGET MEMBERS", "--------------", f"Loaded: {len(items)}", f"Source: {source}"]
+    if err:
+        lines.append(f"Fetch note: {err[:80]}")
+    lines.append("")
+    for idx, (uid, name) in enumerate(items[:limit], 1):
+        lines.append(f"{idx}. {name[:24]} | {uid}")
+    if len(items) > limit:
+        lines.append(f"...and {len(items) - limit} more")
+    if not items:
+        lines.append("No cached members or active subscriptions found.")
+    return "\n".join(lines)[:3900]
+
+
+async def fetch_messages_from_meta(metas):
+    result = []
+    for meta in metas:
+        chat_id = meta.get("chat_id")
+        msg_id = meta.get("message_id")
+        if chat_id is None or msg_id is None:
+            continue
+        try:
+            source_peer = await resolve_source_peer_for_access(chat_id, "recovery")
+            msg = await tg_call("recovery get_messages", userbot.get_messages, source_peer, int(msg_id))
+            if msg and not msg.empty and is_valid_media(msg):
+                result.append(msg)
+        except Exception as e:
+            if is_peer_id_error(e):
+                with contextlib.suppress(Exception):
+                    source_peer = await resolve_source_peer_for_access(chat_id, "recovery_retry", force_refresh=True)
+                    msg = await tg_call("recovery retry get_messages", userbot.get_messages, source_peer, int(msg_id), retries=1)
+                    if msg and not msg.empty and is_valid_media(msg):
+                        result.append(msg)
+                        continue
+            log_event(f"Recovery fetch failed for {chat_id}/{msg_id}: {e}")
+    return result
+
+
+def recovery_record_media_uids(record):
+    return [
+        str(meta.get("media_uid") or "")
+        for meta in record.get("messages", [])
+        if isinstance(meta, dict) and meta.get("media_uid")
+    ]
+
+
+def recovery_record_is_complete(record):
+    uids = recovery_record_media_uids(record)
+    return bool(uids) and all(known_duplicate_uid(uid) for uid in uids)
+
+
+def update_persisted_queue_status(state_name, job_id, status, error=""):
+    with state_mutex:
+        item = STATE[state_name].setdefault("items", {}).get(job_id)
+        if not item:
+            return False
+        item["status"] = status
+        item["last_error"] = str(error)[:500] if error else ""
+        item["updated_at"] = now_iso()
+        save_state(state_name)
+    refresh_persisted_queue_reservation(job_id)
+    return True
+
+
+async def recover_queue_state():
+    if queue_recovery_lock.locked():
+        log_event("Queue recovery already running; duplicate invocation skipped.")
+        return {
+            "busy": True,
+            "recovered": 0,
+            "deferred": len(persisted_recovery_pending_job_ids()),
+            "duplicates": 0,
+            "pending": len(persisted_recovery_pending_job_ids()),
+        }
+    async with queue_recovery_lock:
+        await wait_while_session_invalid("queue recovery")
+        recovered = 0
+        deferred = 0
+        skipped_duplicates = 0
+        stuck_statuses = QUEUE_STUCK_STATUSES
+        live_ids = live_pipeline_job_ids()
+
+        with state_mutex:
+            upload_records = deepcopy(STATE["upload_queue"].get("items", {}))
+            download_records = deepcopy(STATE["download_queue"].get("items", {}))
+
+        upload_stuck_ids = {
+            str(job_id)
+            for job_id, rec in upload_records.items()
+            if rec.get("status") in stuck_statuses
+        }
+
+        for job_id, rec in upload_records.items():
+            job_id = str(job_id)
+            if rec.get("status") not in stuck_statuses:
+                continue
+            if job_id in live_ids:
+                continue
+            if recovery_record_is_complete(rec):
+                update_persisted_queue_status("upload_queue", job_id, "skipped_duplicate")
+                update_persisted_queue_status("download_queue", job_id, "skipped_duplicate")
+                skipped_duplicates += 1
+                continue
+            if recovery_record_blocked_by_other_job(job_id, rec):
+                deferred += 1
+                continue
+            if (
+                recovered >= QUEUE_RECOVERY_BATCH_LIMIT
+                or local_media_pressure() >= QUEUE_RECOVERY_PRESSURE_TARGET
+            ):
+                deferred += 1
+                continue
+
+            files = rec.get("files", [])
+            messages = await fetch_messages_from_meta(rec.get("messages", []))
+            if not messages:
+                update_persisted_queue_status(
+                    "upload_queue",
+                    job_id,
+                    "failed",
+                    "source message missing during recovery",
+                )
+                continue
+            for message in messages:
+                add_processing_keys(message.chat.id, message)
+
+            admitted = False
+            if files and all(os.path.exists(path) and os.path.getsize(path) > 0 for path in files):
+                for path in files:
+                    track_download_file(path)
+                job = {
+                    "job_id": job_id,
+                    "post_uid": rec.get("post_uid", job_id),
+                    "type": rec.get("type", "single"),
+                    "messages": messages,
+                    "files": files,
+                    "ch_name": rec.get("ch_name", ""),
+                    "attempt": 1,
+                    "is_fallback": rec.get("is_fallback", False),
+                    "source": rec.get("source", "recovery"),
+                    "sync_run_id": rec.get("sync_run_id"),
+                    "force_upload": bool(rec.get("force_upload")),
+                    "manual_link_url": rec.get("manual_link_url", ""),
+                    "status_chat_id": rec.get("status_chat_id", 0),
+                    "status_message_id": rec.get("status_message_id", 0),
+                }
+                if not upload_queue.full() and local_media_pressure() < QUEUE_RECOVERY_PRESSURE_TARGET:
+                    record_upload_job(job, "queued_recovered")
+                    stamp_queue_job(job, "upload")
+                    upload_queue.put_nowait(job)
+                    admitted = True
+                elif schedule_queue_retry("upload", job, 5, "staged recovery backpressure"):
+                    record_upload_job(job, "retry", "staged recovery backpressure")
+                    admitted = True
+            else:
+                admitted = await enqueue_media_job(
+                    rec.get("type", "single"),
+                    messages,
+                    rec.get("ch_name", ""),
+                    attempt=1,
+                    is_fallback=rec.get("is_fallback", False),
+                    source=rec.get("source", "recovery"),
+                    sync_run_id=rec.get("sync_run_id"),
+                    force_upload=bool(rec.get("force_upload")),
+                    manual_link_url=rec.get("manual_link_url", ""),
+                    status_chat_id=rec.get("status_chat_id", 0),
+                    status_message_id=rec.get("status_message_id", 0),
+                    reservation_owner=job_id,
+                    recovery_job_id=job_id,
+                )
+            if admitted:
+                recovered += 1
+            else:
+                if recovery_record_is_complete(rec):
+                    update_persisted_queue_status("upload_queue", job_id, "skipped_duplicate")
+                    update_persisted_queue_status("download_queue", job_id, "skipped_duplicate")
+                    skipped_duplicates += 1
+                else:
+                    for message in messages:
+                        remove_processing_keys(message.chat.id, message)
+                    deferred += 1
+            if QUEUE_RECOVERY_ITEM_DELAY_SECONDS:
+                await asyncio.sleep(QUEUE_RECOVERY_ITEM_DELAY_SECONDS)
+
+        for job_id, rec in download_records.items():
+            job_id = str(job_id)
+            if job_id in upload_stuck_ids or rec.get("status") not in stuck_statuses:
+                continue
+            if job_id in live_ids:
+                continue
+            if recovery_record_is_complete(rec):
+                update_persisted_queue_status("download_queue", job_id, "skipped_duplicate")
+                skipped_duplicates += 1
+                continue
+            if recovery_record_blocked_by_other_job(job_id, rec):
+                deferred += 1
+                continue
+            if (
+                recovered >= QUEUE_RECOVERY_BATCH_LIMIT
+                or local_media_pressure() >= QUEUE_RECOVERY_PRESSURE_TARGET
+            ):
+                deferred += 1
+                continue
+
+            messages = await fetch_messages_from_meta(rec.get("messages", []))
+            if not messages:
+                update_persisted_queue_status(
+                    "download_queue",
+                    job_id,
+                    "failed",
+                    "source message missing during recovery",
+                )
+                continue
+            for message in messages:
+                add_processing_keys(message.chat.id, message)
+            admitted = await enqueue_media_job(
+                rec.get("type", "single"),
+                messages,
+                rec.get("ch_name", ""),
+                attempt=1,
+                is_fallback=rec.get("is_fallback", False),
+                source=rec.get("source", "recovery"),
+                sync_run_id=rec.get("sync_run_id"),
+                force_upload=bool(rec.get("force_upload")),
+                manual_link_url=rec.get("manual_link_url", ""),
+                status_chat_id=rec.get("status_chat_id", 0),
+                status_message_id=rec.get("status_message_id", 0),
+                reservation_owner=job_id,
+                recovery_job_id=job_id,
+                partial_download_files=rec.get("partial_download_files", []),
+                partial_download_message_metas=rec.get("partial_download_messages", []),
+            )
+            if admitted:
+                recovered += 1
+            else:
+                if recovery_record_is_complete(rec):
+                    update_persisted_queue_status("download_queue", job_id, "skipped_duplicate")
+                    skipped_duplicates += 1
+                else:
+                    deferred += 1
+            if QUEUE_RECOVERY_ITEM_DELAY_SECONDS:
+                await asyncio.sleep(QUEUE_RECOVERY_ITEM_DELAY_SECONDS)
+
+        pending = len(persisted_recovery_pending_job_ids())
+        if recovered or skipped_duplicates or deferred or pending:
+            log_event(
+                f"Queue recovery staged: admitted={recovered}, duplicate={skipped_duplicates}, "
+                f"deferred={deferred}, pending={pending}, batch_limit={QUEUE_RECOVERY_BATCH_LIMIT}, "
+                f"pressure_target={QUEUE_RECOVERY_PRESSURE_TARGET}."
+            )
+            if recovered:
+                with contextlib.suppress(Exception):
+                    await telegram_gateway_await(
+                        "app.send_message",
+                        lambda: app.send_message(
+                            OWNER_ID,
+                            f"Recovered {recovered} unfinished bot jobs after restart. "
+                            f"Deferred {deferred} for pressure-safe later recovery.",
+                        ),
+                    )
+        else:
+            log_event("No unfinished queue jobs found.")
+        return {
+            "busy": False,
+            "recovered": recovered,
+            "deferred": deferred,
+            "duplicates": skipped_duplicates,
+            "pending": pending,
+        }
+
+
+async def channel_download_worker_loop(worker_id):
+    while True:
+        await wait_while_session_invalid(f"DL W{worker_id}")
+        job = await channel_download_queue.get()
+        observe_queue_wait(job, "download")
+        worker_name = f"DL W{worker_id}"
+        mark_worker_job(worker_name, job)
+        attempt = job.get("attempt", 1)
+        max_attempts = SOURCE_JOB_MAX_RETRIES if pressure_managed_source(job.get("source", "")) else MAX_RETRIES
+        job_type = job["type"]
+        messages = job["messages"]
+        ch_name = job["ch_name"]
+        files_to_cleanup = []
+        should_cleanup_on_fail = False
+
+        try:
+            record_download_job(job, "downloading")
+            record_total_job(job, "downloading")
+            log_event(f"[DL W{worker_id}] Downloading {job_type} from {ch_name} attempt {attempt}")
+            await update_manual_link_status(
+                job,
+                f"Telegram media downloading...\nAttempt: {attempt}\nSource: {ch_name}",
+            )
+            await run_blocking("media", cleanup_download_dir_if_needed)
+            if shutil.disk_usage(str(RUNTIME_DIR)).free < max(1, MIN_FREE_STORAGE_MB) * 1024 * 1024:
+                raise Exception(f"low runtime storage: less than {MIN_FREE_STORAGE_MB} MB free")
+            downloaded_files = []
+            downloaded_messages = []
+            zero_byte_terminal_messages = []
+            duplicate_skipped = 0
+
+            for idx, original_msg in enumerate(messages):
+                await asyncio.sleep(0)
+                m = original_msg
+                try:
+                    fresh_m = await tg_call("download refresh message", userbot.get_messages, m.chat.id, m.id)
+                    if fresh_m and not fresh_m.empty:
+                        m = fresh_m
+                        messages[idx] = fresh_m
+                except Exception:
+                    pass
+
+                if not job.get("force_upload") and await known_duplicate_uid_async(get_media_uid(m)):
+                    remove_processing_keys(m.chat.id, m)
+                    duplicate_skipped += 1
+                    continue
+
+                resumed_fp = partial_download_file_for_message(job, m)
+                if resumed_fp:
+                    track_download_file(resumed_fp)
+                    if resumed_fp not in files_to_cleanup:
+                        files_to_cleanup.append(resumed_fp)
+                    downloaded_files.append(resumed_fp)
+                    downloaded_messages.append(m)
+                    log_event(
+                        f"[DL W{worker_id}] Resumed partial download for "
+                        f"{source_message_key(m)} from checkpoint."
+                    )
+                    continue
+
+                ext = ".mp4" if m.video else ".jpg"
+                safe_path = DOWNLOAD_DIR / f"{job['job_id']}_{idx}_{uuid.uuid4().hex[:8]}{ext}"
+                safe_path_text = str(safe_path)
+                temp_path_text = f"{safe_path_text}.temp"
+                track_download_file(safe_path_text)
+                track_download_file(temp_path_text)
+                files_to_cleanup.extend([safe_path_text, temp_path_text])
+                fp = None
+                for item_attempt in range(1, ZERO_BYTE_ITEM_MAX_RETRIES + 1):
+                    cleanup(fp, safe_path_text, temp_path_text)
+                    if item_attempt > 1:
+                        try:
+                            fresh_m = await tg_call(
+                                "zero-byte refresh message",
+                                userbot.get_messages,
+                                m.chat.id,
+                                m.id,
+                                retries=1,
+                            )
+                            if fresh_m and not fresh_m.empty:
+                                m = fresh_m
+                                messages[idx] = fresh_m
+                        except Exception:
+                            pass
+                    fp = await asyncio.wait_for(
+                        tg_call(
+                            "download media",
+                            userbot.download_media,
+                            m,
+                            file_name=safe_path_text,
+                            retries=TELEGRAM_CALL_RETRIES,
+                            _timeout_seconds=DOWNLOAD_MEDIA_TIMEOUT_SECONDS,
+                        ),
+                        timeout=max(60, DOWNLOAD_MEDIA_TIMEOUT_SECONDS),
+                    )
+                    if fp and os.path.exists(fp) and os.path.getsize(fp) > 1024:
+                        break
+                    cleanup(fp, safe_path_text, temp_path_text)
+                    fp = None
+                    chat_id_str = str(m.chat.id).replace("-100", "")
+                    msg_link = (
+                        f"https://t.me/{m.chat.username}/{m.id}"
+                        if m.chat.username
+                        else f"https://t.me/c/{chat_id_str}/{m.id}"
+                    )
+                    log_event(
+                        f"0-byte media detected ({item_attempt}/{ZERO_BYTE_ITEM_MAX_RETRIES}); "
+                        f"retrying source item: {msg_link}"
+                    )
+                    if item_attempt < ZERO_BYTE_ITEM_MAX_RETRIES:
+                        await asyncio.sleep(min(30, ZERO_BYTE_RETRY_SECONDS * item_attempt))
+
+                if fp and os.path.exists(fp) and os.path.getsize(fp) > 1024:
+                    track_download_file(fp)
+                    cleanup(temp_path_text)
+                    untrack_download_files([temp_path_text])
+                    if str(Path(fp).resolve()) != str(Path(safe_path_text).resolve()):
+                        untrack_download_files([safe_path_text])
+                    downloaded_files.append(fp)
+                    downloaded_messages.append(m)
+                    files_to_cleanup.append(fp)
+                    if remember_partial_download(job, m, fp):
+                        record_download_job(job, "downloading_partial", files=downloaded_files)
+                    continue
+
+                chat_id_str = str(m.chat.id).replace("-100", "")
+                msg_link = f"https://t.me/{m.chat.username}/{m.id}" if m.chat.username else f"https://t.me/c/{chat_id_str}/{m.id}"
+                terminal_error = RuntimeError(
+                    f"0-byte media terminal after {ZERO_BYTE_ITEM_MAX_RETRIES} item attempts"
+                )
+                remember_dead_media([m], terminal_error, force_dead=True)
+                source_brain_record_messages([m], "dead", amount=1, title=ch_name, reason=terminal_error)
+                remove_processing_keys(m.chat.id, m)
+                zero_byte_terminal_messages.append(m)
+                log_event(f"0-byte media quarantined after bounded item retries: {msg_link}")
+
+            if not downloaded_files:
+                if duplicate_skipped and not zero_byte_terminal_messages:
+                    record_download_job(job, "skipped_duplicate")
+                    record_total_job(job, "skipped_duplicate")
+                    record_sync_item(job, "skipped_duplicate")
+                else:
+                    reason = (
+                        f"all {len(zero_byte_terminal_messages)} media item(s) failed bounded "
+                        "zero-byte validation"
+                    )
+                    record_download_job(job, "skipped_dead_media", reason)
+                    record_total_job(job, "skipped_dead_media", reason)
+                    record_sync_item(job, "skipped_dead_media", reason)
+                should_cleanup_on_fail = True
+                continue
+
+            kept_messages = []
+            kept_files = []
+            skipped_filter = []
+            for m, fp in zip(downloaded_messages, downloaded_files):
+                if is_manual_telegram_link_job(job) and TELEGRAM_LINK_BYPASS_CONTENT_FILTER:
+                    kept_messages.append(m)
+                    kept_files.append(fp)
+                    continue
+                media_type = get_media_kind(m)
+                skip_media, match_info = await content_filter_should_skip_file(fp, media_type)
+                if skip_media:
+                    sample = match_info.get("sample", {})
+                    skipped_filter.append(
+                        f"{get_media_uid(m) or m.id} -> sample #{sample.get('id')} distance {sample.get('distance')}"
+                    )
+                    remember_dead_media([m], RuntimeError("skipped_content_filter"), force_dead=True)
+                    remove_processing_keys(m.chat.id, m)
+                    untrack_download_files([fp])
+                    cleanup(fp)
+                    continue
+                kept_messages.append(m)
+                kept_files.append(fp)
+
+            if skipped_filter:
+                log_event(f"Content filter skipped {len(skipped_filter)} item(s) from {ch_name}: {', '.join(skipped_filter[:3])}")
+
+            if not kept_files:
+                record_download_job(job, "skipped_content_filter")
+                record_total_job(job, "skipped_content_filter")
+                record_sync_item(job, "skipped_content_filter")
+                source_brain_record_messages(downloaded_messages, "filtered", amount=len(downloaded_messages), title=ch_name)
+                should_cleanup_on_fail = True
+                continue
+
+            downloaded_messages = kept_messages
+            downloaded_files = kept_files
+            if job_type == "album" and len(downloaded_messages) < 2:
+                job_type = "single"
+                job["type"] = "single"
+
+            job["messages"] = downloaded_messages
+            upload_job = {**job, "files": downloaded_files, "attempt": 1}
+            record_download_job(job, "downloaded", files=downloaded_files)
+            record_upload_job(upload_job, "queued_upload")
+            record_total_job(job, "queued_upload")
+            await update_manual_link_status(
+                job,
+                f"Telegram media downloaded.\nUploading to target...\nItems: {len(downloaded_files)}",
+            )
+            capacity_ready = await wait_for_local_media_capacity(job.get("source", "auto"))
+            if capacity_ready and not upload_queue.full():
+                stamp_queue_job(upload_job, "upload")
+                upload_queue.put_nowait(upload_job)
+            else:
+                scheduled = schedule_queue_retry("upload", upload_job, 2, "download-to-upload backpressure")
+                if not scheduled:
+                    raise RuntimeError("upload retry admission full after download")
+
+        except FloodWait as e:
+            await asyncio.sleep(flood_wait_delay(e.value))
+            if attempt < max_attempts:
+                job["attempt"] = attempt + 1
+                record_download_job(job, "retry", e)
+                await update_manual_link_status(job, f"Download flood wait handled. Retrying...\nAttempt: {attempt + 1}/{max_attempts}")
+                scheduled = schedule_queue_retry("download", job, 0, e)
+                should_cleanup_on_fail = True
+                if not scheduled:
+                    record_download_job(job, "retry_admission_failed", e)
+            else:
+                if schedule_source_job_retry_later(job, e):
+                    should_cleanup_on_fail = True
+                else:
+                    err_msg = format_exception_for_log(e)
+                    record_download_job(job, "failed", e)
+                    record_total_job(job, "failed", e)
+                    record_sync_item(job, "failed", e)
+                    await update_manual_link_status(job, f"Download failed after retries:\n{err_msg[:500]}")
+                    for m in messages:
+                        remove_processing_keys(m.chat.id, m)
+                    should_cleanup_on_fail = True
+        except Exception as e:
+            err_text = str(e)
+            err_msg = format_exception_for_log(e)
+            if should_skip_dead_media_now(e, attempt):
+                record_download_job(job, "skipped_dead_media", e)
+                record_total_job(job, "skipped_dead_media", e)
+                record_sync_item(job, "skipped_dead_media", e)
+                remember_dead_media(messages, e, force_dead=True)
+                source_brain_record_messages(messages, "dead", amount=len(messages), title=ch_name, reason=e)
+                for m in messages:
+                    remove_processing_keys(m.chat.id, m)
+                log_event(f"[DL W{worker_id}] Permanent dead-media skip after attempt {attempt}: {err_msg}")
+                should_cleanup_on_fail = True
+                continue
+            channel_status = classify_channel_error(e)
+            if channel_status and messages:
+                source_msg = messages[0]
+                access_result = await handle_source_access_error(
+                    source_msg.chat.id,
+                    e,
+                    title=getattr(source_msg.chat, "title", "") or ch_name,
+                    status=channel_status,
+                    context="download",
+                )
+                if access_result == "expired_or_deleted":
+                    record_download_job(job, "skipped_source_retired", e)
+                    record_total_job(job, "skipped_source_retired", e)
+                    record_sync_item(job, "skipped_source_retired", e)
+                    for m in messages:
+                        remove_processing_keys(m.chat.id, m)
+                    should_cleanup_on_fail = True
+                    continue
+                if schedule_source_job_retry_later(job, e):
+                    should_cleanup_on_fail = True
+                    continue
+                record_download_job(job, "failed", e)
+                record_total_job(job, "failed", e)
+                record_sync_item(job, "failed", e)
+                remember_dead_media(messages, e)
+                await update_manual_link_status(job, f"Download failed:\n{err_msg[:500]}")
+                for m in messages:
+                    remove_processing_keys(m.chat.id, m)
+                should_cleanup_on_fail = True
+                continue
+            if "sent to fallback" not in err_text:
+                log_event(f"[DL ERROR W{worker_id}] {err_msg}")
+                if attempt < max_attempts and not job.get("is_fallback"):
+                    await asyncio.sleep(5)
+                    job["attempt"] = attempt + 1
+                    record_download_job(job, "retry", e)
+                    await update_manual_link_status(job, f"Download retry scheduled...\nAttempt: {attempt + 1}/{max_attempts}\nReason: {err_msg[:240]}")
+                    scheduled = schedule_queue_retry("download", job, 5, e)
+                    should_cleanup_on_fail = True
+                    if not scheduled:
+                        record_download_job(job, "retry_admission_failed", e)
+                else:
+                    offloaded = await offload_source_media_job_to_worker(job, e)
+                    if not offloaded and schedule_source_job_retry_later(job, e):
+                        should_cleanup_on_fail = True
+                        continue
+                    fallback_status = "worker_fallback_queued" if offloaded else "failed"
+                    record_download_job(job, fallback_status, e)
+                    record_total_job(job, fallback_status, e)
+                    record_sync_item(job, fallback_status, e)
+                    if not offloaded:
+                        remember_dead_media(messages, e)
+                        await update_manual_link_status(job, f"Download failed:\n{err_msg[:500]}")
+                    for m in messages:
+                        remove_processing_keys(m.chat.id, m)
+                    should_cleanup_on_fail = True
+            else:
+                record_download_job(job, "fallback_queued", e)
+                for m in messages:
+                    remove_processing_keys(m.chat.id, m)
+                should_cleanup_on_fail = True
+        finally:
+            if SHUTDOWN_REQUESTED:
+                should_cleanup_on_fail = False
+            if should_cleanup_on_fail:
+                untrack_download_files(files_to_cleanup)
+                cleanup(*files_to_cleanup)
+            channel_download_queue.task_done()
+            clear_worker_job(worker_name)
+
+
+async def upload_worker_loop(worker_id):
+    global auto_count
+    while True:
+        job = await upload_queue.get()
+        observe_queue_wait(job, "upload")
+        worker_name = f"UP W{worker_id}"
+        mark_worker_job(worker_name, job)
+        attempt = job.get("attempt", 1)
+        max_attempts = SOURCE_JOB_MAX_RETRIES if pressure_managed_source(job.get("source", "")) else MAX_RETRIES
+        job_type = job["type"]
+        messages = job["messages"]
+        files = job["files"]
+        ch_name = job["ch_name"]
+        original_files = set(files)
+        generated_files = set()
+        should_cleanup = True
+
+        try:
+            record_upload_job(job, "uploading")
+            record_total_job(job, "uploading")
+            log_event(f"[UP W{worker_id}] Uploading {job_type} for {ch_name} attempt {attempt}")
+            await update_manual_link_status(
+                job,
+                f"Telegram media uploading...\nAttempt: {attempt}\nItems: {len(files)}",
+            )
+
+            if job.get("force_upload"):
+                kept = [(m, f) for m, f in zip(messages, files)]
+            else:
+                kept = []
+                for m, f in zip(messages, files):
+                    if not await known_duplicate_uid_async(get_media_uid(m)):
+                        kept.append((m, f))
+                    await asyncio.sleep(0)
+            if not kept:
+                record_upload_job(job, "skipped_duplicate")
+                record_total_job(job, "skipped_duplicate")
+                record_sync_item(job, "skipped_duplicate")
+                source_brain_record_messages(messages, "duplicate", amount=len(messages), title=ch_name)
+                for m in messages:
+                    remove_processing_keys(m.chat.id, m)
+                await update_manual_link_status(
+                    job,
+                    "Already uploaded or duplicate media. Skipped.\nTip: set ROYELLS_TELEGRAM_LINK_FORCE_UPLOAD=1 to force manual link repost.",
+                )
+                continue
+
+            messages = [x[0] for x in kept]
+            files = [x[1] for x in kept]
+            if job_type == "album" and len(messages) < 2:
+                job_type = "single"
+                log_event(
+                    f"[UP W{worker_id}] Album for {ch_name} has one non-duplicate item after "
+                    "recheck; using terminal single-item fallback."
+                )
+            if job_type != "album" and len(messages) == 1:
+                job_type = "single"
+
+            for f in files:
+                if not os.path.exists(f) or os.path.getsize(f) == 0:
+                    raise Exception("file missing or 0 bytes before upload")
+
+            prepared_items, new_generated_files = await asyncio.wait_for(
+                prepare_source_upload_items(messages, files, worker_id, ch_name),
+                timeout=max(60, UPLOAD_PREPARE_TIMEOUT_SECONDS),
+            )
+            generated_files.update(new_generated_files)
+            if not prepared_items:
+                raise Exception("invalid media: no Telegram-ready media after source preparation")
+
+            if job_type == "album" and len(prepared_items) < 2:
+                job_type = "single"
+                log_event(
+                    f"[UP W{worker_id}] Album for {ch_name} left one Telegram-ready item; "
+                    "using terminal single-item fallback."
+                )
+
+            if job_type != "album" and len(prepared_items) == 1:
+                job_type = "single"
+
+            sent_pairs = []
+            persisted_source_ids = set(job.get("_persisted_source_ids", set()))
+            if job_type == "single":
+                m, fp = prepared_items[0]
+                sent_pairs.append((m, await send_prepared_source_single(m, fp, protect_content=True, job=job, ch_name=ch_name, operation="single_upload")))
+            elif job_type == "album":
+                for chunk in split_source_album_chunks(prepared_items):
+                    chunk_pairs = await send_source_album_chunk_resilient(
+                        chunk,
+                        worker_id,
+                        ch_name,
+                        job=job,
+                    )
+                    chunk_pairs = [(m, sent) for m, sent in chunk_pairs if sent]
+                    persisted_source_ids.update(job.get("_persisted_source_ids", set()))
+                    terminal_failures = set(job.get("_album_terminal_failures", set()))
+                    missing_ids = {
+                        f"{m.chat.id}:{m.id}"
+                        for m, _fp in chunk
+                        if f"{m.chat.id}:{m.id}" not in {
+                            f"{sent_message.chat.id}:{sent_message.id}"
+                            for sent_message, _sent in chunk_pairs
+                        }
+                    }
+                    if len(chunk_pairs) != len(chunk) and not missing_ids.issubset(terminal_failures):
+                        raise RuntimeError(
+                            f"grouped album chunk returned {len(chunk_pairs)}/{len(chunk)} successful items"
+                        )
+                    unpersisted_chunk_pairs = [
+                        (m, sent_msg)
+                        for m, sent_msg in chunk_pairs
+                        if f"{m.chat.id}:{m.id}" not in persisted_source_ids
+                    ]
+                    if unpersisted_chunk_pairs:
+                        await mark_posted_many_queued(
+                            [
+                                (m.chat.id, m, ch_name, sent_msg, job["job_id"])
+                                for m, sent_msg in unpersisted_chunk_pairs
+                            ]
+                        )
+                        persisted_source_ids.update(
+                            f"{m.chat.id}:{m.id}" for m, _ in unpersisted_chunk_pairs
+                        )
+                    if missing_ids:
+                        log_event(
+                            f"[UP W{worker_id}] Album fallback completed with "
+                            f"{len(chunk_pairs)}/{len(chunk)} valid item(s) for {ch_name}; "
+                            f"{len(missing_ids)} deterministic invalid item(s) quarantined."
+                        )
+                    sent_pairs.extend(chunk_pairs)
+                    await asyncio.sleep(1)
+
+            sent_source_ids = {f"{m.chat.id}:{m.id}" for m, sent in sent_pairs if sent}
+            for m, _ in prepared_items:
+                if f"{m.chat.id}:{m.id}" not in sent_source_ids:
+                    remove_processing_keys(m.chat.id, m)
+            sent_pairs = [(m, sent) for m, sent in sent_pairs if sent]
+            if not sent_pairs:
+                terminal_failures = set(job.get("_album_terminal_failures", set()))
+                if terminal_failures:
+                    reason = (
+                        f"all {len(terminal_failures)} album item(s) were rejected as "
+                        "deterministic invalid media"
+                    )
+                    record_upload_job(job, "skipped_dead_media", reason)
+                    record_total_job(job, "skipped_dead_media", reason)
+                    record_sync_item(job, "skipped_dead_media", reason)
+                    await update_manual_link_status(job, f"Upload skipped:\n{reason}")
+                    continue
+                raise Exception("invalid media: all prepared media were rejected by Telegram")
+
+            uploaded_messages = [m for m, _ in sent_pairs]
+            files = [fp for _, fp in prepared_items]
+            auto_count += len(uploaded_messages)
+            diagnostic_stats["uploads"] = int(diagnostic_stats.get("uploads") or 0) + len(uploaded_messages)
+            unpersisted_pairs = [
+                (m, sent_msg)
+                for m, sent_msg in sent_pairs
+                if f"{m.chat.id}:{m.id}" not in persisted_source_ids
+            ]
+            if unpersisted_pairs:
+                await mark_posted_many_queued(
+                    [
+                        (m.chat.id, m, ch_name, sent_msg, job["job_id"])
+                        for m, sent_msg in unpersisted_pairs
+                    ]
+                )
+            await complete_delivery_intents_for_job(job["job_id"])
+
+            with state_mutex:
+                STATE["total_auto_upload"]["total_uploaded"] = STATE["total_auto_upload"].get("total_uploaded", 0) + len(uploaded_messages)
+                save_state("total_auto_upload")
+            terminal_failure_count = len(set(job.get("_album_terminal_failures", set())))
+            completion_status = "uploaded_partial" if terminal_failure_count else "uploaded"
+            completion_error = (
+                f"{terminal_failure_count} deterministic invalid album item(s) skipped"
+                if terminal_failure_count
+                else None
+            )
+            record_upload_job(
+                {**job, "messages": uploaded_messages, "files": files, "type": job_type},
+                completion_status,
+                completion_error,
+            )
+            record_download_job(
+                {**job, "messages": uploaded_messages, "type": job_type},
+                completion_status,
+                completion_error,
+                files=files,
+            )
+            record_total_job(
+                {**job, "messages": uploaded_messages, "type": job_type},
+                completion_status,
+                completion_error,
+            )
+            record_sync_item(
+                {**job, "messages": uploaded_messages, "type": job_type},
+                completion_status,
+                completion_error,
+            )
+            source_brain_record_messages(uploaded_messages, "uploaded", amount=len(uploaded_messages), title=ch_name)
+            log_event(
+                f"[UP W{worker_id}] Uploaded successfully ({len(uploaded_messages)} item(s)"
+                + (f", {terminal_failure_count} invalid skipped)" if terminal_failure_count else ")")
+            )
+            await update_manual_link_status(
+                job,
+                f"Telegram media uploaded successfully.\nItems: {len(uploaded_messages)}"
+                + (
+                    f"\nInvalid album items skipped: {terminal_failure_count}"
+                    if terminal_failure_count
+                    else ""
+                ),
+            )
+            await asyncio.sleep(POST_DELAY)
+
+        except FloodWait as e:
+            await asyncio.sleep(flood_wait_delay(e.value))
+            if attempt < max_attempts:
+                job["attempt"] = attempt + 1
+                record_upload_job(job, "retry", e)
+                await update_manual_link_status(job, f"Upload flood wait handled. Retrying...\nAttempt: {attempt + 1}/{max_attempts}")
+                scheduled = schedule_queue_retry("upload", job, 0, e)
+                should_cleanup = not scheduled
+                if not scheduled:
+                    record_upload_job(job, "retry_admission_failed", e)
+            else:
+                offloaded = await offload_source_media_job_to_worker(job, e)
+                if not offloaded and schedule_source_job_retry_later(job, e):
+                    should_cleanup = True
+                    continue
+                fallback_status = "worker_fallback_queued" if offloaded else "failed"
+                record_upload_job(job, fallback_status, e)
+                record_total_job(job, fallback_status, e)
+                record_sync_item(job, fallback_status, e)
+                await update_manual_link_status(job, f"Upload failed:\n{str(e)[:500]}")
+                for m in messages:
+                    remove_processing_keys(m.chat.id, m)
+                should_cleanup = True
+
+        except Exception as e:
+            err_str = str(e)
+            err_log = format_exception_for_log(e)
+            log_event(f"[UP ERROR W{worker_id}] {err_log}")
+            if should_skip_dead_media_now(e, attempt):
+                record_upload_job(job, "skipped_dead_media", e)
+                record_total_job(job, "skipped_dead_media", e)
+                record_sync_item(job, "skipped_dead_media", e)
+                remember_dead_media(messages, e, force_dead=True)
+                source_brain_record_messages(messages, "dead", amount=len(messages), title=ch_name, reason=e)
+                for m in messages:
+                    remove_processing_keys(m.chat.id, m)
+                await update_manual_link_status(job, f"Upload skipped as invalid/dead media:\n{err_log[:500]}")
+                should_cleanup = True
+                continue
+            if is_invalid_media_upload_error(e) or "invalid" in err_str.lower():
+                offloaded = await offload_source_media_job_to_worker(job, e)
+                if not offloaded and schedule_source_job_retry_later(job, e):
+                    should_cleanup = True
+                    continue
+                fallback_status = "worker_fallback_queued" if offloaded else "failed_invalid_media"
+                record_upload_job(job, fallback_status, e)
+                record_total_job(job, fallback_status, e)
+                record_sync_item(job, fallback_status, e)
+                if not offloaded:
+                    remember_dead_media(messages, e)
+                    await update_manual_link_status(job, f"Upload failed invalid media:\n{err_log[:500]}")
+                for m in messages:
+                    remove_processing_keys(m.chat.id, m)
+                should_cleanup = True
+            elif attempt < max_attempts:
+                await asyncio.sleep(5)
+                job["attempt"] = attempt + 1
+                record_upload_job(job, "retry", e)
+                await update_manual_link_status(job, f"Upload retry scheduled...\nAttempt: {attempt + 1}/{max_attempts}\nReason: {err_log[:240]}")
+                scheduled = schedule_queue_retry("upload", job, 5, e)
+                should_cleanup = not scheduled
+                if not scheduled:
+                    record_upload_job(job, "retry_admission_failed", e)
+            else:
+                offloaded = await offload_source_media_job_to_worker(job, e)
+                if not offloaded and schedule_source_job_retry_later(job, e):
+                    should_cleanup = True
+                    continue
+                fallback_status = "worker_fallback_queued" if offloaded else "failed"
+                record_upload_job(job, fallback_status, e)
+                record_total_job(job, fallback_status, e)
+                record_sync_item(job, fallback_status, e)
+                if not offloaded:
+                    remember_dead_media(messages, e)
+                    await update_manual_link_status(job, f"Upload failed:\n{err_log[:500]}")
+                for m in messages:
+                    remove_processing_keys(m.chat.id, m)
+                should_cleanup = True
+
+        finally:
+            if SHUTDOWN_REQUESTED:
+                should_cleanup = False
+            if should_cleanup:
+                untrack_download_files(original_files | generated_files | set(files))
+                cleanup(*(original_files | generated_files | set(files)))
+            else:
+                untrack_download_files(generated_files)
+                cleanup(*generated_files)
+            upload_queue.task_done()
+            clear_worker_job(worker_name)
+
+
+async def process_telegram_link(job):
+    url = canonical_link_url(job.get("url", ""), "telegram")
+    status_msg = job.get("status_msg")
+    is_fallback = job.get("is_fallback", False)
+    requester_id = int(job.get("requester_id") or OWNER_ID or 0)
+    force_upload = (
+        bool(job.get("force_upload"))
+        or TELEGRAM_LINK_FORCE_UPLOAD_FOR_ALL
+        or (TELEGRAM_LINK_FORCE_UPLOAD and requester_id == OWNER_ID)
+    )
+
+    if status_msg:
+        await safe_edit(status_msg, f"Telegram link detected.\nFetching media: {url}")
+
+    chat_id, msg_id = parse_telegram_message_link(url)
+    if chat_id in (None, "") or not msg_id:
+        if status_msg:
+            await safe_edit(status_msg, "Invalid Telegram post link. Send a direct Telegram media post link.")
+        return
+
+    msg = None
+    source_peer = chat_id
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            source_peer = await resolve_source_peer_for_access(chat_id, "telegram_link", force_refresh=attempt > 0)
+            msg = await tg_call("telegram link get_messages", userbot.get_messages, source_peer, msg_id)
+            if msg and not msg.empty:
+                break
+            raise Exception("message not found or empty")
+        except Exception as e:
+            err_str = str(e).lower()
+            if any(x in err_str for x in ["110", "timeout", "network"]) and attempt < MAX_RETRIES - 1:
+                log_event(f"Network timeout fetching link. Retry {attempt + 1}/{MAX_RETRIES}")
+                await asyncio.sleep(5)
+                continue
+            raise Exception(f"Failed after {MAX_RETRIES} attempts: {e}")
+
+    if not msg or msg.empty:
+        if status_msg:
+            await safe_edit(status_msg, "Message not found. Ensure the userbot account can open that Telegram post.")
+        return
+
+    if msg.media_group_id:
+        messages = await tg_call("telegram link get_media_group", userbot.get_media_group, source_peer, msg.id)
+        job_type = "album"
+    else:
+        messages = [msg]
+        job_type = "single"
+
+    filtered = []
+    for m in messages:
+        if not is_valid_media(m):
+            continue
+        if force_upload:
+            uid = get_media_uid(m)
+            old_hash = make_old_hash(m.chat.id, m.id)
+            if uid in processing_cache or old_hash in processing_cache:
+                continue
+            add_processing_keys(m.chat.id, m)
+            filtered.append(m)
+        elif not await check_and_mark_processing_async(m.chat.id, m):
+            filtered.append(m)
+
+    if not filtered:
+        if status_msg:
+            duplicate_note = "This Telegram media is already processing." if force_upload else "Already uploaded or duplicate media. Skipped."
+            await safe_edit(status_msg, duplicate_note)
+        return
+
+    queued = await enqueue_media_job(
+        job_type,
+        filtered,
+        msg.chat.title or str(chat_id),
+        attempt=1,
+        is_fallback=is_fallback,
+        source="telegram_link",
+        status_msg=status_msg,
+        force_upload=force_upload,
+        manual_link_url=url,
+    )
+    if status_msg:
+        if queued:
+            await safe_edit(
+                status_msg,
+                f"Telegram media added to downloader queue.\nItems: {len(filtered)}\nMode: {'force upload' if force_upload else 'duplicate protected'}",
+            )
+        else:
+            await safe_edit(status_msg, "Telegram media could not be queued. Check logs for details.")
+
+
+# External platform downloaders were intentionally removed.
+# This main bot now accepts Telegram links and source-channel media only.
+
+def validate_photo_file_sync(path):
+    if not path or not os.path.exists(path) or os.path.getsize(path) <= 512:
+        return False
+    if Image is None:
+        return True
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        with Image.open(path) as image:
+            width, height = image.size
+        return width > 0 and height > 0
+    except Exception:
+        return False
+
+
+async def ensure_photo_for_telegram(path):
+    ext = Path(path).suffix.lower()
+    if (
+        ext in (".jpg", ".jpeg", ".png")
+        and await run_blocking("media", validate_photo_file_sync, path)
+    ):
+        return path
+    output_path = path.rsplit(".", 1)[0] + "_photo.jpg"
+    cmd = ["ffmpeg", "-y", "-i", path, "-frames:v", "1", "-q:v", "2", output_path]
+    try:
+        returncode, _stdout, stderr = await run_subprocess_safely(cmd, 120, "photo conversion")
+        if (
+            returncode == 0
+            and await run_blocking("media", validate_photo_file_sync, output_path)
+        ):
+            return output_path
+        log_event(f"Photo convert failed rc={returncode}: {stderr.decode(errors='ignore')[-300:]}")
+    except Exception as e:
+        cleanup(output_path)
+        log_event(f"Photo convert failed: {e}")
+    return path
+
+
+async def link_process_worker_loop(worker_id):
+    while True:
+        await wait_while_session_invalid(f"LINK W{worker_id}")
+        job = await link_process_queue.get()
+        observe_queue_wait(job, "link")
+        worker_name = f"LINK W{worker_id}"
+        mark_worker_job(
+            worker_name,
+            {"job_id": job.get("url", ""), "source": "link", "ch_name": job.get("platform", "link"), "attempt": 1},
+        )
+        try:
+            url = job.get("url", "")
+            platform = detect_link_platform(url)
+            log_event(f"[LINK W{worker_id}] Processing link: {url}")
+            if platform == "telegram":
+                await process_telegram_link(job)
+            else:
+                log_event(f"[LINK W{worker_id}] Unsupported link format: {url}")
+                if job.get("status_msg"):
+                    await safe_edit(job["status_msg"], "Unsupported link. Telegram links only.")
+        except Exception as e:
+            err_log = format_exception_for_log(e)
+            log_event(f"[LINK ERROR W{worker_id}] {err_log}")
+            await update_manual_link_status(job, f"Telegram link processing failed:\n{err_log[:500]}")
+        finally:
+            link_process_queue.task_done()
+            clear_worker_job(worker_name)
+
+
+async def button_worker_loop(worker_id):
+    while True:
+        job = await button_queue.get()
+        observe_queue_wait(job, "button")
+        try:
+            if job["type"] == "admin":
+                await actual_admin_callback_logic(job["client"], job["query"])
+            elif job["type"] == "public":
+                await actual_public_callback_logic(job["client"], job["query"])
+        except Exception as e:
+            tb = traceback.format_exc()
+            diagnostic_increment_error(e, context=f"BUTTON W{worker_id} {job.get('type', '')}", traceback_text=tb)
+            log_event(f"[BUTTON ERROR W{worker_id}] {format_exception_for_log(e)}")
+            logging.error("Button worker %s failed\n%s", worker_id, tb)
+        finally:
+            button_queue.task_done()
+
+
+async def _auto_flush_album(group_key, ch_name, delay=None):
+    try:
+        await asyncio.sleep(ALBUM_WAIT if delay is None else max(0.0, float(delay)))
+        async with auto_album_lock:
+            msgs = auto_album_buffer.pop(group_key, [])
+            auto_album_deadlines.pop(group_key, None)
+        valid_msgs = []
+        if msgs:
+            first = msgs[0]
+            try:
+                album_msgs = await tg_call("auto monitor get_media_group", userbot.get_media_group, first.chat.id, first.id)
+                valid_msgs = [m for m in album_msgs if is_valid_media(m)]
+                buffered_ids = {getattr(m, "id", None) for m in msgs}
+                for m in valid_msgs:
+                    if getattr(m, "id", None) not in buffered_ids:
+                        add_processing_keys(m.chat.id, m)
+            except Exception as e:
+                log_event(f"Auto monitor full album fetch failed for {group_key}: {str(e)[:140]}")
+                valid_msgs = [m for m in msgs if is_valid_media(m)]
+        if valid_msgs:
+            await enqueue_media_job("album", valid_msgs, ch_name, source="auto_monitor")
+        async with auto_album_lock:
+            auto_album_tasks.pop(group_key, None)
+    finally:
+        async with auto_album_lock:
+            auto_album_tasks.pop(group_key, None)
+            auto_album_buffer.pop(group_key, None)
+            auto_album_deadlines.pop(group_key, None)
+        mark_runtime_checkpoint_dirty("album flush complete")
+
+@userbot.on_message(filters.channel)
+async def auto_monitor(client, message):
+    try:
+        cid = message.chat.id
+        cusr = f"@{message.chat.username}" if message.chat.username else ""
+        if is_reserved_source_channel(cid):
+            return
+        active_channels = set(active_source_channels())
+        if cid not in active_channels and cusr not in active_channels:
+            return
+        schedule_source_link_discovery(message, "auto_monitor")
+        if not is_valid_media(message):
+            return
+        if await check_and_mark_processing_async(cid, message):
+            return
+
+        ch_name = message.chat.title or str(cid)
+        record_channel(cid, title=ch_name, status="active", action="seen")
+
+        if message.media_group_id:
+            group_key = f"{cid}:{message.media_group_id}"
+            async with auto_album_lock:
+                auto_album_buffer[group_key].append(message)
+                auto_album_deadlines.setdefault(group_key, time.time() + ALBUM_WAIT)
+                if group_key not in auto_album_tasks:
+                    auto_album_tasks[group_key] = asyncio.create_task(_auto_flush_album(group_key, ch_name))
+                mark_runtime_checkpoint_dirty("album buffered")
+            return
+
+        await enqueue_media_job("single", [message], ch_name, source="auto_monitor")
+    except Exception as e:
+        await handle_ai_error(e, "auto_monitor")
+
+
+async def target_deleted_handler(client, messages):
+    try:
+        if not isinstance(messages, list):
+            messages = [messages]
+        target_ids = []
+        for msg in messages:
+            chat_id = getattr(getattr(msg, "chat", None), "id", None)
+            if chat_id in (None, TARGET_CHAT_ID):
+                target_ids.append(msg.id)
+        removed = remove_clean_duplicate_by_target_ids(target_ids)
+        if removed:
+            log_event(f"Removed {len(removed)} duplicate ledger item(s) after target delete event.")
+    except Exception as e:
+        log_event(f"Delete event handler error: {e}")
+
+
+if hasattr(userbot, "on_deleted_messages"):
+    userbot.on_deleted_messages()(target_deleted_handler)
+
+
+async def run_sync_for_channel(
+    channel_id,
+    limit=1000,
+    sync_run_id=None,
+    history_limit=None,
+    source="sync",
+    return_status=False,
+):
+    synced = 0
+    processed_albums = set()
+    ch = normalize_channel_id(channel_id)
+    last_title = ""
+    had_sync_error = False
+
+    def result(success):
+        value = (synced, bool(success)) if return_status else synced
+        return value
+
+    try:
+        await wait_for_telegram_client("sync history")
+        if not channel_is_active_record(ch):
+            return result(True)
+        source_peer = await resolve_source_peer_for_access(ch, "sync")
+        ch = normalize_channel_id(source_peer)
+        history_limit = history_limit or (limit * 5 if limit <= STARTUP_SCAN_LIMIT else limit)
+        media_units_seen = 0
+        history_iter = userbot.get_chat_history(source_peer, limit=history_limit)
+        async for msg in history_iter:
+            await asyncio.sleep(0)
+            last_title = getattr(getattr(msg, "chat", None), "title", "") or last_title
+            schedule_source_link_discovery(msg, "sync")
+            if not is_valid_media(msg):
+                continue
+
+            if msg.media_group_id:
+                if msg.media_group_id in processed_albums:
+                    continue
+                processed_albums.add(msg.media_group_id)
+                media_units_seen += 1
+                if media_units_seen > limit:
+                    break
+                try:
+                    album_msgs = await tg_call("sync get_media_group", userbot.get_media_group, msg.chat.id, msg.id)
+                    valid_album = []
+                    for m in album_msgs:
+                        if is_valid_media(m) and not await check_and_mark_processing_async(m.chat.id, m):
+                            valid_album.append(m)
+                    if valid_album:
+                        ok = await enqueue_media_job(
+                            "album",
+                            valid_album,
+                            msg.chat.title or str(ch),
+                            source=source,
+                            sync_run_id=sync_run_id,
+                        )
+                        synced += 1 if ok else 0
+                except Exception as e:
+                    had_sync_error = True
+                    status = classify_channel_error(e)
+                    if status:
+                        if await try_refresh_channel_peer(ch, e):
+                            return result(False)
+                        quarantine_channel(ch, reason=str(e), status=status)
+                        return result(False)
+                    if is_temporary_network_error(e):
+                        register_guard_temp_error(ch, e)
+                    else:
+                        await handle_ai_error(e, "run_sync_for_channel album")
+                continue
+
+            media_units_seen += 1
+            if media_units_seen > limit:
+                break
+            if not await check_and_mark_processing_async(msg.chat.id, msg):
+                ok = await enqueue_media_job(
+                    "single",
+                    [msg],
+                    msg.chat.title or str(ch),
+                    source=source,
+                    sync_run_id=sync_run_id,
+                )
+                synced += 1 if ok else 0
+
+    except Exception as e:
+        had_sync_error = True
+        if is_session_auth_error(e):
+            mark_session_auth_invalid(e)
+            with contextlib.suppress(Exception):
+                asyncio.create_task(notify_session_problem(e))
+            return result(False)
+        status = classify_channel_error(e)
+        if status:
+            if await try_refresh_channel_peer(channel_id, e):
+                return result(False)
+            quarantine_channel(channel_id, reason=str(e), status=status)
+        elif is_temporary_network_error(e):
+            register_guard_temp_error(channel_id, e)
+        else:
+            await handle_ai_error(e, "run_sync_for_channel")
+    if not had_sync_error:
+        source_brain_scan_result(ch, synced, title=last_title)
+    return result(not had_sync_error)
+
+
+async def check_single_channel_health(channel_id):
+    ch = normalize_channel_id(channel_id)
+    try:
+        source_peer = await resolve_source_peer_for_access(ch, "health")
+        chat = await tg_call("health get_chat", userbot.get_chat, source_peer)
+        title = getattr(chat, "title", "") or getattr(chat, "first_name", "") or str(ch)
+        record_channel(getattr(chat, "id", ch), title=title, status="active", action="health_ok", reason="")
+        return True, title, ""
+    except Exception as e:
+        status = classify_channel_error(e)
+        if status:
+            if await try_refresh_channel_peer(ch, e):
+                return None, str(ch), str(e)
+            result_status = quarantine_channel(ch, reason=str(e), status=status)
+            if result_status == "expired_or_deleted":
+                return False, str(ch), str(e)
+            return None, str(ch), str(e)
+        if is_temporary_network_error(e):
+            register_guard_temp_error(ch, e)
+        return None, str(ch), str(e)
+
+
+async def check_all_channels_health(status_msg=None):
+    channels = active_source_channels()
+    ok_count, issue_count, temp_count = 0, 0, 0
+    for ch in channels:
+        try:
+            result, title, reason = await asyncio.wait_for(
+                check_single_channel_health(ch),
+                timeout=max(5, CHANNEL_HEALTH_TIMEOUT_SECONDS),
+            )
+        except asyncio.TimeoutError:
+            result, title, reason = None, str(ch), f"health check timed out after {CHANNEL_HEALTH_TIMEOUT_SECONDS}s"
+            register_guard_temp_error(ch, reason)
+        if result is True:
+            ok_count += 1
+        elif result is False:
+            issue_count += 1
+        else:
+            temp_count += 1
+        await asyncio.sleep(0.2)
+    text = (
+        "Channel health check complete.\n"
+        f"Active: {ok_count}\n"
+        f"Removed/deleted: {issue_count}\n"
+        f"Temporary/unchecked: {temp_count}"
+    )
+    if status_msg:
+        await safe_edit(status_msg, text, reply_markup=source_status_keyboard())
+    else:
+        log_event(text.replace("\n", " | "))
+    return ok_count, issue_count, temp_count
+
+
+def guard_key(channel_id):
+    return str(normalize_channel_id(channel_id))
+
+
+def get_guard_cursor(channel_id):
+    key = guard_key(channel_id)
+    with state_mutex:
+        cursor = STATE["sync_source_manager"].setdefault("cursors", {}).get(key, {})
+    return int(cursor.get("last_seen_message_id") or 0)
+
+
+def guard_next_check_allowed(channel_id):
+    key = guard_key(channel_id)
+    with state_mutex:
+        cursor = STATE["sync_source_manager"].setdefault("cursors", {}).get(key, {})
+    next_check_after = max(
+        float(cursor.get("next_check_after") or 0),
+        float(cursor.get("circuit_open_until") or 0),
+    )
+    return next_check_after <= time.time()
+
+
+def source_brain_default(channel_id, title=""):
+    return {
+        "channel_id": guard_key(channel_id),
+        "title": title or "",
+        "score": 50,
+        "queued": 0,
+        "uploaded": 0,
+        "duplicates": 0,
+        "failed": 0,
+        "dead": 0,
+        "copy_uploaded": 0,
+        "scan_hits": 0,
+        "scan_misses": 0,
+        "consecutive_failures": 0,
+        "silent_streak": 0,
+        "next_scan_after": 0,
+        "last_event": "",
+        "last_error": "",
+        "last_checked_at": "",
+        "last_activity_at": "",
+        "media_profile": brain_media_empty_counts(),
+        "semantic_profile": brain_semantic_empty_profile(),
+        "updated_at": now_iso(),
+    }
+
+
+def source_brain_clamp_score(value):
+    return max(1, min(100, int(value)))
+
+
+def source_brain_recalculate_score(item):
+    queued = int(item.get("queued") or 0)
+    uploaded = int(item.get("uploaded") or 0)
+    duplicates = int(item.get("duplicates") or 0)
+    failed = int(item.get("failed") or 0)
+    dead = int(item.get("dead") or 0)
+    hits = int(item.get("scan_hits") or 0)
+    misses = int(item.get("scan_misses") or 0)
+    fail_streak = int(item.get("consecutive_failures") or 0)
+    score = 50 + min(25, uploaded * 2 + hits * 3) + min(10, queued)
+    score -= min(20, duplicates // 3)
+    score -= min(35, failed * 4 + dead * 8 + fail_streak * 6)
+    score -= min(20, misses // 2)
+    item["score"] = source_brain_clamp_score(score)
+    return item["score"]
+
+
+def source_brain_next_delay(item, queued=0, event="scan"):
+    if queued > 0 or event in {"queued", "uploaded", "copy_uploaded"}:
+        return SOURCE_BRAIN_MIN_SCAN_DELAY_SECONDS
+    if event in {"failed", "dead", "timeout", "access_error"}:
+        fail_streak = int(item.get("consecutive_failures") or 0)
+        return min(SOURCE_BRAIN_BAD_COOLDOWN_SECONDS, 300 * max(1, fail_streak))
+    silent = int(item.get("silent_streak") or 0)
+    score = int(item.get("score") or 50)
+    multiplier = min(6, max(1, silent))
+    if score >= 75:
+        multiplier = max(1, multiplier - 1)
+    elif score <= 35:
+        multiplier += 2
+    return min(SOURCE_BRAIN_MAX_SCAN_DELAY_SECONDS, SOURCE_BRAIN_QUIET_BASE_DELAY_SECONDS * multiplier)
+
+
+def source_brain_record(channel_id, event, amount=1, title="", reason="", save=True):
+    if not SOURCE_BRAIN_ENABLED or not channel_id:
+        return
+    key = guard_key(channel_id)
+    with state_mutex:
+        brain = STATE["sync_source_manager"].setdefault("source_brain", {})
+        item = brain.setdefault(key, source_brain_default(key, title=title))
+        if title:
+            item["title"] = title
+        item["last_event"] = event
+        item["updated_at"] = now_iso()
+        if event == "queued":
+            item["queued"] = int(item.get("queued") or 0) + amount
+            item["consecutive_failures"] = 0
+            item["silent_streak"] = 0
+            item["last_activity_at"] = now_iso()
+        elif event == "uploaded":
+            item["uploaded"] = int(item.get("uploaded") or 0) + amount
+            item["consecutive_failures"] = 0
+            item["silent_streak"] = 0
+            item["last_activity_at"] = now_iso()
+        elif event == "copy_uploaded":
+            item["copy_uploaded"] = int(item.get("copy_uploaded") or 0) + amount
+            item["uploaded"] = int(item.get("uploaded") or 0) + amount
+            item["consecutive_failures"] = 0
+            item["silent_streak"] = 0
+            item["last_activity_at"] = now_iso()
+        elif event == "duplicate":
+            item["duplicates"] = int(item.get("duplicates") or 0) + amount
+        elif event in {"failed", "timeout", "access_error"}:
+            item["failed"] = int(item.get("failed") or 0) + amount
+            item["consecutive_failures"] = int(item.get("consecutive_failures") or 0) + amount
+            item["last_error"] = str(reason)[:180]
+        elif event == "dead":
+            item["dead"] = int(item.get("dead") or 0) + amount
+            item["failed"] = int(item.get("failed") or 0) + amount
+            item["consecutive_failures"] = int(item.get("consecutive_failures") or 0) + amount
+            item["last_error"] = str(reason)[:180]
+        elif event == "scan_hit":
+            item["scan_hits"] = int(item.get("scan_hits") or 0) + amount
+            item["silent_streak"] = 0
+            item["consecutive_failures"] = 0
+            item["last_checked_at"] = now_iso()
+        elif event == "scan_miss":
+            item["scan_misses"] = int(item.get("scan_misses") or 0) + amount
+            item["silent_streak"] = int(item.get("silent_streak") or 0) + 1
+            item["last_checked_at"] = now_iso()
+        source_brain_recalculate_score(item)
+        if event in {"scan_hit", "scan_miss", "failed", "timeout", "access_error", "dead"}:
+            queued = amount if event == "scan_hit" else 0
+            item["next_scan_after"] = time.time() + source_brain_next_delay(item, queued=queued, event=event)
+        if item.get("consecutive_failures", 0) >= SOURCE_BRAIN_FAIL_STREAK_BAD:
+            item["next_scan_after"] = max(float(item.get("next_scan_after") or 0), time.time() + SOURCE_BRAIN_BAD_COOLDOWN_SECONDS)
+        if save:
+            save_state("sync_source_manager")
+
+
+def source_brain_record_messages(messages, event, amount=1, title="", reason="", save=True):
+    return None
+
+
+def source_brain_scan_result(channel_id, queued, title=""):
+    return None
+
+
+def source_brain_rank(channel_id):
+    key = guard_key(channel_id)
+    with state_mutex:
+        item = STATE["sync_source_manager"].setdefault("source_brain", {}).get(key, {})
+    score = int(item.get("score") or 50)
+    next_after = float(item.get("next_scan_after") or 0)
+    last_checked = str(item.get("last_checked_at") or "")
+    return (-score, next_after, last_checked, str(key))
+
+
+def ranked_source_channels(channels):
+    return list(channels)
+
+
+def source_brain_summary():
+    if not SOURCE_BRAIN_ENABLED:
+        return "off"
+    with state_mutex:
+        items = list(STATE["sync_source_manager"].setdefault("source_brain", {}).values())
+    now_ts = time.time()
+    active_keys = {guard_key(ch) for ch in active_source_channels()}
+    active_items = [item for item in items if str(item.get("channel_id")) in active_keys]
+    hot = sum(1 for item in active_items if int(item.get("score") or 0) >= 70)
+    weak = sum(1 for item in active_items if int(item.get("score") or 0) <= 35)
+    cooling = sum(1 for item in active_items if float(item.get("next_scan_after") or 0) > now_ts)
+    if not active_items:
+        return "learning"
+    avg_score = sum(int(item.get("score") or 50) for item in active_items) // max(1, len(active_items))
+    return f"{avg_score}% | hot {hot} | weak {weak} | cool {cooling}"
+
+
+def register_guard_temp_error(channel_id, error, reconnect=True):
+    if is_flood_wait_error(error):
+        delay = note_global_flood_wait(error)
+        log_event(f"Global FloodWait observed by source intake; source {guard_key(channel_id)} unchanged (gate {delay:.1f}s).")
+        return
+    if is_global_transport_error(error):
+        if reconnect:
+            schedule_userbot_reconnect(f"source intake transport: {error}")
+        log_event(f"Global transport incident observed by source intake; source {guard_key(channel_id)} unchanged.")
+        return
+    if is_session_auth_error(error):
+        mark_session_auth_invalid(error)
+        with contextlib.suppress(Exception):
+            asyncio.create_task(notify_session_problem(error))
+        log_event(f"Source guard paused for {guard_key(channel_id)}: session auth duplicated/invalid; source kept active.")
+        return
+    key = guard_key(channel_id)
+    if reconnect and should_reconnect_telegram_error(error):
+        schedule_userbot_reconnect(f"source guard {key}: {error}")
+    err_text = str(error).lower()
+    source_circuit_record_failure(channel_id, error)
+    with state_mutex:
+        cursors = STATE["sync_source_manager"].setdefault("cursors", {})
+        old = cursors.get(key, {})
+        count = int(old.get("temp_error_count") or 0) + 1
+        access_problem = any(
+            marker in err_text
+            for marker in (
+                "channel_private",
+                "not accessible",
+                "chatadminrequired",
+                "not participant",
+                "userbannedinchannel",
+                "have no rights",
+            )
+        )
+        if access_problem:
+            backoff = max(SOURCE_GUARD_ACCESS_BACKOFF_SECONDS, SOURCE_GUARD_BACKOFF_MAX_SECONDS)
+        else:
+            backoff = min(max(5, SOURCE_GUARD_BACKOFF_MAX_SECONDS), 20 * count)
+        cursors[key] = {
+            **old,
+            "channel_id": key,
+            "temp_error_count": count,
+            "last_temp_error": str(error)[:160],
+            "last_checked_at": now_iso(),
+            "next_check_after": max(float(old.get("next_check_after") or 0), time.time() + backoff),
+        }
+        brain_event = "access_error" if access_problem else ("timeout" if "timed out" in err_text or "timeout" in err_text else "failed")
+        source_brain_record(key, brain_event, reason=error, save=False)
+        save_state("sync_source_manager")
+    if count == 1 or count % 5 == 0:
+        log_event(f"Source guard network backoff for {key}: {str(error)[:90]} (retry in {backoff}s)")
+
+
+def set_guard_cursor(channel_id, message_id, queued=0):
+    key = guard_key(channel_id)
+    with state_mutex:
+        cursors = STATE["sync_source_manager"].setdefault("cursors", {})
+        old = cursors.get(key, {})
+        cursors[key] = {
+            **old,
+            "channel_id": key,
+            "last_seen_message_id": max(int(message_id or 0), int(old.get("last_seen_message_id") or 0)),
+            "last_checked_at": now_iso(),
+            "last_queued": queued,
+            "temp_error_count": 0,
+            "last_temp_error": "",
+            "delete_confirm_count": 0,
+            "delete_confirm_kind": "",
+            "peer_invalid_count": 0,
+            "peer_invalid_last_error": "",
+            "peer_invalid_context": "",
+            "peer_invalid_updated_at": "",
+            "circuit_failures": 0,
+            "circuit_last_error": "",
+            "circuit_updated_at": "",
+            "circuit_open_until": 0,
+            "next_check_after": 0,
+        }
+        events = STATE["sync_source_manager"].setdefault("guard_events", [])
+        events.append({"time": now_iso(), "channel_id": key, "last_seen": cursors[key]["last_seen_message_id"], "queued": queued})
+        if len(events) > 1000:
+            STATE["sync_source_manager"]["guard_events"] = events[-1000:]
+        save_state("sync_source_manager")
+    source_circuit_record_success(channel_id)
+
+
+async def source_guard_scan_channel(channel_id):
+    await wait_for_telegram_client("source guard")
+    ch = normalize_channel_id(channel_id)
+    if not channel_is_active_record(ch):
+        return 0
+    if not guard_next_check_allowed(ch):
+        return 0
+    source_peer = await resolve_source_peer_for_access(ch, "source_guard")
+    ch = normalize_channel_id(source_peer)
+
+    cursor = get_guard_cursor(ch)
+    limit = SOURCE_GUARD_CATCHUP_LIMIT if cursor <= 0 else SOURCE_GUARD_LOOKBACK
+    scanned = []
+    max_seen = cursor
+    processed_max = cursor
+    queued = 0
+    processed_albums = set()
+    had_error = False
+
+    try:
+        async for msg in userbot.get_chat_history(source_peer, limit=limit):
+            if getattr(msg, "id", 0):
+                max_seen = max(max_seen, msg.id)
+            if cursor and msg.id <= cursor:
+                break
+            schedule_source_link_discovery(msg, "source_guard")
+            if is_valid_media(msg):
+                scanned.append(msg)
+            await asyncio.sleep(0)
+    except Exception as e:
+        if is_session_auth_error(e):
+            mark_session_auth_invalid(e)
+            with contextlib.suppress(Exception):
+                asyncio.create_task(notify_session_problem(e))
+            return 0
+        status = classify_channel_error(e)
+        if status:
+            if await try_refresh_channel_peer(ch, e):
+                return 0
+            quarantine_channel(ch, reason=str(e), status=status)
+            return 0
+        if is_temporary_network_error(e):
+            register_guard_temp_error(ch, e)
+        else:
+            log_event(f"Source guard temporary scan error for {ch}: {e}")
+            register_guard_temp_error(ch, e)
+        return 0
+
+    for msg in sorted(scanned, key=lambda m: m.id):
+        try:
+            if msg.media_group_id:
+                group_key = f"{msg.chat.id}:{msg.media_group_id}"
+                if group_key in processed_albums:
+                    processed_max = max(processed_max, msg.id)
+                    continue
+                processed_albums.add(group_key)
+                album_msgs = await tg_call("guard get_media_group", userbot.get_media_group, msg.chat.id, msg.id)
+                valid_album = []
+                for m in album_msgs:
+                    if cursor and m.id <= cursor:
+                        continue
+                    if is_valid_media(m) and not await check_and_mark_processing_async(m.chat.id, m):
+                        valid_album.append(m)
+                if valid_album:
+                    ok = await enqueue_media_job("album", valid_album, msg.chat.title or str(ch), source="source_guard")
+                    queued += 1 if ok else 0
+                processed_max = max(processed_max, max((m.id for m in album_msgs), default=msg.id))
+                continue
+
+            if not await check_and_mark_processing_async(msg.chat.id, msg):
+                ok = await enqueue_media_job("single", [msg], msg.chat.title or str(ch), source="source_guard")
+                queued += 1 if ok else 0
+            processed_max = max(processed_max, msg.id)
+        except Exception as e:
+            status = classify_channel_error(e)
+            if status:
+                if await try_refresh_channel_peer(ch, e):
+                    break
+                quarantine_channel(ch, reason=str(e), status=status)
+                break
+            had_error = True
+            log_event(f"Source guard process error for {ch}: {e}")
+            register_guard_temp_error(ch, e)
+            break
+
+    cursor_target = processed_max if had_error else max_seen
+    if cursor_target > cursor:
+        set_guard_cursor(ch, cursor_target, queued=queued)
+    if not had_error:
+        title = ""
+        if scanned:
+            title = getattr(getattr(scanned[-1], "chat", None), "title", "") or ""
+        source_brain_scan_result(ch, queued, title=title)
+    return queued
+
+
+def next_source_guard_channels():
+    global source_guard_index
+    channels = active_source_channels()
+    if not channels:
+        source_guard_index = 0
+        return []
+    per_tick = max(1, min(SOURCE_GUARD_CHANNELS_PER_TICK, len(channels)))
+    if source_guard_index >= len(channels):
+        source_guard_index = 0
+    ranked = ranked_source_channels(channels)
+    selected = []
+    next_index = source_guard_index
+    for offset in range(len(ranked)):
+        idx = (source_guard_index + offset) % len(ranked)
+        ch = ranked[idx]
+        next_index = (idx + 1) % len(ranked)
+        if not guard_next_check_allowed(ch):
+            continue
+        selected.append(ch)
+        if len(selected) >= per_tick:
+            break
+    source_guard_index = next_index
+    return selected
+
+
+def select_sync_channels_for_run(channels, source):
+    global auto_sync_index
+    if source in {"manual", "startup_catchup", "startup_rescue"}:
+        return channels
+    if not channels:
+        auto_sync_index = 0
+        return []
+    candidates = ranked_source_channels([ch for ch in channels if guard_next_check_allowed(ch)])
+    if not candidates:
+        return []
+    per_run = min(max(1, AUTO_SYNC_CHANNELS_PER_RUN), len(candidates))
+    if auto_sync_index >= len(candidates):
+        auto_sync_index = 0
+    selected = []
+    next_index = auto_sync_index
+    for offset in range(len(candidates)):
+        idx = (auto_sync_index + offset) % len(candidates)
+        selected.append(candidates[idx])
+        next_index = (idx + 1) % len(candidates)
+        if len(selected) >= per_run:
+            break
+    auto_sync_index = next_index
+    return selected
+
+
+async def source_guard_loop():
+    global last_source_guard
+    if not SOURCE_GUARD_ENABLED:
+        last_source_guard = {"status": "disabled", "time": now_iso(), "queued": 0}
+        return
+    await asyncio.sleep(max(5, SOURCE_GUARD_START_DELAY_SECONDS))
+
+    async def scan_one(ch):
+        try:
+            return await asyncio.wait_for(
+                source_guard_scan_channel(ch),
+                timeout=max(5, SOURCE_GUARD_CHANNEL_TIMEOUT_SECONDS),
+            )
+        except asyncio.TimeoutError:
+            register_guard_temp_error(
+                ch,
+                f"guard scan timed out after {SOURCE_GUARD_CHANNEL_TIMEOUT_SECONDS}s",
+                reconnect=SOURCE_GUARD_TIMEOUT_RECONNECT,
+            )
+        except Exception as e:
+            status = classify_channel_error(e)
+            if status:
+                if await try_refresh_channel_peer(ch, e):
+                    return 0
+                quarantine_channel(ch, reason=str(e), status=status)
+            elif is_temporary_network_error(e):
+                register_guard_temp_error(ch, e)
+            else:
+                register_guard_temp_error(ch, e)
+                log_event(f"Source guard scan task error for {ch}: {e}")
+        return 0
+
+    while True:
+        await wait_while_session_invalid("source guard")
+        local_pressure = local_media_pressure()
+        if (
+            SOURCE_GUARD_PAUSE_ON_LOCAL_PRESSURE
+            and not (worker_route_available() and WORKER_HAS_SOURCE_ACCESS)
+            and local_pressure >= max(1, MAIN_LOCAL_QUEUE_SOFT_LIMIT)
+        ):
+            last_source_guard = {
+                "status": f"paused local queue {local_pressure}",
+                "time": now_iso(),
+                "queued": 0,
+            }
+            last_log = float(source_pressure_log_cache.get("source_guard") or 0)
+            if time.time() - last_log > max(60, SOURCE_GUARD_PRESSURE_SLEEP_SECONDS * 3):
+                source_pressure_log_cache["source_guard"] = time.time()
+                log_event(f"Source guard pressure pause: local media queue has {local_pressure} job(s).")
+            await asyncio.sleep(max(5, SOURCE_GUARD_PRESSURE_SLEEP_SECONDS))
+            continue
+        async with source_guard_lock:
+            total_queued = 0
+            checked = 0
+            total_sources = len(active_source_channels())
+            try:
+                clear_processing_cache_if_idle("source guard")
+                channels = next_source_guard_channels()
+                results = await asyncio.gather(*(scan_one(ch) for ch in channels), return_exceptions=True)
+                for result in results:
+                    if isinstance(result, int):
+                        total_queued += result
+                checked = len(channels)
+                last_source_guard = {
+                    "status": f"watching {checked}/{total_sources} source | queued {total_queued}",
+                    "time": now_iso(),
+                    "queued": total_queued,
+                }
+            except Exception as e:
+                last_source_guard = {"status": f"error: {str(e)[:60]}", "time": now_iso(), "queued": total_queued}
+                log_event(f"Source guard loop error: {e}")
+        await asyncio.sleep(SOURCE_GUARD_INTERVAL_SECONDS)
+
+
+async def wait_for_scan_prefetch_capacity(label):
+    while local_media_pressure() >= SCAN_PREFETCH_PRESSURE_TARGET:
+        PIPELINE_SCAN_STATUS["phase"] = f"{label} pressure wait"
+        await asyncio.sleep(HISTORICAL_BACKFILL_PAUSE_SECONDS)
+
+
+def startup_hot_source_signature(source_order):
+    payload = "|".join(str(source) for source in source_order)
+    return hashlib.sha256(payload.encode("utf-8", "ignore")).hexdigest()[:24]
+
+
+def infer_legacy_startup_hot_completed_sources(source_order):
+    """Infer the completed sequential prefix from legacy, unowned Hot-500 queue records."""
+    if not source_order:
+        return [], []
+    identity_to_index = {}
+    for index, channel_id in enumerate(source_order):
+        record = get_channel_record(channel_id)
+        identities = channel_dedupe_keys(
+            channel_id,
+            record.get("username", ""),
+            record.get("source_link", ""),
+        )
+        identities.add(f"id:{guard_key(channel_id)}")
+        for identity in identities:
+            identity_to_index.setdefault(identity, index)
+
+    with state_mutex:
+        queue_snapshots = [
+            deepcopy(STATE.get("upload_queue", {}).get("items", {})),
+            deepcopy(STATE.get("download_queue", {}).get("items", {})),
+        ]
+
+    touched_indices = set()
+    for records in queue_snapshots:
+        for record in records.values():
+            if record.get("status") not in QUEUE_STUCK_STATUSES:
+                continue
+            if str(record.get("source") or "") not in {"sync", "startup_hot"}:
+                continue
+            if record.get("sync_run_id"):
+                continue
+            for meta in record.get("messages", []) or []:
+                if not isinstance(meta, dict):
+                    continue
+                chat_id = meta.get("chat_id")
+                if chat_id in (None, ""):
+                    continue
+                identities = channel_dedupe_keys(chat_id)
+                identities.add(f"id:{guard_key(chat_id)}")
+                matches = [
+                    identity_to_index[identity]
+                    for identity in identities
+                    if identity in identity_to_index
+                ]
+                if matches:
+                    touched_indices.add(min(matches))
+
+    if not touched_indices:
+        return [], []
+    highest_index = max(touched_indices)
+    # A later touched source proves every earlier sequential source completed. The last
+    # touched source may have been interrupted mid-scan, so keep that boundary resumable.
+    completed = list(source_order[:highest_index])
+    evidence = [source_order[index] for index in sorted(touched_indices)]
+    return completed, evidence
+
+
+def reconcile_startup_hot_scan_state(channels=None, allow_legacy_inference=True):
+    """Keep durable Hot-500 progress compatible with source additions/removals and old JSON."""
+    active_order = []
+    seen = set()
+    for channel_id in channels if channels is not None else active_source_channels():
+        key = guard_key(channel_id)
+        if key and key not in seen:
+            seen.add(key)
+            active_order.append(key)
+
+    with state_mutex:
+        existing = deepcopy(
+            STATE.get("sync_source_manager", {}).get("startup_hot_scan", {})
+        )
+
+    now = now_iso()
+    legacy_state = not isinstance(existing, dict) or not existing.get("source_order")
+    if legacy_state:
+        inferred, evidence = (
+            infer_legacy_startup_hot_completed_sources(active_order)
+            if allow_legacy_inference
+            else ([], [])
+        )
+        completed = inferred
+        state = {
+            "schema_version": 1,
+            "pass_id": stable_uid(
+                "hotpass",
+                now,
+                startup_hot_source_signature(active_order),
+            ),
+            "status": "complete" if len(completed) == len(active_order) else "running",
+            "source_order": active_order,
+            "completed_sources": completed,
+            "current_source": "",
+            "queued": 0,
+            "scan_limit": STARTUP_HOT_SCAN_LIMIT,
+            "history_limit": STARTUP_HOT_SCAN_HISTORY_LIMIT,
+            "source_signature": startup_hot_source_signature(active_order),
+            "created_at": now,
+            "started_at": now,
+            "updated_at": now,
+            "completed_at": now if len(completed) == len(active_order) else "",
+            "last_error": "",
+            "migration": "legacy_queue_prefix_inference" if inferred else "legacy_fresh",
+            "migration_evidence_sources": evidence,
+            "new_pass_token": STARTUP_HOT_SCAN_NEW_PASS_TOKEN,
+        }
+    else:
+        old_order = [guard_key(value) for value in existing.get("source_order", [])]
+        old_order = [value for value in old_order if value]
+        reconciled_order = [value for value in old_order if value in seen]
+        reconciled_order.extend(value for value in active_order if value not in reconciled_order)
+        completed_set = {
+            guard_key(value)
+            for value in existing.get("completed_sources", [])
+            if guard_key(value) in seen
+        }
+        completed = [value for value in reconciled_order if value in completed_set]
+        current_source = guard_key(existing.get("current_source"))
+        if current_source not in reconciled_order or current_source in completed_set:
+            current_source = ""
+        state = {
+            **existing,
+            "schema_version": 1,
+            "source_order": reconciled_order,
+            "completed_sources": completed,
+            "current_source": current_source,
+            "queued": max(0, int(existing.get("queued") or 0)),
+            "scan_limit": max(1, int(existing.get("scan_limit") or STARTUP_HOT_SCAN_LIMIT)),
+            "history_limit": max(
+                1,
+                int(existing.get("history_limit") or STARTUP_HOT_SCAN_HISTORY_LIMIT),
+            ),
+            "source_signature": startup_hot_source_signature(reconciled_order),
+            "updated_at": now,
+            "last_error": str(existing.get("last_error") or "")[:500],
+        }
+        if STARTUP_HOT_SCAN_NEW_PASS_TOKEN and (
+            str(existing.get("new_pass_token") or "") != STARTUP_HOT_SCAN_NEW_PASS_TOKEN
+        ):
+            state.update(
+                {
+                    "pass_id": stable_uid(
+                        "hotpass",
+                        now,
+                        state["source_signature"],
+                        STARTUP_HOT_SCAN_NEW_PASS_TOKEN,
+                    ),
+                    "status": "running",
+                    "completed_sources": [],
+                    "current_source": "",
+                    "queued": 0,
+                    "scan_limit": STARTUP_HOT_SCAN_LIMIT,
+                    "history_limit": STARTUP_HOT_SCAN_HISTORY_LIMIT,
+                    "created_at": now,
+                    "started_at": now,
+                    "completed_at": "",
+                    "last_error": "",
+                    "migration": "explicit_new_pass",
+                    "new_pass_token": STARTUP_HOT_SCAN_NEW_PASS_TOKEN,
+                }
+            )
+        else:
+            state["new_pass_token"] = str(existing.get("new_pass_token") or "")
+            all_complete = len(state["completed_sources"]) == len(state["source_order"])
+            state["status"] = "complete" if all_complete else "running"
+            state["completed_at"] = (
+                str(existing.get("completed_at") or now) if all_complete else ""
+            )
+
+    with state_mutex:
+        STATE["sync_source_manager"]["startup_hot_scan"] = state
+        save_state("sync_source_manager")
+    return deepcopy(state)
+
+
+def startup_hot_scan_snapshot():
+    with state_mutex:
+        return deepcopy(
+            STATE.get("sync_source_manager", {}).get("startup_hot_scan", {})
+        )
+
+
+def set_startup_hot_current_source(channel_id):
+    key = guard_key(channel_id)
+    with state_mutex:
+        state = STATE["sync_source_manager"].setdefault("startup_hot_scan", {})
+        state["status"] = "running"
+        state["current_source"] = key
+        state["last_error"] = ""
+        state["updated_at"] = now_iso()
+        save_state("sync_source_manager")
+
+
+def record_startup_hot_source_result(channel_id, queued, success, error=""):
+    key = guard_key(channel_id)
+    with state_mutex:
+        state = STATE["sync_source_manager"].setdefault("startup_hot_scan", {})
+        completed = [
+            guard_key(value)
+            for value in state.setdefault("completed_sources", [])
+            if guard_key(value)
+        ]
+        if success and key not in completed:
+            completed.append(key)
+            state["queued"] = max(0, int(state.get("queued") or 0)) + max(
+                0, int(queued or 0)
+            )
+        state["completed_sources"] = completed
+        state["current_source"] = ""
+        state["last_error"] = "" if success else str(error or "")[:500]
+        state["updated_at"] = now_iso()
+        save_state("sync_source_manager")
+
+
+def finish_startup_hot_scan():
+    with state_mutex:
+        state = STATE["sync_source_manager"].setdefault("startup_hot_scan", {})
+        state["status"] = "complete"
+        state["current_source"] = ""
+        state["last_error"] = ""
+        state["completed_at"] = now_iso()
+        state["updated_at"] = now_iso()
+        save_state("sync_source_manager")
+        return deepcopy(state)
+
+
+async def startup_hot_scan_loop():
+    """Resume the durable Hot-500 pass only after persisted queue work is safely staged."""
+    global DB_REQUIRES_TARGET_REINDEX
+    if not QUEUE_RECOVERY_READY.is_set():
+        PIPELINE_SCAN_STATUS["phase"] = "queue recovery barrier"
+        log_event("Startup Hot-500 waiting for persisted queue recovery barrier.")
+        await QUEUE_RECOVERY_READY.wait()
+    await asyncio.sleep(2)
+    if DB_REQUIRES_TARGET_REINDEX or not target_media_full_index:
+        log_event("Duplicate index is empty; rebuilding target index before source admission.")
+        await build_target_media_index(delete_duplicates=False, reason="clean_boot_target_index")
+        DB_REQUIRES_TARGET_REINDEX = False
+
+    while True:
+        state = reconcile_startup_hot_scan_state()
+        source_order = list(state.get("source_order", []))
+        completed = set(state.get("completed_sources", []))
+        pending = [source for source in source_order if source not in completed]
+        PIPELINE_SCAN_STATUS.update(
+            {
+                "phase": "hot-500" if pending else "hot complete",
+                "hot_done": len(completed),
+                "hot_total": len(source_order),
+                "last_source": str(state.get("current_source") or ""),
+                "queued": int(state.get("queued") or 0),
+            }
+        )
+        if not pending:
+            if state.get("status") != "complete" or not STARTUP_HOT_SCAN_COMPLETE.is_set():
+                final_state = finish_startup_hot_scan()
+                STARTUP_HOT_SCAN_COMPLETE.set()
+                log_event(
+                    f"Startup hot scan complete: {len(source_order)} source(s), "
+                    f"{int(final_state.get('queued') or 0)} non-duplicate media unit(s) admitted."
+                )
+            await asyncio.sleep(30)
+            continue
+
+        progress = False
+        for channel_id in pending:
+            await wait_while_session_invalid("startup hot scan")
+            await wait_for_scan_prefetch_capacity("hot-500")
+            state = reconcile_startup_hot_scan_state()
+            if channel_id not in state.get("source_order", []):
+                continue
+            if channel_id in set(state.get("completed_sources", [])):
+                continue
+            set_startup_hot_current_source(channel_id)
+            PIPELINE_SCAN_STATUS.update(
+                {
+                    "phase": "hot-500",
+                    "hot_done": len(state.get("completed_sources", [])),
+                    "hot_total": len(state.get("source_order", [])),
+                    "last_source": str(channel_id),
+                    "queued": int(state.get("queued") or 0),
+                }
+            )
+            try:
+                queued, success = await run_sync_for_channel(
+                    channel_id,
+                    int(state.get("scan_limit") or STARTUP_HOT_SCAN_LIMIT),
+                    history_limit=int(
+                        state.get("history_limit") or STARTUP_HOT_SCAN_HISTORY_LIMIT
+                    ),
+                    source="startup_hot",
+                    return_status=True,
+                )
+                if success:
+                    record_startup_hot_source_result(
+                        channel_id,
+                        queued,
+                        success=True,
+                    )
+                    progress = True
+                else:
+                    reason = "source scan returned with a recoverable error"
+                    record_startup_hot_source_result(
+                        channel_id,
+                        queued,
+                        success=False,
+                        error=reason,
+                    )
+                    log_event(f"Startup hot scan deferred for {channel_id}: {reason}")
+            except Exception as exc:
+                record_startup_hot_source_result(
+                    channel_id,
+                    0,
+                    success=False,
+                    error=format_exception_for_log(exc),
+                )
+                log_event(
+                    f"Startup hot scan deferred for {channel_id}: "
+                    f"{format_exception_for_log(exc)}"
+                )
+            await asyncio.sleep(0)
+
+        state = reconcile_startup_hot_scan_state()
+        if len(state.get("completed_sources", [])) == len(state.get("source_order", [])):
+            continue
+        PIPELINE_SCAN_STATUS["phase"] = "hot retry wait"
+        await asyncio.sleep(5 if progress else 60)
+
+
+async def startup_hot_scan_once():
+    """Keep the durable Hot-500 coordinator alive for resume and newly added sources."""
+    while True:
+        try:
+            await startup_hot_scan_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            PIPELINE_SCAN_STATUS["phase"] = "hot coordinator retry"
+            log_event(
+                "Startup Hot-500 coordinator failed safely; durable progress retained: "
+                f"{format_exception_for_log(exc)}"
+            )
+            await asyncio.sleep(60)
+
+
+def historical_cursor_snapshot(channel_id):
+    key = guard_key(channel_id)
+    with state_mutex:
+        cursor = STATE["sync_source_manager"].setdefault("cursors", {}).get(key, {})
+        return int(cursor.get("history_next_message_id") or 1), int(cursor.get("history_latest_message_id") or 0), bool(cursor.get("history_complete"))
+
+
+def save_historical_cursor(channel_id, next_id, latest_id, complete=False, queued=0):
+    key = guard_key(channel_id)
+    with state_mutex:
+        cursor = STATE["sync_source_manager"].setdefault("cursors", {}).setdefault(key, {})
+        cursor.update({"channel_id": key, "history_next_message_id": int(next_id), "history_latest_message_id": int(latest_id), "history_complete": bool(complete), "history_last_queued": int(queued), "history_updated_at": now_iso()})
+        save_state("sync_source_manager")
+
+
+async def source_latest_message_id(source_peer):
+    async for msg in userbot.get_chat_history(source_peer, limit=1):
+        return int(getattr(msg, "id", 0) or 0)
+    return 0
+
+
+async def enqueue_historical_batch(channel_id, messages):
+    queued = 0
+    processed_groups = set()
+    valid = [m for m in (messages if isinstance(messages, list) else [messages]) if m and not getattr(m, "empty", False)]
+    for msg in sorted(valid, key=lambda item: int(getattr(item, "id", 0) or 0)):
+        if not is_valid_media(msg):
+            continue
+        await wait_for_scan_prefetch_capacity("historical")
+        if getattr(msg, "media_group_id", None):
+            group = f"{msg.chat.id}:{msg.media_group_id}"
+            if group in processed_groups:
+                continue
+            processed_groups.add(group)
+            album = await tg_call("historical get_media_group", userbot.get_media_group, msg.chat.id, msg.id, retries=2)
+            fresh = [m for m in album if is_valid_media(m) and not await check_and_mark_processing_async(m.chat.id, m)]
+            if fresh:
+                ok = await enqueue_media_job("album", fresh, msg.chat.title or str(channel_id), source="historical_backfill")
+                queued += 1 if ok else 0
+        elif not await check_and_mark_processing_async(msg.chat.id, msg):
+            ok = await enqueue_media_job("single", [msg], msg.chat.title or str(channel_id), source="historical_backfill")
+            queued += 1 if ok else 0
+        await asyncio.sleep(0)
+    return queued
+
+
+async def historical_backfill_loop():
+    """Round-robin oldest-to-newest durable source backfill while live intake remains active."""
+    if not HISTORICAL_BACKFILL_ENABLED:
+        await asyncio.Event().wait()
+    await QUEUE_RECOVERY_READY.wait()
+    await STARTUP_HOT_SCAN_COMPLETE.wait()
+    while True:
+        channels = active_source_channels()
+        incomplete = 0
+        progress = 0
+        for channel_id in channels:
+            await wait_while_session_invalid("historical backfill")
+            await wait_for_scan_prefetch_capacity("historical")
+            try:
+                source_peer = await resolve_source_peer_for_access(channel_id, "historical_backfill")
+                next_id, latest_id, complete = historical_cursor_snapshot(channel_id)
+                if complete:
+                    progress += 1
+                    continue
+                incomplete += 1
+                if latest_id <= 0:
+                    latest_id = await tg_call("historical latest id", source_latest_message_id, source_peer, retries=2)
+                if latest_id <= 0 or next_id > latest_id:
+                    save_historical_cursor(channel_id, max(next_id, latest_id + 1), latest_id, complete=True)
+                    progress += 1
+                    continue
+                end_id = min(latest_id, next_id + HISTORICAL_BACKFILL_BATCH_IDS - 1)
+                ids = list(range(next_id, end_id + 1))
+                messages = await tg_call("historical get_messages", userbot.get_messages, source_peer, ids, retries=2)
+                queued = await enqueue_historical_batch(channel_id, messages)
+                save_historical_cursor(channel_id, end_id + 1, latest_id, complete=end_id >= latest_id, queued=queued)
+                PIPELINE_SCAN_STATUS.update({"phase": "historical", "backfill_done": progress, "backfill_total": len(channels), "last_source": str(channel_id), "queued": int(PIPELINE_SCAN_STATUS.get("queued", 0)) + queued})
+            except Exception as exc:
+                if is_flood_wait_error(exc):
+                    note_global_flood_wait(exc)
+                elif is_global_transport_error(exc):
+                    schedule_userbot_reconnect(f"historical backfill: {exc}")
+                else:
+                    log_event(f"Historical backfill deferred for {channel_id}: {format_exception_for_log(exc)}")
+            await asyncio.sleep(0)
+        if not channels or incomplete == 0:
+            PIPELINE_SCAN_STATUS["phase"] = "historical complete; live watch"
+            await asyncio.sleep(60)
+        else:
+            await asyncio.sleep(1)
+
+
+async def adaptive_source_intake_loop():
+    """Single-coordinator incremental intake; replaces full-source fan-out scans."""
+    global last_source_guard
+    await asyncio.sleep(ADAPTIVE_INTAKE_START_DELAY_SECONDS)
+    if not QUEUE_RECOVERY_READY.is_set():
+        log_event("Adaptive source intake waiting for persisted queue recovery.")
+        await QUEUE_RECOVERY_READY.wait()
+    if not STARTUP_HOT_SCAN_COMPLETE.is_set():
+        log_event("Adaptive source intake waiting for Hot-500 completion; realtime message handler remains active.")
+        await STARTUP_HOT_SCAN_COMPLETE.wait()
+    log_event("Adaptive source intake active: cursor-based, sequential, pressure-aware.")
+    while True:
+        try:
+            await wait_while_session_invalid("adaptive source intake")
+            pressure = local_media_pressure()
+            if pressure >= SCAN_PREFETCH_PRESSURE_TARGET:
+                last_source_guard = {"status": f"adaptive paused queue {pressure}", "time": now_iso(), "queued": 0}
+                await asyncio.sleep(ADAPTIVE_INTAKE_INTERVAL_SECONDS)
+                continue
+            channels = next_source_guard_channels()
+            if not channels:
+                last_source_guard = {"status": "adaptive waiting", "time": now_iso(), "queued": 0}
+                await asyncio.sleep(ADAPTIVE_INTAKE_INTERVAL_SECONDS)
+                continue
+            queued = 0
+            for channel_id in channels:
+                try:
+                    queued += await asyncio.wait_for(
+                        source_guard_scan_channel(channel_id), timeout=ADAPTIVE_INTAKE_TIMEOUT_SECONDS
+                    )
+                except asyncio.TimeoutError as exc:
+                    log_event(f"Adaptive intake operation timeout for {channel_id}; source health unchanged.")
+                except Exception as exc:
+                    if is_flood_wait_error(exc):
+                        note_global_flood_wait(exc)
+                    elif is_global_transport_error(exc):
+                        schedule_userbot_reconnect(f"adaptive intake: {exc}")
+                    else:
+                        register_guard_temp_error(channel_id, exc, reconnect=False)
+            last_source_guard = {"status": f"adaptive queued {queued}", "time": now_iso(), "queued": queued}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event(f"Adaptive source intake error: {format_exception_for_log(exc)}")
+        await asyncio.sleep(ADAPTIVE_INTAKE_INTERVAL_SECONDS)
+
+
+async def run_sync_for_channel_with_timeout(channel_id, limit, sync_run_id=None, timeout_seconds=None, history_limit=None):
+    timeout_seconds = timeout_seconds or AUTO_SYNC_CHANNEL_TIMEOUT_SECONDS
+    try:
+        return await asyncio.wait_for(
+            run_sync_for_channel(channel_id, limit, sync_run_id=sync_run_id, history_limit=history_limit),
+            timeout=max(30, timeout_seconds),
+        )
+    except asyncio.TimeoutError:
+        register_guard_temp_error(channel_id, f"auto sync timed out after {timeout_seconds}s", reconnect=False)
+        log_event(f"Auto sync channel timeout for {channel_id} after {timeout_seconds}s")
+        return 0
+    except Exception as e:
+        status = classify_channel_error(e)
+        if status:
+            if await try_refresh_channel_peer(channel_id, e):
+                return 0
+            quarantine_channel(channel_id, reason=str(e), status=status)
+        else:
+            log_event(f"Auto sync channel error for {channel_id}: {e}")
+        return 0
+
+
+async def run_sync_all_channels(limit, status_msg=None, source="manual", channel_timeout_seconds=None, history_limit=None):
+    global last_auto_sync
+    await wait_while_session_invalid(f"{source} sync")
+    all_channels = active_source_channels()
+    channels = select_sync_channels_for_run(all_channels, source)
+    if sync_scan_lock.locked():
+        if status_msg:
+            await safe_edit(status_msg, "Sync scan already running. Bot will continue automatically.", reply_markup=sync_keyboard())
+        return 0
+    if not all_channels:
+        if status_msg:
+            await safe_edit(status_msg, "No active channels to sync.")
+        return
+    if not channels:
+        last_auto_sync = {"status": f"{source} waiting backoff", "time": now_iso(), "queued": 0}
+        log_event(f"{source} sync skipped: all source channels are in temporary backoff.")
+        return 0
+    async with sync_scan_lock:
+        clear_processing_cache_if_idle(f"{source} sync start")
+        sync_run_id = stable_uid("sync", now_iso(), limit, source)
+        last_auto_sync = {"status": f"{source} scanning {len(channels)}/{len(all_channels)}", "time": now_iso(), "queued": 0}
+        with state_mutex:
+            STATE["sync_source_manager"]["runs"][sync_run_id] = {
+                "run_id": sync_run_id,
+                "started_at": now_iso(),
+                "limit": limit,
+                "source": source,
+                "channels": [str(c) for c in channels],
+                "total_active_channels": len(all_channels),
+                "queued": 0,
+                "uploaded": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
+            save_state("sync_source_manager")
+        sync_semaphore = asyncio.Semaphore(max(1, AUTO_SYNC_CHANNEL_CONCURRENCY))
+
+        async def run_one(ch):
+            async with sync_semaphore:
+                return await run_sync_for_channel_with_timeout(
+                    ch,
+                    limit,
+                    sync_run_id=sync_run_id,
+                    timeout_seconds=channel_timeout_seconds,
+                    history_limit=history_limit,
+                )
+
+        tasks = [asyncio.create_task(run_one(ch)) for ch in channels]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        queued = sum(r for r in results if isinstance(r, int))
+        last_auto_sync = {"status": f"{source} queued {queued}", "time": now_iso(), "queued": queued}
+        with state_mutex:
+            run = STATE["sync_source_manager"]["runs"].setdefault(sync_run_id, {})
+            run["finished_scan_at"] = now_iso()
+            run["queued_by_scan"] = queued
+            save_state("sync_source_manager")
+        if status_msg:
+            await safe_edit(status_msg, f"Sync scan complete.\nQueued: {queued}\nRun ID: {sync_run_id}", reply_markup=sync_keyboard())
+        else:
+            log_event(f"{source} sync scan complete. Checked {len(channels)}/{len(all_channels)} source(s). Queued {queued}.")
+        return queued
+
+
+async def startup_source_scan_loop():
+    log_event(f"Startup catchup scheduled in {max(0, STARTUP_CATCHUP_DELAY_SECONDS)}s.")
+    await asyncio.sleep(max(0, STARTUP_CATCHUP_DELAY_SECONDS))
+    await QUEUE_RECOVERY_READY.wait()
+    while True:
+        try:
+            await wait_while_session_invalid("startup catchup")
+            if not STARTUP_CATCHUP_ENABLED:
+                log_event("Startup catchup scan disabled by ROYELLS_STARTUP_CATCHUP=0.")
+                return
+            if not active_source_channels():
+                log_event("Startup catchup scan skipped: no active source channels.")
+                return
+            pressure_logged = False
+            while local_media_pressure() >= max(1, MAIN_LOCAL_QUEUE_SOFT_LIMIT):
+                if not pressure_logged:
+                    log_event(
+                        "Startup catchup waiting for recovered media queue to drain: "
+                        f"D{channel_download_queue.qsize()} U{upload_queue.qsize()} "
+                        f"(soft limit {MAIN_LOCAL_QUEUE_SOFT_LIMIT})."
+                    )
+                    pressure_logged = True
+                await asyncio.sleep(max(10, SOURCE_GUARD_PRESSURE_SLEEP_SECONDS))
+            media_limit = STARTUP_CATCHUP_MEDIA_LIMIT
+            history_limit = max(STARTUP_CATCHUP_HISTORY_LIMIT, media_limit)
+            log_event(
+                f"Startup catchup scan: reading last {media_limit} media unit(s) "
+                f"per active source; albums count as one unit."
+            )
+            queued = await run_sync_all_channels(
+                media_limit,
+                source="startup_catchup",
+                channel_timeout_seconds=STARTUP_CATCHUP_CHANNEL_TIMEOUT_SECONDS,
+                history_limit=history_limit,
+            )
+            gc.collect()
+            log_event(f"Startup catchup scan complete. Queued {queued} non-duplicate media unit(s).")
+            return
+        except Exception as e:
+            if should_reconnect_telegram_error(e):
+                schedule_userbot_reconnect(f"startup catchup scan: {e}")
+            log_event(f"Startup catchup scan failed: {e}. Retrying in 60s.")
+            await asyncio.sleep(60)
+
+
+async def immediate_startup_rescue_scan_loop():
+    await asyncio.sleep(IMMEDIATE_RESCUE_SCAN_DELAY_SECONDS)
+    await QUEUE_RECOVERY_READY.wait()
+    try:
+        await wait_while_session_invalid("immediate startup rescue")
+        if not active_source_channels():
+            log_event("Immediate startup rescue skipped: no active source channels.")
+            return
+        if pipeline_job_count() > max(0, AUTO_SYNC_MAX_QUEUE):
+            log_event(
+                f"Immediate startup rescue skipped: pipeline already has {pipeline_job_count()} job(s)."
+            )
+            return
+        if sync_scan_lock.locked():
+            log_event("Immediate startup rescue skipped: sync scan already running.")
+            return
+        limit = IMMEDIATE_RESCUE_SCAN_LIMIT
+        log_event(f"Immediate startup rescue scan: checking {limit} recent media unit(s) per source.")
+        queued = await run_sync_all_channels(
+            limit,
+            source="startup_rescue",
+            channel_timeout_seconds=max(STARTUP_CATCHUP_CHANNEL_TIMEOUT_SECONDS, AUTO_SYNC_CHANNEL_TIMEOUT_SECONDS),
+            history_limit=max(IMMEDIATE_RESCUE_HISTORY_LIMIT, limit),
+        )
+        log_event(f"Immediate startup rescue scan complete. Queued {queued} media unit(s).")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log_event(f"Immediate startup rescue scan failed safely: {format_exception_for_log(e)}")
+
+
+async def auto_sync_loop():
+    global last_auto_sync
+    if not AUTO_SYNC_ENABLED:
+        last_auto_sync = {"status": "disabled", "time": now_iso(), "queued": 0}
+        return
+    await asyncio.sleep(AUTO_SYNC_START_DELAY_SECONDS)
+    while True:
+        try:
+            await wait_while_session_invalid("auto sync")
+            running_jobs = channel_download_queue.qsize() + upload_queue.qsize() + link_process_queue.qsize()
+            if running_jobs <= AUTO_SYNC_MAX_QUEUE:
+                if AUTO_SYNC_HEALTH_CHECK_ENABLED:
+                    last_auto_sync = {"status": "health check", "time": now_iso(), "queued": last_auto_sync.get("queued", 0)}
+                    await check_all_channels_health()
+                await run_sync_all_channels(AUTO_SYNC_LIMIT, source="auto")
+                gc.collect()
+            else:
+                last_auto_sync = {"status": f"waiting queue {running_jobs}", "time": now_iso(), "queued": last_auto_sync.get("queued", 0)}
+                log_event(f"Auto sync waiting: queue has {running_jobs} job(s).")
+        except Exception as e:
+            last_auto_sync = {"status": f"error: {str(e)[:60]}", "time": now_iso(), "queued": 0}
+            log_event(f"Auto sync error: {e}")
+        await asyncio.sleep(AUTO_SYNC_INTERVAL_SECONDS)
+
+
+async def auto_recovery_loop():
+    if not AUTO_RECOVERY_ENABLED:
+        return
+    await asyncio.sleep(max(60, AUTO_RECOVERY_START_DELAY_SECONDS))
+    while True:
+        try:
+            await wait_while_session_invalid("auto recovery")
+            if active_source_channels() and pipeline_job_count() == 0:
+                clear_processing_cache_if_idle("auto recovery")
+                if not sync_scan_lock.locked():
+                    log_event("Auto recovery: idle pipeline detected, scanning recent source history.")
+                    queued = await run_sync_all_channels(AUTO_RECOVERY_LIMIT, source="auto_recovery")
+                    gc.collect()
+                    if not queued:
+                        log_event("Auto recovery: recent scan found no new non-duplicate media.")
+        except Exception as e:
+            if should_reconnect_telegram_error(e):
+                schedule_userbot_reconnect(f"auto recovery: {e}")
+            log_event(f"Auto recovery error: {e}")
+        await asyncio.sleep(max(60, AUTO_RECOVERY_INTERVAL_SECONDS))
+
+
+async def brain_discovery_scan(reason="scheduled"):
+    if not BRAIN_DICTIONARY_ENABLED:
+        return 0
+    if not BRAIN_DISCOVERY_ENABLED:
+        log_event("Brain discovery skipped: ROYELLS_BRAIN_DISCOVERY is off.")
+        return 0
+    if not hasattr(userbot, "search_global"):
+        log_event("Brain discovery skipped: Pyrogram search_global is unavailable in this runtime.")
+        return 0
+    with state_mutex:
+        brain = brain_state()
+        terms = list(dict.fromkeys(list(brain.get("hashtags", [])) + list(brain.get("keywords", []))))
+    if not terms:
+        log_event("Brain discovery skipped: no keywords/hashtags yet.")
+        return 0
+    random.shuffle(terms)
+    added = 0
+    searched = 0
+    for term in terms[:BRAIN_DISCOVERY_SEARCHES_PER_RUN]:
+        searched += 1
+        try:
+            async for msg in userbot.search_global(term, limit=BRAIN_DISCOVERY_RESULTS_LIMIT):
+                chat = getattr(msg, "chat", None)
+                if not chat:
+                    continue
+                chat_id = getattr(chat, "id", None)
+                username = getattr(chat, "username", "") or ""
+                if not chat_id and not username:
+                    continue
+                identifier = f"https://t.me/{username}" if username else str(chat_id)
+                if is_reserved_source_channel(chat_id) or channel_is_active_record(chat_id):
+                    continue
+                if brain_add_pending_channel(
+                    identifier,
+                    origin=f"global_search:{term}:{reason}",
+                    title=getattr(chat, "title", "") or getattr(chat, "first_name", "") or "",
+                    note=f"found by {term}",
+                ):
+                    added += 1
+                await asyncio.sleep(0)
+            await asyncio.sleep(3)
+        except FloodWait as e:
+            await asyncio.sleep(flood_wait_delay(e.value))
+        except Exception as e:
+            log_event(f"Brain discovery search failed for {term}: {str(e)[:160]}")
+    with state_mutex:
+        brain = brain_state()
+        brain["last_discovery_scan"] = now_iso()
+        brain.setdefault("events", []).append({"time": now_iso(), "action": "discovery", "reason": reason, "searched": searched, "added": added})
+        trim_events("brain_dictionary")
+        save_state("brain_dictionary")
+    log_event(f"Brain discovery complete: searched {searched}, pending added/updated {added}.")
+    return added
+
+
+async def brain_validate_pending_batch(limit=5, allow_join=False):
+    if not BRAIN_DICTIONARY_ENABLED:
+        return 0
+    items = brain_pending_items(limit=limit, statuses={"pending", "review", "validation_failed"})
+    validated = 0
+    for item in items:
+        await wait_while_session_invalid("brain validator")
+        result = await brain_validate_candidate(item["uid"], allow_join=allow_join)
+        validated += 1 if result else 0
+        if result and BRAIN_AUTO_JOIN_ENABLED and result.get("status") == "recommended":
+            ok, detail = await brain_approve_candidate(result["uid"], join=True)
+            log_event(f"Brain auto-join {'ok' if ok else 'failed'} for {result.get('identifier')}: {detail}")
+        await asyncio.sleep(5)
+    return validated
+
+
+async def brain_discovery_loop():
+    if not BRAIN_DICTIONARY_ENABLED:
+        log_event("Brain discovery loop disabled.")
+        await asyncio.Event().wait()
+    await asyncio.sleep(420)
+    while True:
+        try:
+            await wait_while_session_invalid("brain discovery")
+            await brain_discovery_scan("loop")
+        except Exception as e:
+            log_event(f"Brain discovery loop error: {e}")
+        await asyncio.sleep(BRAIN_DISCOVERY_INTERVAL_SECONDS)
+
+
+async def brain_pending_processor_loop():
+    if not BRAIN_DICTIONARY_ENABLED:
+        log_event("Brain pending loop disabled.")
+        await asyncio.Event().wait()
+    await asyncio.sleep(600)
+    while True:
+        try:
+            await wait_while_session_invalid("brain pending")
+            count = await brain_validate_pending_batch(limit=3, allow_join=BRAIN_AUTO_JOIN_ENABLED)
+            if count:
+                log_event(f"Brain pending validator checked {count} candidate(s).")
+        except Exception as e:
+            log_event(f"Brain pending loop error: {e}")
+        await asyncio.sleep(BRAIN_PENDING_PROCESS_INTERVAL_SECONDS)
+
+
+async def brain_media_profile_refresh_loop():
+    if not BRAIN_DICTIONARY_ENABLED:
+        await asyncio.Event().wait()
+    await asyncio.sleep(120)
+    while True:
+        try:
+            profile = brain_recalculate_global_media_profile(save=True)
+            with state_mutex:
+                brain = brain_state()
+                cache = brain.setdefault("recommendation_cache", {})
+                now_ts = time.time()
+                for cache_uid, cache_item in list(cache.items()):
+                    if float(cache_item.get("expires_at") or 0) <= now_ts:
+                        cache.pop(cache_uid, None)
+                save_state("brain_dictionary")
+            log_event(
+                "Brain media profile refreshed: "
+                f"photo {int(float(profile.get('photo_ratio') or 0) * 100)}%, "
+                f"video {int(float(profile.get('video_ratio') or 0) * 100)}%, "
+                f"total {int(profile.get('total') or 0)}."
+            )
+        except Exception as e:
+            log_event(f"Brain media profile refresh error: {format_exception_for_log(e)}")
+            diagnostic_increment_error("BRAIN_MEDIA_PROFILE_REFRESH", context="brain_media_profile_refresh_loop", traceback_text=traceback.format_exc())
+        await asyncio.sleep(BRAIN_MEDIA_PROFILE_REFRESH_SECONDS)
+
+
+async def delayed_health_check_once():
+    await asyncio.sleep(max(30, CHANNEL_HEALTH_START_DELAY_SECONDS))
+    await check_all_channels_health()
+    gc.collect()
+
+
+def seconds_since_iso(value):
+    if not value:
+        return 10**9
+    try:
+        return max(0, time.time() - datetime.fromisoformat(str(value)).timestamp())
+    except Exception:
+        return 10**9
+
+
+async def watchdog_loop():
+    global last_watchdog_rescue_sync
+    while True:
+        try:
+            stalled = stalled_worker_jobs()
+            if stalled:
+                job = stalled[0]
+                log_event(
+                    f"Watchdog: {job.get('worker')} is long-running on job {job.get('job_id')} "
+                    f"for >{WORKER_STALL_SECONDS}s; restart disabled, waiting for bounded media timeout."
+                )
+                if WORKER_STALL_FORCE_RESTART:
+                    request_automatic_process_restart(
+                        f"worker {job.get('worker')} exceeded {WORKER_STALL_SECONDS}s "
+                        f"on job {job.get('job_id')}"
+                    )
+            if SOURCE_GUARD_ENABLED and active_source_channels():
+                guard_time = last_source_guard.get("time")
+                guard_age = seconds_since_iso(guard_time) if guard_time else 0
+                if guard_time and guard_age > GUARD_STALE_SECONDS:
+                    reason = f"guard stale for {int(guard_age)}s"
+                    log_event(f"Watchdog: {reason}. Triggering userbot reconnect.")
+                    if pipeline_job_count() == 0:
+                        schedule_userbot_reconnect(reason)
+            if AUTO_SYNC_ENABLED:
+                sync_time = last_auto_sync.get("time")
+                sync_age = seconds_since_iso(sync_time) if sync_time else 0
+                if sync_time and sync_age > max(AUTO_SYNC_INTERVAL_SECONDS * 2, GUARD_STALE_SECONDS):
+                    log_event(f"Watchdog: auto sync stale for {int(sync_age)}s.")
+                now = time.time()
+                running_jobs = channel_download_queue.qsize() + upload_queue.qsize() + link_process_queue.qsize()
+                if (
+                    active_source_channels()
+                    and running_jobs <= AUTO_SYNC_MAX_QUEUE
+                    and sync_time
+                    and sync_age > WATCHDOG_RESCUE_SYNC_SECONDS
+                    and now - last_watchdog_rescue_sync > WATCHDOG_RESCUE_SYNC_SECONDS
+                    and not sync_scan_lock.locked()
+                ):
+                    last_watchdog_rescue_sync = now
+                    log_event("Watchdog: starting rescue source sync.")
+                    asyncio.create_task(run_sync_all_channels(SOURCE_GUARD_LOOKBACK, source="watchdog"))
+        except Exception as e:
+            log_event(f"Watchdog error: {e}")
+        await asyncio.sleep(max(60, WATCHDOG_CHECK_SECONDS))
+
+
+def mask_secret_url(url):
+    text = str(url or "")
+    return re.sub(r"(https?://)([^/@]+)@", r"\1***@", text)
+
+
+async def delete_target_messages(message_ids):
+    ids = message_ids if isinstance(message_ids, list) else [message_ids]
+    ids = [int(msg_id) for msg_id in ids if msg_id]
+    if not ids:
+        return 0
+    payload = ids if len(ids) > 1 else ids[0]
+    last_error = None
+    for attempt in range(1, 5):
+        for label, client in (("userbot", userbot), ("bot", app)):
+            try:
+                await wait_for_telegram_client(f"delete messages via {label}")
+                await tg_call(
+                    f"delete messages via {label}",
+                    client.delete_messages,
+                    TARGET_CHAT_ID,
+                    payload,
+                    retries=3,
+                )
+                return len(ids)
+            except Exception as e:
+                last_error = e
+                if label == "userbot" and should_reconnect_telegram_error(e):
+                    schedule_userbot_reconnect(f"delete messages: {e}")
+                log_event(f"Delete via {label} attempt {attempt}/4 failed for {len(ids)} message(s): {e}")
+        if is_reconnectable_telegram_error(last_error) or is_temporary_network_error(last_error):
+            await wait_for_telegram_client("delete messages retry")
+            await asyncio.sleep(min(30, 2 + attempt * 4))
+            continue
+        break
+    log_event(f"Delete failed after all clients: {last_error}")
+    return 0
+
+
+async def remove_member_from_target(uid, unban_after=True):
+    user_id = int(str(uid))
+    last_error = None
+    for label, client in (("bot", app), ("userbot", userbot)):
+        try:
+            await telegram_gateway_await('client.ban_chat_member', lambda: client.ban_chat_member(TARGET_CHAT_ID, user_id))
+            if unban_after:
+                with contextlib.suppress(Exception):
+                    await telegram_gateway_await('client.unban_chat_member', lambda: client.unban_chat_member(TARGET_CHAT_ID, user_id))
+            return True, None
+        except Exception as e:
+            last_error = e
+            if label == "userbot" and should_reconnect_telegram_error(e):
+                schedule_userbot_reconnect(f"remove member: {e}")
+            log_event(f"Remove member via {label} failed for {user_id}: {e}")
+    return False, str(last_error)
+
+
+async def run_full_deep_cleaner(status_msg):
+    if deep_clean_lock.locked():
+        await safe_edit(status_msg, "Deep clean is already running.", reply_markup=clean_keyboard())
+        return
+    async with deep_clean_lock:
+        await run_full_deep_cleaner_locked(status_msg)
+
+
+async def iter_chat_history_paged(chat_id, context, page_limit=None, max_page_retries=6):
+    page_limit = max(20, int(page_limit or DEEP_CLEAN_HISTORY_PAGE_LIMIT))
+    offset_id = 0
+    while True:
+        batch = []
+        for attempt in range(1, max_page_retries + 1):
+            try:
+                await wait_for_telegram_client(context)
+                async for msg in userbot.get_chat_history(chat_id, limit=page_limit, offset_id=offset_id):
+                    batch.append(msg)
+                    await asyncio.sleep(0)
+                break
+            except Exception as e:
+                batch = []
+                if should_reconnect_telegram_error(e):
+                    schedule_userbot_reconnect(f"{context}: {e}")
+                if attempt >= max_page_retries or not (is_reconnectable_telegram_error(e) or is_temporary_network_error(e)):
+                    raise
+                delay = min(20, 3 * attempt)
+                log_event(f"{context} page retry {attempt}/{max_page_retries} after {str(e)[:120]}")
+                await wait_for_telegram_client(context)
+                await asyncio.sleep(delay)
+        if not batch:
+            break
+        for msg in batch:
+            yield msg
+        next_offset = getattr(batch[-1], "id", 0)
+        if not next_offset or next_offset == offset_id:
+            break
+        offset_id = next_offset
+        await asyncio.sleep(0.2)
+
+
+def replace_target_index_db(seen_uids, reason):
+    """Atomically rebuild target duplicate ledgers outside the asyncio thread."""
+    with db_mutex:
+        conn = db_connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM target_media_full_index")
+            conn.execute("DELETE FROM target_media")
+            conn.executemany(
+                "INSERT OR REPLACE INTO target_media_full_index (uid, message_id, indexed_at, source) VALUES (?,?,?,?)",
+                ((uid, int(msg_id), now_iso(), reason) for uid, msg_id in seen_uids.items()),
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO target_media (uid) VALUES (?)",
+                ((uid,) for uid in seen_uids),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def replace_deep_clean_db(seen_uids):
+    """Atomically rebuild posted and target ledgers after a deep scan."""
+    with db_mutex:
+        conn = db_connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM posted")
+            conn.execute("DELETE FROM target_media")
+            conn.execute("DELETE FROM target_media_full_index")
+            conn.executemany("INSERT OR IGNORE INTO target_media (uid) VALUES (?)", ((uid,) for uid in seen_uids))
+            conn.executemany(
+                "INSERT OR IGNORE INTO posted (hash, channel) VALUES (?,?)",
+                ((uid, "target_rescan") for uid in seen_uids),
+            )
+            conn.executemany(
+                "INSERT OR REPLACE INTO target_media_full_index (uid, message_id, indexed_at, source) VALUES (?,?,?,?)",
+                ((uid, int(msg_id), now_iso(), "deep_clean") for uid, msg_id in seen_uids.items()),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+async def build_target_media_index(delete_duplicates=False, status_msg=None, reason="target_index"):
+    if not TARGET_MEDIA_INDEX_ENABLED:
+        return {"scanned": 0, "unique": len(target_media_full_index), "duplicates": 0, "deleted": 0}
+    if target_index_lock.locked():
+        return {"scanned": 0, "unique": len(target_media_full_index), "duplicates": 0, "deleted": 0, "busy": True}
+    async with target_index_lock:
+        log_event(f"Target media index scan started: {reason}. Delete duplicates: {delete_duplicates}")
+        seen_uids = {}
+        duplicate_ids = []
+        scanned = 0
+        last_update = time.time()
+        max_history = max(0, TARGET_MEDIA_INDEX_MAX_HISTORY)
+        try:
+            async for msg in iter_chat_history_paged(
+                TARGET_CHAT_ID,
+                f"{reason} target index",
+                page_limit=TARGET_MEDIA_INDEX_PAGE_LIMIT,
+            ):
+                scanned += 1
+                if max_history and scanned > max_history:
+                    break
+                if is_valid_media(msg):
+                    uid = get_media_uid(msg)
+                    if uid:
+                        if uid in seen_uids:
+                            duplicate_ids.append(msg.id)
+                        else:
+                            seen_uids[uid] = msg.id
+                now = time.time()
+                if status_msg and now - last_update > 4:
+                    last_update = now
+                    await safe_edit(
+                        status_msg,
+                        f"Building target media index...\nScanned: {scanned}\nUnique: {len(seen_uids)}\nDuplicates: {len(duplicate_ids)}",
+                    )
+
+            deleted = 0
+            if delete_duplicates and duplicate_ids:
+                batch_size = max(1, DEEP_CLEAN_DELETE_BATCH)
+                for i in range(0, len(duplicate_ids), batch_size):
+                    chunk = duplicate_ids[i : i + batch_size]
+                    deleted += await delete_target_messages(chunk)
+                    await asyncio.sleep(0.35)
+            if deleted:
+                diagnostic_stats["duplicates_deleted"] = int(diagnostic_stats.get("duplicates_deleted") or 0) + deleted
+
+            target_media_full_index.clear()
+            target_media_full_index.update(seen_uids.keys())
+            await run_blocking("db", replace_target_index_db, seen_uids, reason)
+
+            with state_mutex:
+                STATE["target_media_index"]["items"] = {
+                    uid: {
+                        "uid": uid,
+                        "message_id": msg_id,
+                        "target_chat_id": TARGET_CHAT_ID,
+                        "source": reason,
+                        "updated_at": now_iso(),
+                    }
+                    for uid, msg_id in seen_uids.items()
+                }
+                STATE["target_media_index"]["target_messages"] = {str(msg_id): uid for uid, msg_id in seen_uids.items()}
+                STATE["target_media_index"]["last_full_scan"] = now_iso()
+                STATE["target_media_index"].setdefault("events", []).append(
+                    {
+                        "time": now_iso(),
+                        "action": reason,
+                        "scanned": scanned,
+                        "unique": len(seen_uids),
+                        "duplicates": len(duplicate_ids),
+                        "deleted": deleted,
+                    }
+                )
+                trim_events("target_media_index")
+                save_state("target_media_index")
+
+                clean_items = STATE["clean_duplicate"].setdefault("items", {})
+                target_messages = STATE["clean_duplicate"].setdefault("target_messages", {})
+                for uid, msg_id in seen_uids.items():
+                    clean_items.setdefault(
+                        uid,
+                        {
+                            "uid": uid,
+                            "target_chat_id": TARGET_CHAT_ID,
+                            "target_message_ids": [msg_id],
+                            "status": "active",
+                            "source_channel": "target_index",
+                            "created_at": now_iso(),
+                            "updated_at": now_iso(),
+                        },
+                    )
+                    target_messages[str(msg_id)] = uid
+                save_state("clean_duplicate")
+
+            log_event(
+                f"Target media index complete: scanned {scanned}, unique {len(seen_uids)}, "
+                f"duplicates {len(duplicate_ids)}, deleted {deleted}."
+            )
+            return {"scanned": scanned, "unique": len(seen_uids), "duplicates": len(duplicate_ids), "deleted": deleted}
+        except Exception as e:
+            if is_session_auth_error(e):
+                mark_session_auth_invalid(e)
+                with contextlib.suppress(Exception):
+                    asyncio.create_task(notify_session_problem(e))
+                return {"scanned": scanned, "unique": len(seen_uids), "duplicates": len(duplicate_ids), "deleted": 0}
+            if should_reconnect_telegram_error(e):
+                schedule_userbot_reconnect(f"target media index: {e}")
+            log_event(f"Target media index failed: {e}")
+            raise
+
+
+async def target_media_index_loop():
+    if QUEUE_WORKER_MODE or not TARGET_MEDIA_INDEX_ENABLED:
+        log_event("Target media index loop disabled.")
+        await asyncio.Event().wait()
+    await asyncio.sleep(max(10, TARGET_MEDIA_INDEX_START_DELAY_SECONDS))
+    while True:
+        try:
+            while pipeline_job_count() > 0:
+                stalled = stalled_worker_jobs()
+                if stalled:
+                    job = stalled[0]
+                    if WORKER_STALL_FORCE_RESTART:
+                        request_automatic_process_restart(
+                            f"target index wait found worker {job.get('worker')} "
+                            f"over {WORKER_STALL_SECONDS}s on job {job.get('job_id')}"
+                        )
+                last_log = float(source_pressure_log_cache.get("target_index_wait") or 0)
+                if time.time() - last_log > 600:
+                    source_pressure_log_cache["target_index_wait"] = time.time()
+                    log_event(f"Target media index waiting for idle pipeline; jobs={pipeline_job_count()}.")
+                await asyncio.sleep(120)
+            await wait_while_session_invalid("target media index")
+            await build_target_media_index(
+                delete_duplicates=TARGET_MEDIA_INDEX_DELETE_DUPLICATES,
+                reason="scheduled_target_index",
+            )
+        except Exception as e:
+            log_event(f"Scheduled target index error: {e}")
+        await asyncio.sleep(max(3600, TARGET_MEDIA_INDEX_INTERVAL_SECONDS))
+
+
+async def run_full_deep_cleaner_locked(status_msg):
+    log_event("Starting full target channel deep clean.")
+    seen_uids = {}
+    duplicate_ids = []
+    scanned = 0
+    last_update = time.time()
+    try:
+        total_msgs = await tg_call("deep clean history count", userbot.get_chat_history_count, TARGET_CHAT_ID)
+        total_msgs = total_msgs or 1
+        async for msg in iter_chat_history_paged(TARGET_CHAT_ID, "deep clean history"):
+            scanned += 1
+            if is_valid_media(msg):
+                uid = get_media_uid(msg)
+                if uid:
+                    if uid in seen_uids:
+                        duplicate_ids.append(msg.id)
+                    else:
+                        seen_uids[uid] = msg.id
+            now = time.time()
+            if now - last_update > 3.5:
+                last_update = now
+                pct = min(100, (scanned / total_msgs) * 100)
+                await safe_edit(
+                    status_msg,
+                    f"Deep cleaning...\nProgress: {round(pct, 1)}%\nScanned: {scanned}/{total_msgs}\nDuplicates found: {len(duplicate_ids)}",
+                )
+
+        deleted = 0
+        batch_size = max(1, DEEP_CLEAN_DELETE_BATCH)
+        for i in range(0, len(duplicate_ids), batch_size):
+            chunk = duplicate_ids[i : i + batch_size]
+            deleted_now = await delete_target_messages(chunk)
+            deleted += deleted_now
+            await asyncio.sleep(0.3)
+            if deleted_now == 0 and len(chunk) > 1:
+                for msg_id in chunk:
+                    deleted_single = await delete_target_messages(msg_id)
+                    deleted += deleted_single
+                    await asyncio.sleep(0.05)
+
+        await run_blocking("db", replace_deep_clean_db, seen_uids)
+        target_media_full_index.clear()
+        target_media_full_index.update(seen_uids.keys())
+
+        with state_mutex:
+            STATE["clean_duplicate"]["items"] = {}
+            STATE["clean_duplicate"]["target_messages"] = {}
+            STATE["target_media_index"]["items"] = {}
+            STATE["target_media_index"]["target_messages"] = {}
+            for uid, msg_id in seen_uids.items():
+                STATE["clean_duplicate"]["items"][uid] = {
+                    "uid": uid,
+                    "target_chat_id": TARGET_CHAT_ID,
+                    "target_message_ids": [msg_id],
+                    "status": "active",
+                    "source_channel": "target_rescan",
+                    "created_at": now_iso(),
+                    "updated_at": now_iso(),
+                }
+                STATE["clean_duplicate"]["target_messages"][str(msg_id)] = uid
+                STATE["target_media_index"]["items"][uid] = {
+                    "uid": uid,
+                    "message_id": msg_id,
+                    "target_chat_id": TARGET_CHAT_ID,
+                    "source": "deep_clean",
+                    "updated_at": now_iso(),
+                }
+                STATE["target_media_index"]["target_messages"][str(msg_id)] = uid
+            STATE["clean_duplicate"]["events"].append(
+                {"time": now_iso(), "action": "deep_clean", "scanned": scanned, "deleted": deleted, "unique": len(seen_uids)}
+            )
+            STATE["target_media_index"]["last_full_scan"] = now_iso()
+            trim_events("clean_duplicate")
+            save_state("clean_duplicate")
+            save_state("target_media_index")
+
+        await safe_edit(
+            status_msg,
+            f"Deep clean complete.\nScanned: {scanned}\nDeleted duplicates: {deleted}\nUnique media saved: {len(seen_uids)}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Menu", callback_data="menu_main")]]),
+        )
+    except Exception as e:
+        if should_reconnect_telegram_error(e):
+            schedule_userbot_reconnect(f"deep clean: {e}")
+        log_event(f"Clean error: {e}")
+        with contextlib.suppress(Exception):
+            await safe_edit(status_msg, f"Clean failed: {e}", reply_markup=clean_keyboard())
+
+
+async def run_remove_gifs(status_msg):
+    scanned, deleted = 0, 0
+    last_update = time.time()
+    try:
+        total_msgs = await tg_call("gif clean history count", userbot.get_chat_history_count, TARGET_CHAT_ID)
+        total_msgs = total_msgs or 1
+        async for msg in iter_chat_history_paged(TARGET_CHAT_ID, "gif clean history"):
+            scanned += 1
+            if is_gif_media(msg):
+                deleted_now = await delete_target_messages(msg.id)
+                if deleted_now:
+                    deleted += 1
+                    await asyncio.sleep(0.1)
+            now = time.time()
+            if now - last_update > 3.5:
+                last_update = now
+                pct = min(100, (scanned / total_msgs) * 100)
+                await safe_edit(
+                    status_msg,
+                    f"Removing GIFs...\nProgress: {round(pct, 1)}%\nScanned: {scanned}/{total_msgs}\nDeleted GIFs: {deleted}",
+                )
+        await safe_edit(
+            status_msg,
+            f"GIF clean complete.\nScanned: {scanned}\nDeleted GIFs: {deleted}",
+            reply_markup=clean_keyboard(),
+        )
+    except Exception as e:
+        if should_reconnect_telegram_error(e):
+            schedule_userbot_reconnect(f"gif clean: {e}")
+        log_event(f"GIF clean error: {e}")
+        with contextlib.suppress(Exception):
+            await safe_edit(status_msg, f"GIF clean failed: {e}", reply_markup=clean_keyboard())
+
+
+async def process_bulk_source_submission(client, message, payload, state_info=None):
+    state_info = state_info or {}
+    menu_chat_id = state_info.get("menu_chat_id")
+    menu_message_id = state_info.get("menu_message_id")
+    status_msg = None
+    if menu_chat_id and menu_message_id:
+        await delete_incoming_message(message)
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await(
+                "app.edit_message_text",
+                lambda: app.edit_message_text(
+                    int(menu_chat_id),
+                    int(menu_message_id),
+                    "Resolving and adding source channels...",
+                    disable_web_page_preview=True,
+                ),
+            )
+    else:
+        status_msg = await telegram_gateway_await(
+            "message.reply_text",
+            lambda: message.reply_text("Resolving and adding source channels..."),
+        )
+
+    try:
+        result = await add_source_channels_bulk(payload)
+        result_text = format_bulk_source_result(result)
+    except Exception as exc:
+        result_text = f"Bulk source add failed.\nReason: {str(exc)[:500]}"
+
+    if menu_chat_id and menu_message_id:
+        try:
+            await telegram_gateway_await(
+                "app.edit_message_text",
+                lambda: app.edit_message_text(
+                    int(menu_chat_id),
+                    int(menu_message_id),
+                    result_text,
+                    reply_markup=channels_keyboard(0),
+                    disable_web_page_preview=True,
+                ),
+            )
+            return
+        except Exception as exc:
+            log_event(f"Bulk source result menu edit failed: {str(exc)[:160]}")
+    if status_msg:
+        await safe_edit(status_msg, result_text, reply_markup=channels_keyboard(0))
+    else:
+        await telegram_gateway_await(
+            "client.send_message",
+            lambda: client.send_message(
+                message.chat.id,
+                result_text,
+                reply_markup=channels_keyboard(0),
+                disable_web_page_preview=True,
+            ),
+        )
+
+
+@app.on_message(filters.command("start") & filters.private)
+async def start_cmd(client, message):
+    user_id = getattr(message.from_user, "id", None)
+    log_event(f"/start received from {user_id}")
+    try:
+        if is_owner(user_id):
+            owner_states.pop(OWNER_ID, None)
+            await stop_all_live_dashboards()
+            live = bool(LIVE_DASHBOARD_ENABLED)
+            if QUEUE_WORKER_MODE:
+                sent = await telegram_gateway_await('message.reply_text', lambda: message.reply_text(
+                    get_worker_menu_text(live=live),
+                    reply_markup=worker_keyboard(live=live),
+                    parse_mode=ParseMode.HTML,
+                ))
+            else:
+                dashboard_text = await run_blocking("control", get_main_menu_text, live)
+                sent = await telegram_gateway_await(
+                    "message.reply_text",
+                    lambda: message.reply_text(
+                        dashboard_text,
+                        reply_markup=main_keyboard(live=live),
+                        parse_mode=ParseMode.HTML,
+                    ),
+                )
+            if live:
+                await start_live_dashboard(sent.chat.id, sent.id)
+        elif QUEUE_WORKER_MODE:
+            await telegram_gateway_await('message.reply_text', lambda: message.reply_text("This worker bot is internal. Please use the main Royells bot."))
+        else:
+            public_text = await get_public_menu_text(message.from_user)
+            public_markup = await public_keyboard(message.from_user)
+            await telegram_gateway_await(
+                "message.reply_text",
+                lambda: message.reply_text(
+                    public_text,
+                    reply_markup=public_markup,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                ),
+            )
+    except Exception as e:
+        log_event(f"/start reply failed for {user_id}: {str(e)[:220]}")
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await('message.reply_text', lambda: message.reply_text(
+                "Royells control is online, but dashboard render failed. Check logs.",
+                reply_markup=main_keyboard() if not QUEUE_WORKER_MODE else worker_keyboard(),
+            ))
+
+
+@app.on_message(filters.command("backup") & filters.private & ADMIN_FILTER)
+async def backup_cmd(client, message):
+    archive_path = None
+    status_msg = await telegram_gateway_await('message.reply_text', lambda: message.reply_text("Creating Royells backup archive..."))
+    try:
+        archive_path = await run_blocking("persistence", create_backup_archive)
+        await send_backup_document(client, message.chat.id, archive_path, f"Royells manual backup\nTime: {format_display_datetime(seconds=True)}")
+        await safe_edit(status_msg, "Backup sent successfully.")
+    except Exception as e:
+        await safe_edit(status_msg, f"Backup failed: {str(e)[:500]}")
+        log_event(f"Manual backup failed: {e}")
+    finally:
+        cleanup(archive_path)
+
+
+@app.on_message(filters.command("restore") & filters.private & ADMIN_FILTER)
+async def restore_cmd(client, message):
+    reply = message.reply_to_message
+    if not reply or not reply.document:
+        await telegram_gateway_await('message.reply_text', lambda: message.reply_text("Reply to a Royells .zip backup or one known state .json file, then send /restore."))
+        return
+    status_msg = await telegram_gateway_await('message.reply_text', lambda: message.reply_text("Restore queued. Preparing..."))
+    await restore_from_document_message(client, reply, status_msg)
+
+
+@app.on_message(filters.private & filters.document & ADMIN_FILTER)
+async def restore_document_handler(client, message):
+    state_info = owner_states.get(OWNER_ID, {})
+    if state_info.get("action") != "wait_restore_file":
+        return
+    menu_chat_id = state_info.get("menu_chat_id") or message.chat.id
+    menu_message_id = state_info.get("menu_message_id")
+    status_msg = None
+    if menu_message_id:
+        with contextlib.suppress(Exception):
+            status_msg = await telegram_gateway_await('app.get_messages', lambda: app.get_messages(int(menu_chat_id), int(menu_message_id)))
+    if not status_msg:
+        status_msg = await telegram_gateway_await('message.reply_text', lambda: message.reply_text("Restore queued. Preparing..."))
+    owner_states.pop(OWNER_ID, None)
+    await restore_from_document_message(client, message, status_msg)
+
+
+@app.on_message(filters.command("add_ignore") & filters.private & ADMIN_FILTER)
+async def add_ignore_cmd(client, message):
+    reply = message.reply_to_message
+    if reply and (reply.photo or reply.video):
+        await add_content_filter_sample_from_message(client, reply)
+        return
+    owner_states[OWNER_ID] = {"action": "wait_content_filter_sample"}
+    await telegram_gateway_await('message.reply_text', lambda: message.reply_text(
+        "Send or forward one photo/video sample now.\nSimilar source media will be skipped before upload.",
+        reply_markup=cancel_keyboard("menu_content_filter"),
+    ))
+
+
+@app.on_message(filters.command("addsources") & filters.private & ADMIN_FILTER)
+async def add_sources_cmd(client, message):
+    owner_states.pop(OWNER_ID, None)
+    payload = str(message.text or "").partition(" ")[2].strip()
+    if payload:
+        await process_bulk_source_submission(client, message, payload)
+        return
+    set_owner_state("wait_addchannels_bulk")
+    await telegram_gateway_await(
+        "message.reply_text",
+        lambda: message.reply_text(
+            f"Send up to {MAX_BULK_SOURCE_CHANNELS} source channels.\n"
+            "Use one link, @username, invite link, or numeric ID per line. "
+            "Comma-separated input is also accepted.",
+            reply_markup=cancel_keyboard("menu_channels"),
+            disable_web_page_preview=True,
+        ),
+    )
+
+
+@app.on_message(filters.private & ADMIN_FILTER & (filters.photo | filters.video))
+async def content_filter_sample_media_handler(client, message):
+    state_info = owner_states.get(OWNER_ID, {})
+    if state_info.get("action") != "wait_content_filter_sample":
+        return
+    menu_chat_id = state_info.get("menu_chat_id") or message.chat.id
+    menu_message_id = state_info.get("menu_message_id")
+    status_msg = None
+    if menu_message_id:
+        with contextlib.suppress(Exception):
+            status_msg = await telegram_gateway_await('app.get_messages', lambda: app.get_messages(int(menu_chat_id), int(menu_message_id)))
+    owner_states.pop(OWNER_ID, None)
+    await add_content_filter_sample_from_message(client, message, status_msg=status_msg)
+
+
+@userbot.on_message(filters.text & ~filters.private)
+async def worker_queue_result_handler(client, message):
+    if QUEUE_WORKER_MODE:
+        return
+    if not WORKER_QUEUE_GROUP_ID or int(message.chat.id) != int(WORKER_QUEUE_GROUP_ID):
+        return
+    payload = parse_worker_queue_payload(message.text)
+    if not payload:
+        return
+    if payload.get("kind") == "heartbeat":
+        record_worker_queue_heartbeat(payload)
+        return
+    if payload.get("kind") != "result":
+        return
+    update_worker_queue_result(payload)
+
+    status_chat_id = payload.get("status_chat_id")
+    status_message_id = payload.get("status_message_id")
+    status = payload.get("status", "unknown")
+    platform = payload.get("platform", "link")
+    task_id = payload.get("task_id", "")
+    detail = payload.get("message", "")
+    text = (
+        f"Worker task {status}.\n"
+        f"Platform: {platform}\n"
+        f"Task: {task_id[-12:] if task_id else 'N/A'}"
+    )
+    if detail:
+        text += f"\n{str(detail)[:500]}"
+
+    if status_chat_id and status_message_id:
+        try:
+            await telegram_gateway_await('app.edit_message_text', lambda: app.edit_message_text(
+                int(status_chat_id),
+                int(status_message_id),
+                text,
+                disable_web_page_preview=True,
+            ))
+            return
+        except Exception as e:
+            log_event(f"Worker result edit failed: {e}")
+
+    requester_id = payload.get("requester_id") or OWNER_ID
+    with contextlib.suppress(Exception):
+        await telegram_gateway_await('client.send_message', lambda: client.send_message(int(requester_id), text))
+
+
+def set_owner_state(action, **kwargs):
+    payload = {"action": action, "created_at": time.time()}
+    payload.update(kwargs)
+    owner_states[OWNER_ID] = payload
+    return payload
+
+
+def get_owner_state():
+    state_info = owner_states.get(OWNER_ID, {})
+    if not state_info:
+        return {}
+    created_at = float(state_info.get("created_at") or 0)
+    if created_at and time.time() - created_at > OWNER_STATE_TTL_SECONDS:
+        log_event(f"Owner state expired and cleared: {state_info.get('action')}")
+        owner_states.pop(OWNER_ID, None)
+        return {}
+    return state_info
+
+
+@app.on_message(filters.private & filters.text & ADMIN_FILTER)
+async def admin_text_handler(client, message):
+    text = message.text.strip()
+    if QUEUE_WORKER_MODE:
+        await telegram_gateway_await('message.reply_text', lambda: message.reply_text("Worker mode only accepts queue-group tasks. Use the dashboard buttons."))
+        return
+    command_name = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+    if command_name == "/addsources":
+        return
+
+    state_info = get_owner_state()
+    state = state_info.get("action")
+    if state == "wait_addchannels_bulk":
+        owner_states.pop(OWNER_ID, None)
+        await process_bulk_source_submission(client, message, text, state_info=state_info)
+        return
+
+    if state == "wait_addchannel":
+        try:
+            norm_channel, title, source_link, username = await asyncio.wait_for(
+                resolve_source_channel_input(text),
+                timeout=ADD_CHANNEL_RESOLVE_TIMEOUT_SECONDS,
+            )
+        except Exception as e:
+            owner_states.pop(OWNER_ID, None)
+            await delete_incoming_message(message)
+            err = "source channel resolve timed out" if isinstance(e, asyncio.TimeoutError) else str(e)[:300]
+            return await telegram_gateway_await('client.send_message', lambda: client.send_message(
+                message.chat.id,
+                f"Failed to resolve source channel.\nReason: {err}\n\nAction closed. Press Add Channel again if needed.",
+                reply_markup=channels_keyboard(),
+                disable_web_page_preview=True,
+            ))
+        if await run_blocking("db", add_channel_db, norm_channel, title, source_link, username):
+            await run_blocking("db", load_channels)
+            await delete_incoming_message(message)
+            result_text = f"Channel added.\nName: {title}\nSaved as: {norm_channel}\n\n{format_source_channel_list()}"
+            edited = False
+            menu_chat_id = state_info.get("menu_chat_id")
+            menu_message_id = state_info.get("menu_message_id")
+            if menu_chat_id and menu_message_id:
+                with contextlib.suppress(Exception):
+                    await telegram_gateway_await('app.edit_message_text', lambda: app.edit_message_text(
+                        int(menu_chat_id),
+                        int(menu_message_id),
+                        result_text,
+                        reply_markup=channels_keyboard(),
+                        disable_web_page_preview=True,
+                    ))
+                    edited = True
+            if not edited:
+                await telegram_gateway_await('client.send_message', lambda: client.send_message(
+                    message.chat.id,
+                    result_text,
+                    reply_markup=channels_keyboard(),
+                    disable_web_page_preview=True,
+                ))
+        else:
+            await delete_incoming_message(message)
+            await telegram_gateway_await('client.send_message', lambda: client.send_message(
+                message.chat.id,
+                "Channel was not added. It may already exist or be reserved.",
+                reply_markup=channels_keyboard(),
+                disable_web_page_preview=True,
+            ))
+        owner_states.pop(OWNER_ID, None)
+        return
+
+    elif state == "wait_link_report_channel":
+        try:
+            report_channel, title, source_link, username = await resolve_source_channel_input(text)
+            saved = save_source_link_report_config(
+                report_channel,
+                title=title,
+                source_link=source_link,
+                username=username,
+            )
+            await delete_incoming_message(message)
+            with contextlib.suppress(Exception):
+                await warmup_peer(userbot, saved, "userbot source link report channel")
+            with contextlib.suppress(Exception):
+                await warmup_peer(app, saved, "bot source link report channel")
+            result_text = get_source_link_report_menu_text()
+            edited = False
+            menu_chat_id = state_info.get("menu_chat_id")
+            menu_message_id = state_info.get("menu_message_id")
+            if menu_chat_id and menu_message_id:
+                with contextlib.suppress(Exception):
+                    await telegram_gateway_await('app.edit_message_text', lambda: app.edit_message_text(
+                        int(menu_chat_id),
+                        int(menu_message_id),
+                        result_text,
+                        reply_markup=source_link_report_keyboard(),
+                        disable_web_page_preview=True,
+                        parse_mode=ParseMode.HTML,
+                    ))
+                    edited = True
+            if not edited:
+                await telegram_gateway_await('client.send_message', lambda: client.send_message(
+                    message.chat.id,
+                    result_text,
+                    reply_markup=source_link_report_keyboard(),
+                    disable_web_page_preview=True,
+                    parse_mode=ParseMode.HTML,
+                ))
+        except Exception as e:
+            await telegram_gateway_await('message.reply_text', lambda: message.reply_text(
+                f"Failed to set source link report channel.\nReason: {str(e)[:400]}",
+                reply_markup=source_link_report_keyboard(),
+            ))
+        owner_states.pop(OWNER_ID, None)
+        return
+
+    elif state == "wait_add_admin":
+        try:
+            uid = _coerce_user_id(text)
+            if not uid:
+                raise ValueError("Send a numeric Telegram user ID.")
+            await run_blocking("persistence", save_runtime_admin_id, uid)
+            await delete_incoming_message(message)
+            result_text = get_access_menu_text() + f"\n\nAdded admin: {uid}"
+            edited = False
+            menu_chat_id = state_info.get("menu_chat_id")
+            menu_message_id = state_info.get("menu_message_id")
+            if menu_chat_id and menu_message_id:
+                with contextlib.suppress(Exception):
+                    await telegram_gateway_await('app.edit_message_text', lambda: app.edit_message_text(
+                        int(menu_chat_id),
+                        int(menu_message_id),
+                        result_text,
+                        reply_markup=access_keyboard(),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    ))
+                    edited = True
+            if not edited:
+                await telegram_gateway_await('client.send_message', lambda: client.send_message(
+                    message.chat.id,
+                    result_text,
+                    reply_markup=access_keyboard(),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                ))
+        except Exception as e:
+            await telegram_gateway_await('message.reply_text', lambda: message.reply_text(
+                f"Admin add failed:\n{str(e)[:400]}",
+                reply_markup=access_keyboard(),
+            ))
+        owner_states.pop(OWNER_ID, None)
+        return
+
+    elif state == "wait_set_target":
+        try:
+            target_id = normalize_target_channel_id(text)
+            await delete_incoming_message(message)
+            for label, client_obj in (("userbot", userbot), ("bot", app)):
+                with contextlib.suppress(Exception):
+                    await warmup_peer(client_obj, target_id, f"{label} new target channel")
+            old_target, new_target = await run_blocking("db", save_runtime_target_chat_id, target_id)
+            await run_blocking("db", load_channels)
+            asyncio.create_task(build_target_media_index(delete_duplicates=False, reason="target_changed_from_dashboard"))
+            result_text = (
+                get_access_menu_text()
+                + "\n\nTarget channel saved."
+                + f"\nOld: {old_target}"
+                + f"\nNew: {new_target}"
+                + "\nTarget index rebuild started in background."
+            )
+            edited = False
+            menu_chat_id = state_info.get("menu_chat_id")
+            menu_message_id = state_info.get("menu_message_id")
+            if menu_chat_id and menu_message_id:
+                with contextlib.suppress(Exception):
+                    await telegram_gateway_await('app.edit_message_text', lambda: app.edit_message_text(
+                        int(menu_chat_id),
+                        int(menu_message_id),
+                        result_text,
+                        reply_markup=access_keyboard(),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    ))
+                    edited = True
+            if not edited:
+                await telegram_gateway_await('client.send_message', lambda: client.send_message(
+                    message.chat.id,
+                    result_text,
+                    reply_markup=access_keyboard(),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                ))
+        except Exception as e:
+            await telegram_gateway_await('message.reply_text', lambda: message.reply_text(
+                f"Target save failed:\n{str(e)[:500]}",
+                reply_markup=access_keyboard(),
+                disable_web_page_preview=True,
+            ))
+        owner_states.pop(OWNER_ID, None)
+        return
+
+    elif state == "wait_brain_terms":
+        await delete_incoming_message(message)
+        owner_states.pop(OWNER_ID, None)
+        await telegram_gateway_await('client.send_message', lambda: client.send_message(message.chat.id, "Brain/AI features are removed in stability-first mode.", reply_markup=tools_keyboard()))
+        return
+
+    elif state == "wait_addsub_id":
+        if not text.isdigit():
+            return await telegram_gateway_await('message.reply_text', lambda: message.reply_text("Please send a valid numeric user ID."))
+        uid = text
+        kb = subscription_duration_keyboard(uid)
+        await telegram_gateway_await('message.reply_text', lambda: message.reply_text(f"Selected ID: {uid}\nChoose subscription length:", reply_markup=kb))
+        owner_states.pop(OWNER_ID, None)
+        return
+
+    elif state == "wait_bansub_id":
+        if not text.isdigit():
+            return await telegram_gateway_await('message.reply_text', lambda: message.reply_text("Please send a valid numeric user ID."))
+        uid = text
+        kb = ban_duration_keyboard(uid)
+        await telegram_gateway_await('message.reply_text', lambda: message.reply_text(f"Selected ID: {uid}\nChoose ban length:", reply_markup=kb))
+        owner_states.pop(OWNER_ID, None)
+        return
+
+    elif state == "wait_remsub_id":
+        if not text.isdigit():
+            return await telegram_gateway_await('message.reply_text', lambda: message.reply_text("Please send a valid numeric user ID."))
+        uid = text
+        kb = confirm_remove_subscription_keyboard(uid)
+        await telegram_gateway_await('message.reply_text', lambda: message.reply_text(f"Selected ID: {uid}\nConfirm removal:", reply_markup=kb))
+        owner_states.pop(OWNER_ID, None)
+        return
+
+    elif state == "wait_remmember_id":
+        if not text.isdigit():
+            return await telegram_gateway_await('message.reply_text', lambda: message.reply_text("Please send a valid numeric user ID."))
+        uid = text
+        kb = confirm_remove_member_keyboard(uid)
+        await telegram_gateway_await('message.reply_text', lambda: message.reply_text(f"Selected ID: {uid}\nConfirm member removal:", reply_markup=kb))
+        owner_states.pop(OWNER_ID, None)
+        return
+
+    if extract_first_url(text):
+        await queue_private_link(client, message, text, "Link received. Added to queue.")
+
+
+def support_chat_id():
+    return int(SUPPORT_CHAT_ID or SOURCE_LINK_REPORT_CHAT_ID or 0)
+
+
+def cleanup_support_ticket_cache(now=None):
+    now = float(now or time.time())
+    for msg_id, item in list(support_ticket_map.items()):
+        if now - float(item.get("created_at") or 0) > SUPPORT_TICKET_TTL_SECONDS:
+            support_ticket_map.pop(msg_id, None)
+    for user_id, ts in list(support_last_message_time.items()):
+        if now - float(ts or 0) > SUPPORT_TICKET_TTL_SECONDS:
+            support_last_message_time.pop(user_id, None)
+
+
+def support_user_label(user):
+    if not user:
+        return "Unknown"
+    name = " ".join(part for part in [getattr(user, "first_name", ""), getattr(user, "last_name", "")] if part).strip()
+    if not name:
+        name = getattr(user, "username", "") or "Unknown"
+    username = getattr(user, "username", "") or ""
+    suffix = f" (@{html.escape(username)})" if username else ""
+    return f"{html.escape(name)}{suffix}"
+
+
+def support_ticket_header(message):
+    user = getattr(message, "from_user", None)
+    user_id = int(getattr(user, "id", 0) or 0)
+    body = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    media_type = str(getattr(message, "media", "") or "text").replace("MessageMediaType.", "").lower()
+    parts = [
+        "<b>New message from unsubscribed user</b>",
+        f"User: {support_user_label(user)}",
+        f"USER_ID: <code>{user_id}</code>",
+        f"Type: {html.escape(media_type)}",
+        f"Time: {html.escape(format_display_datetime(seconds=True))}",
+    ]
+    if body:
+        parts.extend(["", "<b>Message</b>", html.escape(body[:2000])])
+    return "\n".join(parts)
+
+
+def support_contact_request_header(user):
+    user_id = int(getattr(user, "id", 0) or 0)
+    parts = [
+        "<b>Contact admin request</b>",
+        f"User: {support_user_label(user)}",
+        f"USER_ID: <code>{user_id}</code>",
+        "Type: contact_button",
+        f"Time: {html.escape(format_display_datetime(seconds=True))}",
+        "",
+        "Reply to this message and the reply will be delivered to the user.",
+    ]
+    return "\n".join(parts)
+
+
+def remember_support_ticket(message_id, user_id):
+    if message_id and user_id:
+        support_ticket_map[int(message_id)] = {"user_id": int(user_id), "created_at": time.time()}
+
+
+def extract_support_user_id_from_text(text):
+    raw = str(text or "")
+    match = re.search(r"USER_ID:\s*(?:<code>)?(\d+)(?:</code>)?", raw)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"\bID:\s*`?(\d+)`?", raw)
+    if match:
+        return int(match.group(1))
+    return 0
+
+
+def support_reply_target_user_id(replied):
+    if not replied:
+        return 0
+    cached = support_ticket_map.get(int(getattr(replied, "id", 0) or 0), {})
+    if cached.get("user_id"):
+        return int(cached["user_id"])
+    return extract_support_user_id_from_text(getattr(replied, "text", None) or getattr(replied, "caption", None) or "")
+
+
+async def forward_to_support(client, message):
+    support_chat = support_chat_id()
+    user = getattr(message, "from_user", None)
+    user_id = int(getattr(user, "id", 0) or 0)
+    if not support_chat or not user_id:
+        log_event("Support ticket skipped: support chat or user id is missing.")
+        return False
+
+    now = time.time()
+    cleanup_support_ticket_cache(now)
+    last = float(support_last_message_time.get(user_id) or 0)
+    if SUPPORT_COOLDOWN_SECONDS and now - last < SUPPORT_COOLDOWN_SECONDS:
+        return False
+
+    try:
+        header_msg = await telegram_gateway_await('client.send_message', lambda: client.send_message(
+            support_chat,
+            support_ticket_header(message),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        ))
+        remember_support_ticket(getattr(header_msg, "id", 0), user_id)
+        if getattr(message, "media", None):
+            with contextlib.suppress(Exception):
+                copied = await telegram_gateway_await('client.copy_message', lambda: client.copy_message(
+                    chat_id=support_chat,
+                    from_chat_id=message.chat.id,
+                    message_id=message.id,
+                ))
+                remember_support_ticket(getattr(copied, "id", 0), user_id)
+        support_last_message_time[user_id] = now
+        return True
+    except Exception as e:
+        log_event(f"Support forward failed for {user_id}: {e}")
+        return False
+
+
+async def forward_contact_request_to_support(client, query):
+    support_chat = support_chat_id()
+    user = getattr(query, "from_user", None)
+    user_id = int(getattr(user, "id", 0) or 0)
+    if not support_chat or not user_id:
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await('query.answer', lambda: query.answer("Support is not configured.", show_alert=True))
+        log_event("Contact admin request skipped: support chat or user id is missing.")
+        return False
+
+    now = time.time()
+    cleanup_support_ticket_cache(now)
+    last = float(support_last_message_time.get(user_id) or 0)
+    if SUPPORT_COOLDOWN_SECONDS and now - last < SUPPORT_COOLDOWN_SECONDS:
+        left = int(SUPPORT_COOLDOWN_SECONDS - (now - last))
+        minutes = max(1, (left + 59) // 60)
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await('query.answer', lambda: query.answer(f"Admin already notified. Try again after {minutes} minute(s).", show_alert=True))
+        return False
+
+    try:
+        ticket = await telegram_gateway_await('client.send_message', lambda: client.send_message(
+            support_chat,
+            support_contact_request_header(user),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        ))
+        remember_support_ticket(getattr(ticket, "id", 0), user_id)
+        support_last_message_time[user_id] = now
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await('query.answer', lambda: query.answer("Admin notified. Wait for reply.", show_alert=True))
+        log_event(f"Contact admin request forwarded for {user_id}.")
+        return True
+    except Exception as e:
+        log_event(f"Contact admin request failed for {user_id}: {e}")
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await('query.answer', lambda: query.answer("Could not notify admin now. Try again later.", show_alert=True))
+        return False
+
+
+async def quietly_handle_unsubscribed_message(client, message):
+    await forward_to_support(client, message)
+    if SUPPORT_DELETE_INCOMING:
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await('message.delete', lambda: message.delete())
+
+
+def is_support_reply_authorized(message):
+    from_user_id = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+    if from_user_id == OWNER_ID:
+        return True
+    sender_chat_id = int(getattr(getattr(message, "sender_chat", None), "id", 0) or 0)
+    support_chat = support_chat_id()
+    if support_chat and sender_chat_id == support_chat:
+        return True
+    return False
+
+
+@app.on_message(filters.reply)
+async def support_reply_handler(client, message):
+    support_chat = support_chat_id()
+    if not support_chat or int(getattr(message.chat, "id", 0) or 0) != support_chat:
+        return
+    if not is_support_reply_authorized(message):
+        return
+    user_id = support_reply_target_user_id(getattr(message, "reply_to_message", None))
+    if not user_id:
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await('message.reply_text', lambda: message.reply_text("Support target user ID not found. Reply directly to a ticket header/media message."))
+        return
+    try:
+        await telegram_gateway_await('client.copy_message', lambda: client.copy_message(chat_id=int(user_id), from_chat_id=message.chat.id, message_id=message.id))
+        log_event(f"Support reply delivered to {user_id}.")
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await('message.delete', lambda: message.delete())
+    except Exception as e:
+        body = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        if body:
+            try:
+                await telegram_gateway_await('client.send_message', lambda: client.send_message(int(user_id), body))
+                log_event(f"Support reply text fallback delivered to {user_id}.")
+                with contextlib.suppress(Exception):
+                    await telegram_gateway_await('message.delete', lambda: message.delete())
+                return
+            except Exception as fallback_error:
+                log_event(f"Support reply text fallback failed for {user_id}: {fallback_error}")
+        log_event(f"Support reply delivery failed for {user_id}: {e}")
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await('message.reply_text', lambda: message.reply_text(f"Delivery failed for {user_id}: {str(e)[:180]}"))
+
+
+@app.on_message(filters.private & filters.text & ~ADMIN_FILTER)
+async def public_text_handler(client, message):
+    if QUEUE_WORKER_MODE:
+        if message.text and extract_first_url(message.text):
+            await delete_incoming_message(message)
+        return await telegram_gateway_await('client.send_message', lambda: client.send_message(message.chat.id, "This worker bot is internal. Please use the main Royells bot."))
+
+    text = message.text.strip()
+    sub_end = await run_blocking("control", get_user_subscription, message.from_user.id)
+    if not sub_end:
+        await quietly_handle_unsubscribed_message(client, message)
+        return
+
+    if extract_first_url(text):
+        await queue_private_link(client, message, text, "Link received. Added to queue.")
+    else:
+        public_text = await get_public_menu_text(message.from_user)
+        public_markup = await public_keyboard(message.from_user)
+        await telegram_gateway_await(
+            "message.reply_text",
+            lambda: message.reply_text(
+                public_text,
+                reply_markup=public_markup,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            ),
+        )
+
+
+@app.on_message(
+    filters.private
+    & ~ADMIN_FILTER
+    & (filters.photo | filters.video | filters.document | filters.audio | filters.voice | filters.animation | filters.sticker)
+)
+async def public_media_handler(client, message):
+    if QUEUE_WORKER_MODE:
+        if SUPPORT_DELETE_INCOMING:
+            await delete_incoming_message(message)
+        return
+    sub_end = await run_blocking("control", get_user_subscription, message.from_user.id)
+    if not sub_end:
+        await quietly_handle_unsubscribed_message(client, message)
+        return
+
+
+@app.on_callback_query(ADMIN_FILTER)
+async def route_admin_cb(client, query):
+    job = stamp_queue_job({"type": "admin", "client": client, "query": query}, "button")
+    await button_queue.put(job)
+
+
+@app.on_callback_query(~ADMIN_FILTER)
+async def route_public_cb(client, query):
+    job = stamp_queue_job({"type": "public", "client": client, "query": query}, "button")
+    await button_queue.put(job)
+
+
+async def actual_admin_callback_logic(client, query: CallbackQuery):
+    data = query.data
+    if data == "menu_brain" or data.startswith("brain_") or data.startswith("act_brain_"):
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(
+            query.message,
+            "Brain/AI features are removed in stability-first mode.",
+            reply_markup=tools_keyboard(),
+        )
+        return
+    if data.startswith(("aiview_", "aireject_", "aifix_")):
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(
+            query.message,
+            "AI live patching is removed in stability-first mode.",
+            reply_markup=tools_keyboard(),
+        )
+        return
+    if data not in {"menu_main", "worker_status", "worker_health", "act_live_start", "act_live_stop"}:
+        await stop_live_dashboard(query.message.chat.id, query.message.id)
+    if data not in {"menu_logs", "logs_live_start", "logs_live_stop"}:
+        await stop_live_logs(query.message.chat.id, query.message.id)
+    if data in ("worker_status", "worker_health"):
+        owner_states.pop(OWNER_ID, None)
+        live = bool(LIVE_DASHBOARD_ENABLED)
+        await safe_edit(query.message, get_worker_menu_text(live=live), reply_markup=worker_keyboard(live=live), parse_mode=ParseMode.HTML)
+        if live:
+            await start_live_dashboard(query.message.chat.id, query.message.id)
+
+    elif data == "act_live_start":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(
+            query.message,
+            dashboard_text_for_mode(live=False),
+            reply_markup=dashboard_keyboard_for_mode(live=False),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "act_live_stop":
+        owner_states.pop(OWNER_ID, None)
+        await stop_live_dashboard(query.message.chat.id, query.message.id)
+        await safe_edit(
+            query.message,
+            dashboard_text_for_mode(live=False),
+            reply_markup=dashboard_keyboard_for_mode(live=False),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "menu_commands":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, get_command_menu_text(), reply_markup=back_to_current_dashboard_keyboard(), parse_mode=ParseMode.HTML)
+
+    elif data == "menu_settings":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, get_settings_menu_text(), reply_markup=settings_keyboard(), parse_mode=ParseMode.HTML)
+
+    elif data.startswith("set_worker_"):
+        owner_states.pop(OWNER_ID, None)
+        _, _, name, action = data.split("_", 3)
+        current = runtime_worker_snapshot().get(name, 1)
+        delta = 1 if action == "inc" else -1
+        saved = save_runtime_worker_setting(name, current + delta)
+        await safe_edit(
+            query.message,
+            get_settings_menu_text() + f"\n\nSaved {name} workers = {saved}. Press Restart Apply to use it.",
+            reply_markup=settings_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data.startswith("set_queue_"):
+        owner_states.pop(OWNER_ID, None)
+        _, _, name, action = data.split("_", 3)
+        current = runtime_queue_snapshot().get(name, 1)
+        delta = 2 if action == "inc" else -2
+        saved = save_runtime_queue_setting(name, current + delta)
+        await safe_edit(
+            query.message,
+            get_settings_menu_text() + f"\n\nSaved queue {name} = {saved}. Press Restart Apply to use it.",
+            reply_markup=settings_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "set_preset_safe":
+        owner_states.pop(OWNER_ID, None)
+        save_runtime_worker_setting("download", 1)
+        save_runtime_worker_setting("upload", 1)
+        save_runtime_worker_setting("link", 1)
+        save_runtime_worker_setting("button", 4)
+        save_runtime_queue_setting("soft", 8)
+        save_runtime_queue_setting("hard", 18)
+        await safe_edit(
+            query.message,
+            get_settings_menu_text() + "\n\nSafe preset saved. Press Restart Apply to use it.",
+            reply_markup=settings_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "set_preset_balanced":
+        owner_states.pop(OWNER_ID, None)
+        save_runtime_worker_setting("download", 2)
+        save_runtime_worker_setting("upload", 2)
+        save_runtime_worker_setting("link", 1)
+        save_runtime_worker_setting("button", 4)
+        save_runtime_queue_setting("soft", 12)
+        save_runtime_queue_setting("hard", 24)
+        await safe_edit(
+            query.message,
+            get_settings_menu_text() + "\n\nBalanced preset saved. Press Restart Apply to use it.",
+            reply_markup=settings_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "act_restart_apply":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, "Runtime settings saved. Restarting bot to apply worker changes...")
+        log_event("Owner requested controlled restart to apply runtime settings.")
+        await checkpoint_runtime_state("owner restart apply", force=True)
+        await run_blocking("persistence", flush_state_saves, 10)
+        await asyncio.sleep(1)
+        os._exit(HARD_WATCHDOG_EXIT_CODE)
+
+    elif data == "menu_restore_help":
+        owner_states.pop(OWNER_ID, None)
+        text = (
+            "RESTORE HELP\n"
+            "============\n"
+            "1. Reply to a Royells backup .zip or known state .json file.\n"
+            "2. Send /restore.\n"
+            "3. Restart the Space or local process after zip restore.\n\n"
+            "Backup files are available from the Tools > Backup button."
+        )
+        await safe_edit(query.message, format_dashboard_pre(text.splitlines(), footer=""), reply_markup=tools_keyboard(), parse_mode=ParseMode.HTML)
+
+    elif data == "act_restore":
+        owner_states[OWNER_ID] = {
+            "action": "wait_restore_file",
+            "menu_chat_id": query.message.chat.id,
+            "menu_message_id": query.message.id,
+        }
+        await safe_edit(
+            query.message,
+            "RESTORE\n=======\nSend the Royells backup file now.\nAccepted: .zip backup or known state .json file.\nA safety snapshot will be created before restore.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu_tools")]]),
+        )
+
+    elif data == "menu_tools":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, get_tools_menu_text(), reply_markup=tools_keyboard(), parse_mode=ParseMode.HTML)
+
+    elif data == "menu_access":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, get_access_menu_text(), reply_markup=access_keyboard(), parse_mode=ParseMode.HTML)
+
+    elif data == "act_add_admin":
+        set_owner_state(
+            "wait_add_admin",
+            menu_chat_id=query.message.chat.id,
+            menu_message_id=query.message.id,
+        )
+        await safe_edit(
+            query.message,
+            "ADD ADMIN\n=========\nSend the Telegram numeric user ID to grant dashboard access.",
+            reply_markup=cancel_keyboard("menu_access"),
+        )
+
+    elif data == "act_set_target":
+        set_owner_state(
+            "wait_set_target",
+            menu_chat_id=query.message.chat.id,
+            menu_message_id=query.message.id,
+        )
+        await safe_edit(
+            query.message,
+            "SET TARGET CHANNEL\n==================\nSend the target channel ID with or without -100.\nExample: 3205176109 or -1003205176109",
+            reply_markup=cancel_keyboard("menu_access"),
+        )
+
+    elif data.startswith("adm_rm_"):
+        uid = data.split("_", 2)[2]
+        try:
+            removed_uid = await run_blocking("persistence", remove_runtime_admin_id, uid)
+            await safe_edit(
+                query.message,
+                get_access_menu_text() + f"\n\nRemoved admin: {removed_uid}",
+                reply_markup=access_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            await safe_edit(query.message, f"Admin remove failed:\n{str(e)[:400]}", reply_markup=access_keyboard())
+
+    elif data == "menu_link_report":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(
+            query.message,
+            get_source_link_report_menu_text(),
+            reply_markup=source_link_report_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "menu_brain":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, get_brain_menu_text(), reply_markup=brain_keyboard(), parse_mode=ParseMode.HTML)
+
+    elif data == "menu_content_filter":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, "Content filter has been permanently removed. Fast Copy mode is always active.", reply_markup=tools_keyboard())
+
+    elif data == "act_cf_add":
+        owner_states[OWNER_ID] = {
+            "action": "wait_content_filter_sample",
+            "menu_chat_id": query.message.chat.id,
+            "menu_message_id": query.message.id,
+        }
+        await safe_edit(
+            query.message,
+            "CONTENT FILTER\n==============\nSend or forward one photo/video sample now.\nThe bot will skip similar source media before upload.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu_content_filter")]]),
+        )
+
+    elif data.startswith("cf_del_"):
+        owner_states.pop(OWNER_ID, None)
+        sample_id = int(data.rsplit("_", 1)[1])
+        removed = await run_blocking("db", delete_content_filter_hash, sample_id)
+        text = "Filter sample removed." if removed else "Filter sample not found."
+        await safe_edit(
+            query.message,
+            f"{text}\n\n{get_content_filter_menu_text()}",
+            reply_markup=content_filter_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "menu_brain_pending":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, get_brain_pending_text(0, status_key="all"), reply_markup=brain_pending_keyboard(0, status_key="all"), parse_mode=ParseMode.HTML)
+
+    elif data.startswith("brain_pending_"):
+        owner_states.pop(OWNER_ID, None)
+        page = int(data.rsplit("_", 1)[1])
+        await safe_edit(query.message, get_brain_pending_text(page, status_key="all"), reply_markup=brain_pending_keyboard(page, status_key="all"), parse_mode=ParseMode.HTML)
+
+    elif data.startswith("brain_filter_"):
+        owner_states.pop(OWNER_ID, None)
+        raw = data[len("brain_filter_") :]
+        status_key, page_text = raw.rsplit("_", 1)
+        page = int(page_text)
+        await safe_edit(
+            query.message,
+            get_brain_pending_text(page, status_key=status_key),
+            reply_markup=brain_pending_keyboard(page, status_key=status_key),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data.startswith("brain_terms_"):
+        owner_states.pop(OWNER_ID, None)
+        page = int(data.rsplit("_", 1)[1])
+        await safe_edit(query.message, get_brain_terms_text(page), reply_markup=brain_terms_keyboard(page), parse_mode=ParseMode.HTML)
+
+    elif data in {"act_brain_add_terms", "act_brain_new_terms"}:
+        owner_states[OWNER_ID] = {
+            "action": "wait_brain_terms",
+            "menu_chat_id": query.message.chat.id,
+            "menu_message_id": query.message.id,
+        }
+        await safe_edit(
+            query.message,
+            "BRAIN NEW TERMS\n===============\nSend keywords and hashtags separated by comma or space.\nExample: funny, dance, #trending",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="brain_terms_0")]]),
+        )
+
+    elif data == "act_brain_validate_pending":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, "Validating pending brain candidates...")
+        count = await brain_validate_pending_batch(limit=8, allow_join=False)
+        await safe_edit(
+            query.message,
+            f"Brain validation complete.\nChecked: {count}\n\n{get_brain_pending_text(0)}",
+            reply_markup=brain_pending_keyboard(0),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "act_brain_force_discovery":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, "Running brain discovery scan...")
+        added = await brain_discovery_scan("manual")
+        await safe_edit(
+            query.message,
+            f"Brain discovery complete.\nPending added/updated: {added}\n\n{get_brain_menu_text()}",
+            reply_markup=brain_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "act_brain_report":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, get_brain_report_text(), reply_markup=brain_keyboard(), parse_mode=ParseMode.HTML)
+
+    elif data == "act_diag_now":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, "Creating diagnostic report...")
+        try:
+            await send_diagnostic_report_now(client, query.message.chat.id, reset_on_success=False)
+            await safe_edit(query.message, "Diagnostic report sent.", reply_markup=back_to_current_dashboard_keyboard())
+        except Exception as e:
+            await safe_edit(query.message, f"Diagnostic report failed:\n{str(e)[:500]}", reply_markup=back_to_current_dashboard_keyboard())
+
+    elif data.startswith("brain_val_"):
+        owner_states.pop(OWNER_ID, None)
+        uid = data.split("_", 2)[2]
+        await safe_edit(query.message, f"Validating brain candidate {uid}...")
+        item = await brain_validate_candidate(uid, allow_join=False)
+        status = item.get("status", "missing") if item else "missing"
+        await safe_edit(
+            query.message,
+            f"Validation result: {status}\n\n{get_brain_candidate_text(uid)}",
+            reply_markup=brain_candidate_keyboard(uid),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data.startswith("brain_view_"):
+        owner_states.pop(OWNER_ID, None)
+        uid = data.split("_", 2)[2]
+        await safe_edit(
+            query.message,
+            get_brain_candidate_text(uid),
+            reply_markup=brain_candidate_keyboard(uid),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data.startswith("brain_app_"):
+        owner_states.pop(OWNER_ID, None)
+        uid = data.split("_", 2)[2]
+        ok, detail = await brain_approve_candidate(uid, join=False)
+        await safe_edit(query.message, ("Approved.\n" if ok else "Approve failed.\n") + detail, reply_markup=brain_pending_keyboard(0))
+
+    elif data.startswith("brain_rej_"):
+        owner_states.pop(OWNER_ID, None)
+        uid = data.split("_", 2)[2]
+        ok = brain_reject_candidate(uid, blacklist=False, reason="owner")
+        await safe_edit(query.message, "Rejected." if ok else "Candidate not found.", reply_markup=brain_pending_keyboard(0))
+
+    elif data.startswith("brain_blk_"):
+        owner_states.pop(OWNER_ID, None)
+        uid = data.split("_", 2)[2]
+        ok = brain_reject_candidate(uid, blacklist=True, reason="owner")
+        await safe_edit(query.message, "Blacklisted." if ok else "Candidate not found.", reply_markup=brain_pending_keyboard(0))
+
+    elif data == "act_set_link_report":
+        owner_states[OWNER_ID] = {
+            "action": "wait_link_report_channel",
+            "menu_chat_id": query.message.chat.id,
+            "menu_message_id": query.message.id,
+        }
+        await safe_edit(
+            query.message,
+            (
+                "SET SOURCE LINK REPORT\n"
+                "======================\n"
+                "Send the report channel post link, channel link, @username, or numeric ID.\n"
+                "Example: https://t.me/c/4345299792/1 or 4345299792"
+            ),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu_link_report")]]),
+        )
+
+    elif data == "act_disable_link_report":
+        owner_states.pop(OWNER_ID, None)
+        save_source_link_report_config(0, title="Disabled")
+        await safe_edit(
+            query.message,
+            get_source_link_report_menu_text(),
+            reply_markup=source_link_report_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "act_test_link_report":
+        owner_states.pop(OWNER_ID, None)
+        if not SOURCE_LINK_REPORT_CHAT_ID:
+            await safe_edit(query.message, "Source link report channel is not set.", reply_markup=source_link_report_keyboard())
+        else:
+            errors = []
+            sent = False
+            for label, client_obj in (("userbot", userbot), ("bot", app)):
+                try:
+                    await tg_call(
+                        f"source link report test via {label}",
+                        client_obj.send_message,
+                        SOURCE_LINK_REPORT_CHAT_ID,
+                        f"Royells source link report test\nTime: {format_display_datetime(seconds=True)}",
+                        disable_web_page_preview=True,
+                        retries=2,
+                    )
+                    sent = True
+                    break
+                except Exception as e:
+                    errors.append(f"{label}: {str(e)[:100]}")
+            text = "Test report sent successfully." if sent else f"Test failed:\n{' | '.join(errors)[:700]}"
+            await safe_edit(query.message, text, reply_markup=source_link_report_keyboard())
+
+    elif data == "menu_queue":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, get_queue_menu_text(), reply_markup=back_to_current_dashboard_keyboard(), parse_mode=ParseMode.HTML)
+
+    elif data == "act_queue_ping":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, "Worker queue has been removed. Main bot is running local-only mode.", reply_markup=tools_keyboard())
+
+    elif data == "act_backup_now":
+        owner_states.pop(OWNER_ID, None)
+        archive_path = None
+        await safe_edit(query.message, "Creating backup archive...")
+        try:
+            archive_path = await run_blocking("persistence", create_backup_archive)
+            await send_backup_document(client, query.message.chat.id, archive_path, f"Royells backup\nTime: {format_display_datetime(seconds=True)}")
+            await safe_edit(query.message, "Backup sent.", reply_markup=back_to_current_dashboard_keyboard())
+        except Exception as e:
+            await safe_edit(query.message, f"Backup failed: {str(e)[:500]}", reply_markup=back_to_current_dashboard_keyboard())
+        finally:
+            cleanup(archive_path)
+
+    elif data.startswith("aiview_"):
+        fix_id = data.split("_")[1]
+        code = ai_suggested_fixes.get(fix_id, "Code expired or already applied.")
+        if len(code) > 4000:
+            path = DATA_DIR / "ai_fix.py"
+            path.write_text(code, encoding="utf-8")
+            await telegram_gateway_await('query.message.reply_document', lambda: query.message.reply_document(str(path), caption="AI suggested code"))
+            path.unlink(missing_ok=True)
+        else:
+            await telegram_gateway_await('app.send_message', lambda: app.send_message(OWNER_ID, f"AI suggested code:\n\n```python\n{code}\n```"))
+
+    elif data.startswith("aireject_"):
+        fix_id = data.split("_")[1]
+        ai_suggested_fixes.pop(fix_id, None)
+        await safe_edit(query.message, "AI fix rejected.")
+
+    elif data.startswith("aifix_"):
+        fix_id = data.split("_")[1]
+        code = ai_suggested_fixes.get(fix_id)
+        if not code:
+            return await telegram_gateway_await('query.answer', lambda: query.answer("Fix expired.", show_alert=True))
+        try:
+            exec(code, globals())
+            ai_suggested_fixes.pop(fix_id, None)
+            await safe_edit(query.message, "AI fix applied live.")
+        except Exception as patch_e:
+            await safe_edit(query.message, f"Failed to apply patch:\n{patch_e}")
+
+    elif data == "menu_main":
+        owner_states.pop(OWNER_ID, None)
+        live = bool(LIVE_DASHBOARD_ENABLED)
+        if QUEUE_WORKER_MODE:
+            await safe_edit(query.message, get_worker_menu_text(live=live), reply_markup=worker_keyboard(live=live), parse_mode=ParseMode.HTML)
+        else:
+            await safe_edit(query.message, get_main_menu_text(live=live), reply_markup=main_keyboard(live=live), parse_mode=ParseMode.HTML)
+        if live:
+            await start_live_dashboard(query.message.chat.id, query.message.id)
+
+    elif data == "menu_channels":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, format_source_channel_list(0), reply_markup=channels_keyboard(0))
+
+    elif data.startswith("src_page_"):
+        owner_states.pop(OWNER_ID, None)
+        page = int(data.rsplit("_", 1)[1])
+        await safe_edit(query.message, format_source_channel_list(page), reply_markup=channels_keyboard(page))
+
+    elif data.startswith("src_view_"):
+        owner_states.pop(OWNER_ID, None)
+        uid = data.split("_", 2)[2]
+        item = source_item_by_uid(uid)
+        if not item:
+            await safe_edit(query.message, "Source not found or already removed.", reply_markup=channels_keyboard(0))
+        else:
+            await safe_edit(
+                query.message,
+                format_source_channel_detail(item),
+                reply_markup=source_channel_detail_keyboard(item),
+                parse_mode=ParseMode.HTML,
+            )
+
+    elif data.startswith("src_rm_"):
+        owner_states.pop(OWNER_ID, None)
+        uid = data.split("_", 2)[2]
+        item = source_item_by_uid(uid)
+        if not item:
+            await safe_edit(query.message, "Source not found or already removed.", reply_markup=channels_keyboard(0))
+        else:
+            ch_to_remove = item.get("channel_id")
+            title = item.get("title") or str(ch_to_remove)
+            await run_blocking("db", rm_channel_db, ch_to_remove)
+            await run_blocking("db", load_channels)
+            await safe_edit(
+                query.message,
+                f"Removed source:\n{title}\nID: {ch_to_remove}\n\n{format_source_channel_list(0)}",
+                reply_markup=channels_keyboard(0),
+            )
+
+    elif data == "menu_channel_issues":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, format_channel_issue_list(), reply_markup=source_status_keyboard())
+
+    elif data == "act_check_channels":
+        owner_states.pop(OWNER_ID, None)
+        status_msg = query.message
+        await safe_edit(status_msg, "Checking source channel health...")
+        asyncio.create_task(check_all_channels_health(status_msg))
+
+    elif data == "menu_subs":
+        owner_states.pop(OWNER_ID, None)
+        await render_subscribers_dashboard(query.message)
+
+    elif data == "menu_sub_list":
+        await render_subscribers_dashboard(query.message)
+
+    elif data.startswith("subs_page_"):
+        owner_states.pop(OWNER_ID, None)
+        page = int(data.rsplit("_", 1)[1])
+        await render_subscribers_dashboard(query.message, page=page)
+
+    elif data.startswith("subv_"):
+        owner_states.pop(OWNER_ID, None)
+        uid = data.split("_", 1)[1]
+        item = await refresh_subscription_profile(uid, force=False)
+        await safe_edit(
+            query.message,
+            subscriber_detail_text(uid, item=item),
+            reply_markup=subscriber_detail_keyboard(uid),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data.startswith("subban_"):
+        owner_states.pop(OWNER_ID, None)
+        uid = data.split("_", 1)[1]
+        await safe_edit(query.message, f"Selected ID: {uid}\nChoose ban length:", reply_markup=ban_duration_keyboard(uid))
+
+    elif data == "menu_sync":
+        owner_states.pop(OWNER_ID, None)
+        running_jobs = channel_download_queue.qsize() + upload_queue.qsize() + link_process_queue.qsize()
+        text = (
+            "SOURCE GUARD STATUS\n"
+            "------------------------------\n"
+            f"Mode: {'On' if SOURCE_GUARD_ENABLED else 'Off'}\n"
+            f"Watch interval: {SOURCE_GUARD_INTERVAL_SECONDS} seconds\n"
+            f"Per tick: {SOURCE_GUARD_CHANNELS_PER_TICK} source | Timeout: {SOURCE_GUARD_CHANNEL_TIMEOUT_SECONDS}s\n"
+            f"Network backoff max: {SOURCE_GUARD_BACKOFF_MAX_SECONDS}s\n"
+            f"Latest lookback: {SOURCE_GUARD_LOOKBACK} posts/source\n"
+            f"First catchup: {SOURCE_GUARD_CATCHUP_LIMIT} posts/source\n"
+            f"Queue now: {running_jobs}\n"
+            f"Last status: {last_source_guard.get('status', 'starting')}\n"
+            f"Last watch: {short_dt(last_source_guard.get('time'))}\n\n"
+            "Guard watches source channels continuously and only queues new, non-duplicate media."
+        )
+        await safe_edit(query.message, text, reply_markup=sync_keyboard())
+
+    elif data == "menu_clean":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, "Full deep cleaner scans target channel and removes duplicates.", reply_markup=clean_keyboard())
+
+    elif data == "menu_logs":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, get_logs_text(live=True), reply_markup=logs_keyboard(live=True))
+        await start_live_logs(query.message.chat.id, query.message.id)
+
+    elif data == "logs_live_start":
+        owner_states.pop(OWNER_ID, None)
+        await safe_edit(query.message, get_logs_text(live=True), reply_markup=logs_keyboard(live=True))
+        await start_live_logs(query.message.chat.id, query.message.id)
+
+    elif data == "logs_live_stop":
+        owner_states.pop(OWNER_ID, None)
+        await stop_live_logs(query.message.chat.id, query.message.id)
+        await safe_edit(query.message, get_logs_text(live=False), reply_markup=logs_keyboard(live=False))
+
+    elif data == "close_menu":
+        owner_states.pop(OWNER_ID, None)
+        try:
+            await telegram_gateway_await('query.message.delete', lambda: query.message.delete())
+        except Exception:
+            with contextlib.suppress(Exception):
+                await safe_edit(query.message, "Closed.", reply_markup=None)
+
+    elif data == "act_addchannel":
+        set_owner_state(
+            "wait_addchannel",
+            menu_chat_id=query.message.chat.id,
+            menu_message_id=query.message.id,
+        )
+        await safe_edit(
+            query.message,
+            "Send source channel link, post link, invite link, @username, or numeric ID.\nExample: https://t.me/channel/123 or 3555003673.",
+            reply_markup=cancel_keyboard("menu_channels"),
+        )
+
+    elif data == "act_addchannels_bulk":
+        set_owner_state(
+            "wait_addchannels_bulk",
+            menu_chat_id=query.message.chat.id,
+            menu_message_id=query.message.id,
+        )
+        await safe_edit(
+            query.message,
+            f"Send up to {MAX_BULK_SOURCE_CHANNELS} source channels.\n"
+            "Use one link, @username, invite link, or numeric ID per line. "
+            "Comma-separated input is also accepted.",
+            reply_markup=cancel_keyboard("menu_channels"),
+        )
+
+    elif data == "act_rmchannel":
+        owner_states.pop(OWNER_ID, None)
+        channels = active_channel_state_items()
+        if not channels:
+            return await safe_edit(query.message, "No channel to remove.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_channels")]]))
+        await safe_edit(
+            query.message,
+            "Select source channel to remove:\nName is shown first to avoid removing the wrong source.",
+            reply_markup=remove_channels_keyboard(0),
+        )
+
+    elif data.startswith("rm_page_"):
+        owner_states.pop(OWNER_ID, None)
+        page = int(data.rsplit("_", 1)[1])
+        await safe_edit(
+            query.message,
+            "Select source channel to remove:\nName is shown first to avoid removing the wrong source.",
+            reply_markup=remove_channels_keyboard(page),
+        )
+
+    elif data.startswith("rmc_"):
+        ch_to_remove = data.split("_", 1)[1]
+        record = get_channel_record(ch_to_remove)
+        title = record.get("title") or ch_to_remove
+        await run_blocking("db", rm_channel_db, ch_to_remove)
+        await run_blocking("db", load_channels)
+        await safe_edit(query.message, f"Removed source:\n{title}\nID: {ch_to_remove}", reply_markup=channels_keyboard(0))
+
+    elif data in ["act_addsub", "act_bansub", "act_remmember"]:
+        owner_states.pop(OWNER_ID, None)
+        action = "add" if data == "act_addsub" else ("ban" if data == "act_bansub" else "kick")
+        await safe_edit(query.message, "Loading member list...")
+        kb, total_m, curr_p, total_p = await build_member_keyboard(action, 0)
+        note = MEMBERS_CACHE.get("error", "")
+        text = f"Select user\nMembers: {total_m} | Page: {curr_p}/{total_p}"
+        if note:
+            text += f"\nNote: {note[:120]}"
+        await safe_edit(query.message, text, reply_markup=kb)
+
+    elif data == "act_remsub":
+        owner_states.pop(OWNER_ID, None)
+        kb, total_m, curr_p, total_p = build_subscription_keyboard("remove", 0)
+        await safe_edit(query.message, f"Select subscription to remove\nActive: {total_m} | Page: {curr_p}/{total_p}", reply_markup=kb)
+
+    elif data.startswith("page_"):
+        parts = data.split("_")
+        kb, total_m, curr_p, total_p = await build_member_keyboard(parts[1], int(parts[2]))
+        await safe_edit(query.message, f"Select user:\nTotal members: {total_m} | Page: {curr_p}/{total_p}", reply_markup=kb)
+
+    elif data.startswith("subpage_"):
+        parts = data.split("_")
+        kb, total_m, curr_p, total_p = build_subscription_keyboard(parts[1], int(parts[2]))
+        await safe_edit(query.message, f"Select subscription\nActive: {total_m} | Page: {curr_p}/{total_p}", reply_markup=kb)
+
+    elif data.startswith("sel_"):
+        parts = data.split("_")
+        action = parts[1]
+        uid = parts[2]
+        if action == "add":
+            await safe_edit(query.message, f"Selected ID: {uid}\nChoose subscription length:", reply_markup=subscription_duration_keyboard(uid))
+        elif action == "ban":
+            await safe_edit(query.message, f"Selected ID: {uid}\nChoose ban length:", reply_markup=ban_duration_keyboard(uid))
+        else:
+            await safe_edit(query.message, f"Selected ID: {uid}\nConfirm member removal:", reply_markup=confirm_remove_member_keyboard(uid))
+
+    elif data.startswith("selsub_"):
+        parts = data.split("_")
+        uid = parts[2]
+        await safe_edit(query.message, f"Selected subscription: {uid}\nConfirm removal:", reply_markup=confirm_remove_subscription_keyboard(uid))
+
+    elif data.startswith("manual_"):
+        action = data.split("_")[1]
+        if action == "add":
+            owner_states[OWNER_ID] = {"action": "wait_addsub_id"}
+            await safe_edit(query.message, "Send the user ID to add:", reply_markup=cancel_keyboard())
+        elif action == "ban":
+            owner_states[OWNER_ID] = {"action": "wait_bansub_id"}
+            await safe_edit(query.message, "Send the user ID to ban:", reply_markup=cancel_keyboard())
+        elif action == "remove":
+            owner_states[OWNER_ID] = {"action": "wait_remsub_id"}
+            await safe_edit(query.message, "Send the user ID to remove subscription:", reply_markup=cancel_keyboard())
+        else:
+            owner_states[OWNER_ID] = {"action": "wait_remmember_id"}
+            await safe_edit(query.message, "Send the user ID to remove from channel:", reply_markup=cancel_keyboard())
+
+    elif data == "act_members":
+        await telegram_gateway_await('query.answer', lambda: query.answer("Fetching members...", show_alert=False))
+        await safe_edit(query.message, "Collecting member data...")
+        await safe_edit(query.message, await format_member_list(), reply_markup=members_keyboard())
+
+    elif data.startswith("sync_"):
+        await telegram_gateway_await('query.answer', lambda: query.answer("Manual sync is disabled. Auto recovery is always running.", show_alert=True))
+        await safe_edit(query.message, "Manual sync is disabled.\nAuto guard + auto recovery will scan sources automatically.", reply_markup=sync_keyboard())
+
+    elif data == "act_deepclean":
+        await telegram_gateway_await('query.answer', lambda: query.answer("Deep clean started.", show_alert=False))
+        status_msg = await telegram_gateway_await('query.message.edit_text', lambda: query.message.edit_text("Initializing deep clean..."))
+        asyncio.create_task(run_full_deep_cleaner(status_msg))
+
+    elif data == "act_target_index_clean":
+        await telegram_gateway_await('query.answer', lambda: query.answer("Target duplicate scan started.", show_alert=False))
+        status_msg = await telegram_gateway_await('query.message.edit_text', lambda: query.message.edit_text("Building target index and removing duplicate media..."))
+        async def run_target_index_clean():
+            try:
+                result = await build_target_media_index(
+                    delete_duplicates=True,
+                    status_msg=status_msg,
+                    reason="manual_target_duplicate_clean",
+                )
+                await safe_edit(
+                    status_msg,
+                    (
+                        "Target duplicate clean complete.\n"
+                        f"Scanned: {result.get('scanned', 0)}\n"
+                        f"Unique: {result.get('unique', 0)}\n"
+                        f"Duplicates found: {result.get('duplicates', 0)}\n"
+                        f"Deleted: {result.get('deleted', 0)}"
+                    ),
+                    reply_markup=clean_keyboard(),
+                )
+            except Exception as e:
+                await safe_edit(status_msg, f"Target duplicate clean failed:\n{str(e)[:500]}", reply_markup=clean_keyboard())
+        asyncio.create_task(run_target_index_clean())
+
+    elif data == "act_remove_gifs":
+        await telegram_gateway_await('query.answer', lambda: query.answer("GIF clean started.", show_alert=False))
+        status_msg = await telegram_gateway_await('query.message.edit_text', lambda: query.message.edit_text("Scanning target channel for GIFs..."))
+        asyncio.create_task(run_remove_gifs(status_msg))
+
+    elif data.startswith("sub_"):
+        parts = data.split("_")
+        uid, days = parts[1], int(parts[2])
+        await safe_edit(query.message, "Processing...")
+        try:
+            with contextlib.suppress(Exception):
+                await telegram_gateway_await('app.unban_chat_member', lambda: app.unban_chat_member(TARGET_CHAT_ID, int(uid)))
+            expire_date = await run_blocking("db", add_subscription, uid, days)
+            with contextlib.suppress(Exception):
+                user_obj = await telegram_gateway_await('app.get_users', lambda: app.get_users(int(uid)))
+                await run_blocking(
+                    "db", update_subscription_profile_cache,
+                    uid,
+                    first_name=getattr(user_obj, "first_name", "") or "",
+                    last_name=getattr(user_obj, "last_name", "") or "",
+                    username=getattr(user_obj, "username", "") or "",
+                    deleted=bool(getattr(user_obj, "is_deleted", False)),
+                )
+                user_menu_text = await get_public_menu_text(user_obj)
+                user_menu_markup = await public_keyboard(user_obj)
+                await telegram_gateway_await(
+                    "app.send_message",
+                    lambda: app.send_message(
+                        int(uid),
+                        user_menu_text,
+                        reply_markup=user_menu_markup,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    ),
+                )
+            await safe_edit(
+                query.message,
+                await get_subscribers_dashboard_text_live(note=f"Added {uid}; expires {format_display_datetime(expire_date)}"),
+                reply_markup=subscribers_dashboard_keyboard(0),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            await handle_ai_error(e, "add_sub")
+
+    elif data.startswith("rmsub_"):
+        uid = data.split("_", 1)[1]
+        await safe_edit(query.message, "Removing subscription...")
+        try:
+            await run_blocking("db", remove_subscription, uid)
+            removed, remove_error = await remove_member_from_target(uid)
+            note = "User removed from target channel." if removed else f"Channel remove failed: {remove_error}"
+            await safe_edit(
+                query.message,
+                await get_subscribers_dashboard_text_live(note=f"Removed {uid}. {note}"),
+                reply_markup=subscribers_dashboard_keyboard(0),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            await handle_ai_error(e, "remove_sub")
+
+    elif data.startswith("kick_"):
+        uid = data.split("_", 1)[1]
+        await safe_edit(query.message, "Removing member from channel...")
+        try:
+            removed, remove_error = await remove_member_from_target(uid)
+            if not removed:
+                raise RuntimeError(remove_error or "remove failed")
+            await run_blocking("db", remove_subscription, uid, "member_removed")
+            await safe_edit(
+                query.message,
+                await get_subscribers_dashboard_text_live(note=f"Member removed from target: {uid}"),
+                reply_markup=subscribers_dashboard_keyboard(0),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            await handle_ai_error(e, "remove_member")
+
+    elif data.startswith("ban_"):
+        parts = data.split("_")
+        uid = parts[1]
+        days = int(parts[2])
+        await safe_edit(query.message, "Processing...")
+        try:
+            user_id = int(uid)
+            if days >= 999:
+                await telegram_gateway_await('app.ban_chat_member', lambda: app.ban_chat_member(TARGET_CHAT_ID, user_id))
+            else:
+                await telegram_gateway_await('app.ban_chat_member', lambda: app.ban_chat_member(TARGET_CHAT_ID, user_id, until_date=datetime.now() + timedelta(days=days)))
+            await run_blocking("db", mark_subscription_banned, uid, days)
+            await safe_edit(
+                query.message,
+                await get_subscribers_dashboard_text_live(note=f"Banned {uid}; {'Permanent' if days >= 999 else str(days) + ' day(s)'}"),
+                reply_markup=subscribers_dashboard_keyboard(0),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            await handle_ai_error(e, "ban_sub")
+
+
+async def actual_public_callback_logic(client, query):
+    if query.data == "pub_contact":
+        await forward_contact_request_to_support(client, query)
+        return
+    if not await run_blocking("control", get_user_subscription, query.from_user.id):
+        with contextlib.suppress(Exception):
+            await telegram_gateway_await('query.answer', lambda: query.answer())
+        return
+    if query.data == "pub_refresh":
+        await safe_edit(
+            query.message,
+            await get_public_menu_text(query.from_user),
+            reply_markup=await public_keyboard(query.from_user),
+            parse_mode=ParseMode.HTML,
+        )
+    elif query.data == "pub_sub_info":
+        txt = await get_public_menu_text(query.from_user)
+        await safe_edit(query.message, txt, reply_markup=await public_keyboard(query.from_user), parse_mode=ParseMode.HTML)
+
+
+async def supervise_loop(name, coro_factory, restart_delay=5):
+    while True:
+        started = time.monotonic()
+        log_event(f"Task start: {name}")
+        try:
+            await coro_factory()
+            duration = time.monotonic() - started
+            log_event(f"Task finish: {name} duration={duration:.2f}s; restarting in {restart_delay}s")
+        except asyncio.CancelledError:
+            duration = time.monotonic() - started
+            log_event(f"Task cancelled: {name} duration={duration:.2f}s")
+            raise
+        except Exception as e:
+            duration = time.monotonic() - started
+            log_event(f"Task error: {name} duration={duration:.2f}s error={e}; restarting in {restart_delay}s")
+        await asyncio.sleep(restart_delay)
+
+
+async def run_once_supervised(name, coro_factory):
+    try:
+        await coro_factory()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log_event(f"{name} failed safely: {format_exception_for_log(e)}")
+
+
+async def recover_queue_state_once():
+    """Stage every persisted job in bounded batches before source history admission."""
+    while not QUEUE_RECOVERY_READY.is_set():
+        try:
+            stats = await recover_queue_state()
+            pending = len(persisted_recovery_pending_job_ids())
+            if pending == 0:
+                QUEUE_RECOVERY_READY.set()
+                log_event(
+                    "Persisted queue recovery barrier released: every unfinished job is "
+                    f"live or terminal; reservations={persisted_queue_reservations.owner_count()} "
+                    f"job(s)/{persisted_queue_reservations.key_count()} key(s)."
+                )
+                return
+            PIPELINE_SCAN_STATUS["phase"] = f"recovering queue {pending}"
+            delay = QUEUE_RECOVERY_RETRY_SECONDS
+            if stats and stats.get("busy"):
+                delay = max(delay, 5)
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event(
+                "Queue recovery failed safely; source admission remains blocked and recovery "
+                f"will retry: {format_exception_for_log(e)}"
+            )
+            await asyncio.sleep(max(5, QUEUE_RECOVERY_RETRY_SECONDS))
+
+
+async def queue_healer_loop():
+    if not QUEUE_HEALER_ENABLED:
+        await asyncio.Event().wait()
+    await asyncio.sleep(max(60, QUEUE_HEALER_INTERVAL_SECONDS))
+    await QUEUE_RECOVERY_READY.wait()
+    while True:
+        try:
+            await wait_while_session_invalid("queue healer")
+            stale = queue_state_stale_count(force=True)
+            if stale and pipeline_job_count() == 0:
+                clear_processing_cache_if_idle("queue healer")
+                log_event(f"Queue healer detected {stale} stale job state(s); running recovery.")
+                await recover_queue_state()
+            elif stale:
+                stalled = stalled_worker_jobs()
+                if stalled:
+                    job = stalled[0]
+                    log_event(
+                        f"Queue healer found long-running {job.get('worker')} job {job.get('job_id')} "
+                        f"with {stale} stale state record(s); leaving the live job intact."
+                    )
+                    if WORKER_STALL_FORCE_RESTART:
+                        request_automatic_process_restart(
+                            f"queue healer found worker {job.get('worker')} over "
+                            f"{WORKER_STALL_SECONDS}s on job {job.get('job_id')}"
+                        )
+                log_event(
+                    f"Queue healer sees {stale} stale state record(s), but live queue is active "
+                    f"D{channel_download_queue.qsize()} U{upload_queue.qsize()} L{link_process_queue.qsize()}."
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event(f"Queue healer error: {str(e)[:180]}")
+        await asyncio.sleep(max(120, QUEUE_HEALER_INTERVAL_SECONDS))
+
+
+def initialize_runtime_state_sync():
+    init_state_files()
+    apply_runtime_config()
+    load_source_link_report_config()
+    init_db()
+    if reactivate_recoverable_peer_sources():
+        load_channels()
+    loaded_target = load_target_full_index_from_db()
+    loaded_dead = load_dead_media_from_state()
+    log_db_startup_status()
+    return loaded_target, loaded_dead
+
+
+def validate_runtime_configuration():
+    """Fail fast on unsafe or contradictory production configuration."""
+    errors = []
+    if API_ID and int(API_ID) <= 0:
+        errors.append("ROYELLS_API_ID must be positive")
+    if OWNER_ID and TARGET_CHAT_ID and int(OWNER_ID) == int(TARGET_CHAT_ID):
+        errors.append("owner user and target chat must be different")
+    if TELEGRAM_API_CONCURRENCY < 1 or MAX_CONCURRENT_TRANSMISSIONS < 1:
+        errors.append("Telegram concurrency values must be at least 1")
+    if MAIN_LOCAL_QUEUE_SOFT_LIMIT < 1 or MAIN_LOCAL_QUEUE_HARD_LIMIT < MAIN_LOCAL_QUEUE_SOFT_LIMIT:
+        errors.append("queue hard limit must be >= soft limit >= 1")
+    if DOWNLOAD_WORKERS < 1 or UPLOAD_WORKERS < 1 or LINK_WORKERS < 1:
+        errors.append("download/upload/link worker counts must be at least 1")
+    for directory in (DATA_DIR, RUNTIME_DIR, STATE_DIR, BACKUP_DIR, DOWNLOAD_DIR):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            probe = directory / f".write_probe_{BOOT_ID}"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+        except Exception as exc:
+            errors.append(f"directory not writable: {directory}: {exc}")
+    if errors:
+        raise RuntimeError("Invalid production configuration: " + "; ".join(errors))
+    return True
+
+
+async def main():
+    global DB_REQUIRES_TARGET_REINDEX, SHUTDOWN_REQUESTED, RUNTIME_CHECKPOINT_LOOP
+    SHUTDOWN_REQUESTED = False
+    RUNTIME_CHECKPOINT_LOOP = asyncio.get_running_loop()
+    install_asyncio_diagnostics(RUNTIME_CHECKPOINT_LOOP)
+    missing = []
+    if not API_ID:
+        missing.append("ROYELLS_API_ID")
+    if not API_HASH:
+        missing.append("ROYELLS_API_HASH")
+    if not BOT_TOKEN:
+        missing.append("ROYELLS_BOT_TOKEN")
+    if not OWNER_ID:
+        missing.append("ROYELLS_OWNER_ID")
+    if not TARGET_CHAT_ID:
+        missing.append("ROYELLS_TARGET_CHAT_ID")
+    if missing:
+        raise RuntimeError("Missing required environment variable(s): " + ", ".join(missing))
+    validate_runtime_configuration()
+
+    log_event("=" * 50)
+    log_event(f"Starting Royells Bot v{APP_VERSION}")
+    log_event(f"Deploy target: {'Hugging Face Space' if IS_HUGGINGFACE_SPACE else 'local'}")
+    log_event(f"Data folder: {DATA_DIR}")
+    log_event(f"Runtime folder: {RUNTIME_DIR}")
+    log_event(
+        f"Workers: bot={WORKERS}, button={BUTTON_WORKERS}, download={DOWNLOAD_WORKERS}, "
+        f"upload={UPLOAD_WORKERS}, link={LINK_WORKERS}, api_concurrency={TELEGRAM_API_CONCURRENCY}"
+    )
+
+    start_keepalive_http_server()
+    acquire_single_instance_lock()
+    restored = await run_blocking("persistence", restore_state_backup_if_needed)
+    if restored:
+        log_event(f"Restored {restored} file(s) from persistent backup.")
+    purged_sessions = await run_blocking("persistence", purge_local_session_files, "post-restore")
+    if purged_sessions:
+        log_event(f"Purged {purged_sessions} restored Telegram session file(s); env session string/bot token will be used.")
+    await run_blocking("db", repair_db_from_backup_if_needed)
+    loaded_target, loaded_dead = await run_blocking("persistence", initialize_runtime_state_sync)
+    start_state_save_worker()
+    checkpoint_payload, checkpoint_source = await run_blocking("persistence", load_runtime_checkpoint_sync)
+    intent_snapshot, intent_source = await run_blocking("persistence", load_delivery_intents_sync)
+    checkpoint_restore = await run_blocking(
+        "persistence",
+        restore_runtime_checkpoint_sync,
+        checkpoint_payload,
+    )
+    if checkpoint_payload:
+        log_event(
+            f"Runtime checkpoint loaded from {checkpoint_source or 'unknown'}: "
+            f"merged={checkpoint_restore.get('merged', 0)}, "
+            f"intents={checkpoint_restore.get('intents', 0)}."
+        )
+    if intent_snapshot:
+        log_event(f"Delivery intent ledger loaded from {intent_source or 'unknown'}: {len(intent_snapshot)} pending intent(s).")
+    reserved_jobs, reserved_keys = initialize_persisted_queue_reservations()
+    hot_state = reconcile_startup_hot_scan_state()
+    PIPELINE_SCAN_STATUS.update(
+        {
+            "phase": "queue recovery",
+            "hot_done": len(hot_state.get("completed_sources", [])),
+            "hot_total": len(hot_state.get("source_order", [])),
+            "last_source": str(hot_state.get("current_source") or ""),
+            "queued": int(hot_state.get("queued") or 0),
+        }
+    )
+    log_event(
+        f"Startup queue reservations ready: {reserved_jobs} recoverable job(s), "
+        f"{reserved_keys} media key(s). Hot-500 durable progress: "
+        f"{len(hot_state.get('completed_sources', []))}/"
+        f"{len(hot_state.get('source_order', []))} source(s)."
+    )
+    log_event(f"Loaded target media index: {loaded_target} uid(s); dead media skip list: {loaded_dead} uid(s).")
+
+    await start_telegram_client_safely(userbot, "userbot")
+    await start_telegram_client_safely(app, "bot")
+    with contextlib.suppress(Exception):
+        me = await telegram_gateway_await('app.get_me', lambda: app.get_me())
+        log_event(f"Bot identity: @{getattr(me, 'username', '') or 'unknown'} id={getattr(me, 'id', '')}")
+    await startup_peer_warmup(include_userbot=True)
+
+    log_event("Bot and userbot started.")
+    log_event("Persistent JSON files are ready.")
+    if DB_REQUIRES_TARGET_REINDEX:
+        log_event("Fresh/rebuilt SQLite detected; rebuilding target index before queue recovery or source admission.")
+        await build_target_media_index(
+            delete_duplicates=False,
+            reason="fresh_db_target_index",
+        )
+        DB_REQUIRES_TARGET_REINDEX = False
+        log_event("Fresh/rebuilt SQLite target index is ready.")
+    await recover_delivery_intents_after_restart()
+    await restore_checkpoint_runtime_queues_after_telegram(checkpoint_payload)
+    await checkpoint_runtime_state("startup restore complete", force=True)
+    log_event("Crash recovery is active.")
+    start_hard_watchdog("main")
+
+    workers = []
+    workers.append(asyncio.create_task(supervise_loop("event_loop_heartbeat", event_loop_heartbeat_loop), name="event_loop_heartbeat"))
+    if ASYNC_DIAGNOSTICS_ENABLED:
+        workers.append(asyncio.create_task(supervise_loop("asyncio_diagnostics", asyncio_diagnostics_loop), name="asyncio_diagnostics"))
+    else:
+        log_event("Async task-age diagnostics disabled; heartbeat and hard watchdog remain active.")
+    workers.append(asyncio.create_task(supervise_loop("critical_db_writer", critical_db_writer_loop), name="critical_db_writer"))
+    workers.append(asyncio.create_task(supervise_loop("job_state_db_writer", job_state_db_writer_loop), name="job_state_db_writer"))
+    workers.append(asyncio.create_task(supervise_loop("runtime_checkpoint", runtime_checkpoint_loop), name="runtime_checkpoint"))
+    workers.append(asyncio.create_task(supervise_loop("retry_scheduler", retry_scheduler_loop), name="retry_scheduler"))
+    for i in range(max(1, DOWNLOAD_WORKERS)):
+        workers.append(asyncio.create_task(supervise_loop(f"DL W{i + 1}", lambda i=i: channel_download_worker_loop(i + 1))))
+    for i in range(max(1, UPLOAD_WORKERS)):
+        workers.append(asyncio.create_task(supervise_loop(f"UP W{i + 1}", lambda i=i: upload_worker_loop(i + 1))))
+    for i in range(max(1, LINK_WORKERS)):
+        workers.append(asyncio.create_task(supervise_loop(f"LINK W{i + 1}", lambda i=i: link_process_worker_loop(i + 1))))
+    for i in range(max(1, BUTTON_WORKERS)):
+        workers.append(asyncio.create_task(supervise_loop(f"BUTTON W{i + 1}", lambda i=i: button_worker_loop(i + 1))))
+    workers.append(asyncio.create_task(recover_queue_state_once()))
+    workers.append(asyncio.create_task(supervise_loop("queue_healer", queue_healer_loop)))
+    workers.append(asyncio.create_task(supervise_loop("runtime_resource_guard", runtime_resource_guard_loop)))
+    workers.append(asyncio.create_task(supervise_loop("outbound_keepalive", outbound_keepalive_loop)))
+    workers.append(asyncio.create_task(supervise_loop("persistent_backup", persistent_backup_loop)))
+    workers.append(asyncio.create_task(supervise_loop("telegram_backup", telegram_backup_loop)))
+    workers.append(asyncio.create_task(supervise_loop("diagnostic_report", diagnostic_report_loop)))
+    workers.append(asyncio.create_task(supervise_loop("session_validator", session_validator_loop)))
+    workers.append(asyncio.create_task(supervise_loop("watchdog", watchdog_loop)))
+    workers.append(asyncio.create_task(supervise_loop("target_media_index", target_media_index_loop)))
+    if STARTUP_CATCHUP_ENABLED and not ADAPTIVE_INTAKE_ENABLED:
+        workers.append(asyncio.create_task(run_once_supervised("startup_source_scan", startup_source_scan_loop)))
+    if IMMEDIATE_RESCUE_ENABLED and not ADAPTIVE_INTAKE_ENABLED:
+        workers.append(asyncio.create_task(run_once_supervised("immediate_startup_rescue", immediate_startup_rescue_scan_loop)))
+    if ADAPTIVE_INTAKE_ENABLED:
+        workers.append(asyncio.create_task(run_once_supervised("startup_hot_scan", startup_hot_scan_once)))
+        workers.append(asyncio.create_task(supervise_loop("adaptive_source_intake", adaptive_source_intake_loop)))
+        workers.append(asyncio.create_task(supervise_loop("historical_backfill", historical_backfill_loop)))
+    workers.append(asyncio.create_task(delayed_health_check_once()))
+    if AUTO_SYNC_ENABLED and not ADAPTIVE_INTAKE_ENABLED:
+        workers.append(asyncio.create_task(supervise_loop("auto_sync", auto_sync_loop)))
+    else:
+        last_auto_sync.update({"status": "disabled", "time": now_iso(), "queued": 0})
+    if AUTO_RECOVERY_ENABLED:
+        workers.append(asyncio.create_task(supervise_loop("auto_recovery", auto_recovery_loop)))
+    if SOURCE_GUARD_ENABLED and not ADAPTIVE_INTAKE_ENABLED:
+        workers.append(asyncio.create_task(supervise_loop("source_guard", source_guard_loop)))
+    else:
+        last_source_guard.update({"status": "disabled", "time": now_iso(), "queued": 0})
+
+    try:
+        await telegram_gateway_await('app.send_message', lambda: app.send_message(OWNER_ID, "Royells Bot started successfully. Crash recovery and source guard are active."))
+        log_event("Owner startup ping sent successfully.")
+    except Exception as e:
+        log_event(f"Owner startup ping failed: {str(e)[:220]}")
+
+    try:
+        await wait_for_shutdown_signal()
+    finally:
+        SHUTDOWN_REQUESTED = True
+        await checkpoint_runtime_state("shutdown requested", force=True)
+        log_event("Shutting down workers...")
+        await stop_all_live_dashboards()
+        await stop_all_live_logs()
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await app.stop()
+        with contextlib.suppress(Exception):
+            await userbot.stop()
+        state_stopped = await run_blocking("persistence", stop_state_save_worker, 30)
+        if not state_stopped:
+            log_event("State writer did not fully stop before shutdown deadline; last durable generation retained.")
+        stop_keepalive_http_server()
+
+
+if __name__ == "__main__":
+    bootstrap_log("entering application runner")
+    try:
+        asyncio.run(main())
+        print("Main loop returned unexpectedly. Automatic restart is disabled.", flush=True)
+    except KeyboardInterrupt:
+        print("Bot stopped by user.")
+    except Exception as e:
+        print("FATAL CRASH:", repr(e), flush=True)
+        print("Automatic restart is disabled; use a manual Factory Restart after inspecting logs.", flush=True)
+        raise

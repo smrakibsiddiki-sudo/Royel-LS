@@ -1,0 +1,5 @@
+Pyrogram>=2.0.106,<3
+TgCrypto>=1.2.5
+requests>=2.31.0
+Pillow>=10.0.0
+ImageHash>=4.3.1
