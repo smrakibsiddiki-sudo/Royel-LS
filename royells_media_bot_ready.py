@@ -140,6 +140,7 @@ from pyrogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
 )
@@ -266,8 +267,13 @@ def env_url_list(*names):
     return urls
 
 
-IS_HUGGINGFACE_SPACE = env_bool("ROYELLS_HUGGINGFACE_SPACE") or bool(os.getenv("SPACE_ID") or os.getenv("SPACE_HOST"))
 E2_MICRO_SAFE_PROFILE = env_bool("ROYELLS_E2_MICRO_PROFILE", False)
+IS_HUGGINGFACE_SPACE = (
+    not E2_MICRO_SAFE_PROFILE
+) and (
+    env_bool("ROYELLS_HUGGINGFACE_SPACE")
+    or bool(os.getenv("SPACE_ID") or os.getenv("SPACE_HOST"))
+)
 
 # Sensitive values must come from environment variables or Hugging Face Secrets.
 API_ID = env_int("ROYELLS_API_ID", "0")
@@ -801,7 +807,15 @@ SCAN_ALBUM_PREFETCH_TIMEOUT_SECONDS = max(
     15,
     env_int("ROYELLS_SCAN_ALBUM_PREFETCH_TIMEOUT_SECONDS", str(TELEGRAM_CALL_TIMEOUT_SECONDS)),
 )
-SOURCE_PEER_RESOLVE_COOLDOWN_SECONDS = max(1800, int(os.getenv("ROYELLS_SOURCE_PEER_RESOLVE_COOLDOWN_SECONDS", "1800")))
+SOURCE_PEER_RESOLVE_COOLDOWN_SECONDS = max(
+    300 if E2_MICRO_SAFE_PROFILE else 1800,
+    int(
+        os.getenv(
+            "ROYELLS_SOURCE_PEER_RESOLVE_COOLDOWN_SECONDS",
+            "300" if E2_MICRO_SAFE_PROFILE else "1800",
+        )
+    ),
+)
 DOWNLOAD_STORAGE_LIMIT_MB = int(os.getenv("ROYELLS_DOWNLOAD_STORAGE_LIMIT_MB", "4096"))
 MIN_FREE_STORAGE_MB = int(os.getenv("ROYELLS_MIN_FREE_STORAGE_MB", "2048" if IS_HUGGINGFACE_SPACE else "1024"))
 DOWNLOAD_ATTEMPT_CLEANUP_GRACE_SECONDS = max(
@@ -863,7 +877,7 @@ SLOW_LOG_RATE_LIMIT_SECONDS = max(
     env_int("ROYELLS_SLOW_LOG_RATE_LIMIT_SECONDS", "60"),
 )
 DB_HEALTH_CHECK_INTERVAL_SECONDS = max(
-    30,
+    300 if E2_MICRO_SAFE_PROFILE else 30,
     env_int("ROYELLS_DB_HEALTH_CHECK_INTERVAL_SECONDS", "120"),
 )
 DB_ONLINE_RECOVERY_COOLDOWN_SECONDS = max(
@@ -881,7 +895,14 @@ DB_OPEN_RETRY_BASE_SECONDS = max(0.05, float(os.getenv("ROYELLS_DB_OPEN_RETRY_BA
 DB_STARTUP_READY_ATTEMPTS = max(1, min(30, env_int("ROYELLS_DB_STARTUP_READY_ATTEMPTS", "10")))
 DB_STARTUP_READY_DELAY_SECONDS = max(0.1, float(os.getenv("ROYELLS_DB_STARTUP_READY_DELAY_SECONDS", "1.5")))
 DB_OPEN_STARTUP_SIDECAR_REPAIR = env_bool("ROYELLS_DB_OPEN_STARTUP_SIDECAR_REPAIR", True)
-DB_MAINTENANCE_ENABLED = env_bool("ROYELLS_DB_MAINTENANCE", True)
+DB_STARTUP_DEEP_CHECK = env_bool(
+    "ROYELLS_DB_STARTUP_DEEP_CHECK",
+    False if E2_MICRO_SAFE_PROFILE else True,
+)
+DB_MAINTENANCE_ENABLED = env_bool(
+    "ROYELLS_DB_MAINTENANCE",
+    False if E2_MICRO_SAFE_PROFILE else True,
+)
 DB_MAINTENANCE_INTERVAL_SECONDS = max(
     900,
     env_int("ROYELLS_DB_MAINTENANCE_INTERVAL_SECONDS", "21600"),
@@ -982,6 +1003,29 @@ TARGET_MEDIA_INDEX_INTERVAL_SECONDS = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_
 TARGET_MEDIA_INDEX_PAGE_LIMIT = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_PAGE_LIMIT", str(DEEP_CLEAN_HISTORY_PAGE_LIMIT)))
 TARGET_MEDIA_INDEX_MAX_HISTORY = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_MAX_HISTORY", "0"))
 TARGET_MEDIA_INDEX_DELETE_DUPLICATES = env_bool("ROYELLS_TARGET_MEDIA_INDEX_DELETE_DUPLICATES", True)
+DB_STATS_REFRESH_INTERVAL_SECONDS = max(
+    300 if E2_MICRO_SAFE_PROFILE else 15,
+    env_int(
+        "ROYELLS_DB_STATS_REFRESH_INTERVAL_SECONDS",
+        "300" if E2_MICRO_SAFE_PROFILE else "15",
+    ),
+)
+LEDGER_DUPLICATE_SKIP = env_bool(
+    "ROYELLS_LEDGER_DUPLICATE_SKIP",
+    True if E2_MICRO_SAFE_PROFILE else False,
+)
+SOURCE_UPLOAD_AS_DOCUMENT = env_bool(
+    "ROYELLS_SOURCE_UPLOAD_AS_DOCUMENT",
+    True if E2_MICRO_SAFE_PROFILE else False,
+)
+SOURCE_VIDEO_UPLOAD_AS_DOCUMENT = env_bool(
+    "ROYELLS_SOURCE_VIDEO_UPLOAD_AS_DOCUMENT",
+    SOURCE_UPLOAD_AS_DOCUMENT,
+)
+SOURCE_PHOTO_UPLOAD_AS_DOCUMENT = env_bool(
+    "ROYELLS_SOURCE_PHOTO_UPLOAD_AS_DOCUMENT",
+    SOURCE_UPLOAD_AS_DOCUMENT,
+)
 QUEUE_RECOVERY_BATCH_LIMIT = max(1, env_int("ROYELLS_QUEUE_RECOVERY_BATCH_LIMIT", "50"))
 QUEUE_RECOVERY_PRESSURE_TARGET = 0
 QUEUE_RECOVERY_ITEM_DELAY_SECONDS = max(0.0, float(os.getenv("ROYELLS_QUEUE_RECOVERY_ITEM_DELAY_SECONDS", "0.1")))
@@ -3716,16 +3760,19 @@ def ensure_sqlite_runtime_ready(
             with db_mutex:
                 conn = db_connect()
                 try:
-                    quick = conn.execute("PRAGMA quick_check;").fetchone()
-                    if not quick or str(quick[0]).lower() != "ok":
-                        raise RuntimeError(f"SQLite quick_check failed: {quick[0] if quick else 'missing result'}")
-                    foreign_key_error = conn.execute(
-                        "PRAGMA foreign_key_check;"
-                    ).fetchone()
-                    if foreign_key_error:
-                        raise RuntimeError(
-                            f"SQLite foreign_key_check failed: {foreign_key_error}"
-                        )
+                    if DB_STARTUP_DEEP_CHECK:
+                        quick = conn.execute("PRAGMA quick_check;").fetchone()
+                        if not quick or str(quick[0]).lower() != "ok":
+                            raise RuntimeError(f"SQLite quick_check failed: {quick[0] if quick else 'missing result'}")
+                        foreign_key_error = conn.execute(
+                            "PRAGMA foreign_key_check;"
+                        ).fetchone()
+                        if foreign_key_error:
+                            raise RuntimeError(
+                                f"SQLite foreign_key_check failed: {foreign_key_error}"
+                            )
+                    else:
+                        conn.execute("PRAGMA user_version;").fetchone()
                     if require_write:
                         conn.execute(
                             """
@@ -12432,7 +12479,7 @@ def known_duplicate_uid(uid):
 
 
 def known_duplicate_uid_memory(uid):
-    """Fast-path only canonical target evidence, never a historical UI ledger."""
+    """Fast-path duplicate evidence already loaded in memory."""
     if not uid:
         return False
     if is_dead_media_uid(uid):
@@ -12441,9 +12488,10 @@ def known_duplicate_uid_memory(uid):
         return True
     with state_mutex:
         if uid in STATE.get("target_media_index", {}).setdefault("items", {}):
-            # Keep the canonical in-memory index warm. ``clean_duplicate`` is
-            # deliberately excluded: it is an audit/UI ledger and can retain
-            # historical entries until the next verified full target scan.
+            # Keep the canonical in-memory index warm from verified target evidence.
+            target_media_full_index.add(uid)
+            return True
+        if LEDGER_DUPLICATE_SKIP and uid in STATE.get("clean_duplicate", {}).setdefault("items", {}):
             target_media_full_index.add(uid)
             return True
     return False
@@ -14072,8 +14120,9 @@ def remove_clean_duplicate_by_target_ids(message_ids):
                 item["target_message_ids"] = target_ids
                 item["updated_at"] = now_iso()
             else:
-                items.pop(uid, None)
-                remove_uid_from_target(uid)
+                item["target_message_ids"] = []
+                item["status"] = "target_deleted"
+                item["updated_at"] = now_iso()
                 removed.append(uid)
         if removed:
             STATE["clean_duplicate"].setdefault("events", []).append(
@@ -14972,7 +15021,9 @@ async def prepare_source_upload_items(messages, files, worker_id, ch_name):
 async def build_source_media_group(prepared_items):
     media_group = []
     for m, fp in prepared_items:
-        if m.photo:
+        if (m.video and SOURCE_VIDEO_UPLOAD_AS_DOCUMENT) or (m.photo and SOURCE_PHOTO_UPLOAD_AS_DOCUMENT):
+            media_group.append(InputMediaDocument(media=fp))
+        elif m.photo:
             media_group.append(InputMediaPhoto(media=fp))
         elif m.video:
             media_group.append(
@@ -15115,6 +15166,45 @@ async def target_send_video(label, video, protect_content=True, job=None, messag
     raise last_error
 
 
+async def target_send_document(label, document, protect_content=True, job=None, messages=None, operation=None):
+    last_error = None
+    intent_id = ""
+    if job is not None:
+        intent_id = await begin_delivery_intent(
+            job,
+            messages or [],
+            operation or label,
+            files=[document],
+        )
+    for client_label, client in target_media_clients():
+        try:
+            sent = await telegram_media_call(
+                f"{label} via {client_label}",
+                lambda: client.send_document(
+                    TARGET_CHAT_ID,
+                    document=document,
+                    protect_content=protect_content,
+                ),
+                upload_timeout_for_files([document]),
+                client_role=client_label,
+            )
+            await update_delivery_intent(intent_id, status="accepted", target_messages=[sent])
+            return sent
+        except Exception as e:
+            last_error = e
+            await update_delivery_intent(
+                intent_id,
+                status="ambiguous" if isinstance(e, TimeoutError) or is_temporary_network_error(e) else "failed",
+                error=e,
+            )
+            if isinstance(e, TimeoutError) or is_temporary_network_error(e):
+                raise
+            if not (is_peer_id_error(e) or is_temporary_network_error(e) or "forbidden" in str(e).lower()):
+                raise
+            log_event(f"{label} via {client_label} failed, trying next target sender: {str(e)[:140]}")
+    raise last_error
+
+
 async def target_send_media_group(label, media, protect_content=True, job=None, messages=None, files=None, operation=None):
     last_error = None
     intent_id = ""
@@ -15217,6 +15307,15 @@ async def send_prepared_source_single(m, fp, protect_content=True, job=None, ch_
     try:
         await ensure_upload_file_fingerprints(upload_state, [fp])
         if m.photo:
+            if SOURCE_PHOTO_UPLOAD_AS_DOCUMENT:
+                return await target_send_document(
+                    "send_document_photo",
+                    fp,
+                    protect_content=protect_content,
+                    job=job,
+                    messages=[m],
+                    operation=operation or "single_photo_document",
+                )
             return await target_send_photo(
                 "send_photo",
                 fp,
@@ -15226,6 +15325,15 @@ async def send_prepared_source_single(m, fp, protect_content=True, job=None, ch_
                 operation=operation or "single_photo",
             )
         if m.video:
+            if SOURCE_VIDEO_UPLOAD_AS_DOCUMENT:
+                return await target_send_document(
+                    "send_document_video",
+                    fp,
+                    protect_content=protect_content,
+                    job=job,
+                    messages=[m],
+                    operation=operation or "single_video_document",
+                )
             return await target_send_video(
                 "send_video",
                 fp,
@@ -17257,7 +17365,7 @@ async def db_stats_refresh_loop():
                 f"Dashboard DB statistics refresh deferred: {str(exc)[:160]}",
                 interval_seconds=120,
             )
-        await asyncio.sleep(15)
+        await asyncio.sleep(DB_STATS_REFRESH_INTERVAL_SECONDS)
 
 
 def short_dt(value):
