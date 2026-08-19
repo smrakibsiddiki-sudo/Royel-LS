@@ -138,7 +138,6 @@ from pyrogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
 )
@@ -530,9 +529,9 @@ TARGET_MEDIA_INDEX_INTERVAL_SECONDS = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_
 TARGET_MEDIA_INDEX_PAGE_LIMIT = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_PAGE_LIMIT", str(DEEP_CLEAN_HISTORY_PAGE_LIMIT)))
 TARGET_MEDIA_INDEX_MAX_HISTORY = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_MAX_HISTORY", "0"))
 TARGET_MEDIA_INDEX_DELETE_DUPLICATES = env_bool("ROYELLS_TARGET_MEDIA_INDEX_DELETE_DUPLICATES", True)
-SOURCE_UPLOAD_AS_DOCUMENT = env_bool("ROYELLS_SOURCE_UPLOAD_AS_DOCUMENT", True if E2_MICRO_SAFE_PROFILE else False)
-SOURCE_VIDEO_UPLOAD_AS_DOCUMENT = env_bool("ROYELLS_SOURCE_VIDEO_UPLOAD_AS_DOCUMENT", SOURCE_UPLOAD_AS_DOCUMENT)
-SOURCE_PHOTO_UPLOAD_AS_DOCUMENT = env_bool("ROYELLS_SOURCE_PHOTO_UPLOAD_AS_DOCUMENT", SOURCE_UPLOAD_AS_DOCUMENT)
+SOURCE_UPLOAD_AS_DOCUMENT = False
+SOURCE_VIDEO_UPLOAD_AS_DOCUMENT = False
+SOURCE_PHOTO_UPLOAD_AS_DOCUMENT = False
 QUEUE_RECOVERY_BATCH_LIMIT = max(1, env_int("ROYELLS_QUEUE_RECOVERY_BATCH_LIMIT", "50"))
 QUEUE_RECOVERY_PRESSURE_TARGET = max(
     1,
@@ -3042,6 +3041,21 @@ def is_invalid_media_upload_error(exc):
     )
 
 
+def is_media_artifact_refresh_error(exc):
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return any(
+        marker in text
+        for marker in [
+            "media_empty",
+            "media empty",
+            "fresh download required",
+            "requires fresh download",
+            "complete album fresh download required",
+            "source media preparation requires fresh download",
+        ]
+    )
+
+
 def format_exception_for_log(exc):
     text = str(exc).strip()
     return f"{exc.__class__.__name__}: {text}" if text else exc.__class__.__name__
@@ -3060,8 +3074,6 @@ def is_permanent_dead_media_error(exc):
             "invalid media: no telegram-ready media",
             "invalid media: all prepared media",
             "file must be non-empty",
-            "media_empty",
-            "media empty",
         ]
     )
 
@@ -8200,6 +8212,27 @@ def schedule_source_job_retry_later(job, reason):
     return schedule_queue_retry("download", retry_job, delay, reason)
 
 
+def schedule_fresh_download_retry(job, reason, delay_seconds=None):
+    retry_job = {
+        k: v
+        for k, v in job.items()
+        if k not in ("files", "_partial_download_files", "_partial_download_message_metas")
+    }
+    retry_job["attempt"] = 1
+    delay = max(10, int(delay_seconds if delay_seconds is not None else SOURCE_FAILED_RETRY_DELAY_SECONDS))
+    record_upload_job(job, "retry_later", reason)
+    record_download_job(retry_job, "retry_later", reason, files=[])
+    record_total_job(retry_job, "retry_later", reason)
+    record_sync_item(retry_job, "retry_later", reason)
+    scheduled = schedule_queue_retry("download", retry_job, delay, reason)
+    if scheduled:
+        log_event(
+            f"Fresh source download retry scheduled in {delay}s for "
+            f"{retry_job.get('ch_name', '')}: {str(reason)[:140]}"
+        )
+    return scheduled
+
+
 def record_download_job(job, status, error=None, files=None):
     job_id = job["job_id"]
     with state_mutex:
@@ -8927,9 +8960,6 @@ async def prepare_source_upload_items(messages, files, worker_id, ch_name):
 
         try:
             if m.video:
-                if SOURCE_VIDEO_UPLOAD_AS_DOCUMENT:
-                    prepared.append((m, fp))
-                    continue
                 send_fp = await fix_video_for_telegram(fp, force=FORCE_SOURCE_VIDEO_FIX)
                 if send_fp != fp:
                     generated_files.add(send_fp)
@@ -8943,9 +8973,6 @@ async def prepare_source_upload_items(messages, files, worker_id, ch_name):
                     raise Exception("video is not readable after Telegram preparation")
                 prepared.append((m, send_fp))
             elif m.photo:
-                if SOURCE_PHOTO_UPLOAD_AS_DOCUMENT:
-                    prepared.append((m, fp))
-                    continue
                 send_fp = await ensure_photo_for_telegram(fp)
                 if send_fp != fp:
                     generated_files.add(send_fp)
@@ -8969,9 +8996,7 @@ async def prepare_source_upload_items(messages, files, worker_id, ch_name):
 async def build_source_media_group(prepared_items):
     media_group = []
     for m, fp in prepared_items:
-        if (m.video and SOURCE_VIDEO_UPLOAD_AS_DOCUMENT) or (m.photo and SOURCE_PHOTO_UPLOAD_AS_DOCUMENT):
-            media_group.append(InputMediaDocument(media=fp))
-        elif m.photo:
+        if m.photo:
             media_group.append(InputMediaPhoto(media=fp))
         elif m.video:
             meta = await async_get_video_meta(fp)
@@ -9032,7 +9057,7 @@ async def target_send_photo(label, photo, protect_content=True, job=None, messag
         try:
             sent = await telegram_media_call(
                 f"{label} via {client_label}",
-                client.send_photo(TARGET_CHAT_ID, photo=photo, protect_content=protect_content),
+                client.send_photo(TARGET_CHAT_ID, photo=photo, caption="", protect_content=protect_content),
                 UPLOAD_SEND_TIMEOUT_SECONDS,
             )
             await update_delivery_intent(intent_id, status="accepted", target_messages=[sent])
@@ -9064,43 +9089,7 @@ async def target_send_video(label, video, protect_content=True, job=None, messag
         try:
             sent = await telegram_media_call(
                 f"{label} via {client_label}",
-                client.send_video(TARGET_CHAT_ID, video=video, protect_content=protect_content, **kwargs),
-                UPLOAD_SEND_TIMEOUT_SECONDS,
-            )
-            await update_delivery_intent(intent_id, status="accepted", target_messages=[sent])
-            return sent
-        except Exception as e:
-            last_error = e
-            await update_delivery_intent(
-                intent_id,
-                status="ambiguous" if isinstance(e, TimeoutError) or is_temporary_network_error(e) else "failed",
-                error=e,
-            )
-            if not (is_peer_id_error(e) or is_temporary_network_error(e) or "forbidden" in str(e).lower()):
-                raise
-            log_event(f"{label} via {client_label} failed, trying next target sender: {str(e)[:140]}")
-    raise last_error
-
-
-async def target_send_document(label, document, protect_content=True, job=None, messages=None, operation=None):
-    last_error = None
-    intent_id = ""
-    if job is not None:
-        intent_id = await begin_delivery_intent(
-            job,
-            messages or [],
-            operation or label,
-            files=[document],
-        )
-    for client_label, client in target_media_clients():
-        try:
-            sent = await telegram_media_call(
-                f"{label} via {client_label}",
-                client.send_document(
-                    TARGET_CHAT_ID,
-                    document=document,
-                    protect_content=protect_content,
-                ),
+                client.send_video(TARGET_CHAT_ID, video=video, caption="", protect_content=protect_content, **kwargs),
                 UPLOAD_SEND_TIMEOUT_SECONDS,
             )
             await update_delivery_intent(intent_id, status="accepted", target_messages=[sent])
@@ -9215,15 +9204,6 @@ async def confirm_recent_target_media_item(source_message):
 
 async def send_prepared_source_single(m, fp, protect_content=True, job=None, ch_name="", operation=None):
     if m.photo:
-        if SOURCE_PHOTO_UPLOAD_AS_DOCUMENT:
-            return await target_send_document(
-                "send_document_photo",
-                fp,
-                protect_content=protect_content,
-                job=job,
-                messages=[m],
-                operation=operation or "single_photo_document",
-            )
         return await target_send_photo(
             "send_photo",
             fp,
@@ -9233,15 +9213,6 @@ async def send_prepared_source_single(m, fp, protect_content=True, job=None, ch_
             operation=operation or "single_photo",
         )
     if m.video:
-        if SOURCE_VIDEO_UPLOAD_AS_DOCUMENT:
-            return await target_send_document(
-                "send_document_video",
-                fp,
-                protect_content=protect_content,
-                job=job,
-                messages=[m],
-                operation=operation or "single_video_document",
-            )
         meta = await async_get_video_meta(fp)
         return await target_send_video(
             "send_video",
@@ -13281,6 +13252,22 @@ async def upload_worker_loop(worker_id):
             err_str = str(e)
             err_log = format_exception_for_log(e)
             log_event(f"[UP ERROR W{worker_id}] {err_log}")
+            if is_media_artifact_refresh_error(e):
+                scheduled = schedule_fresh_download_retry(
+                    job,
+                    e,
+                    delay_seconds=30 if E2_MICRO_SAFE_PROFILE else 60,
+                )
+                if scheduled:
+                    await update_manual_link_status(
+                        job,
+                        "Upload media artifact expired/empty.\nFresh source download scheduled.",
+                    )
+                    should_cleanup = True
+                    continue
+                record_upload_job(job, "retry_admission_failed", e)
+                record_total_job(job, "retry_admission_failed", e)
+                record_sync_item(job, "retry_admission_failed", e)
             if should_skip_dead_media_now(e, attempt):
                 record_upload_job(job, "skipped_dead_media", e)
                 record_total_job(job, "skipped_dead_media", e)
