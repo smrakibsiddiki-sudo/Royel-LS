@@ -529,6 +529,10 @@ TARGET_MEDIA_INDEX_INTERVAL_SECONDS = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_
 TARGET_MEDIA_INDEX_PAGE_LIMIT = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_PAGE_LIMIT", str(DEEP_CLEAN_HISTORY_PAGE_LIMIT)))
 TARGET_MEDIA_INDEX_MAX_HISTORY = int(os.getenv("ROYELLS_TARGET_MEDIA_INDEX_MAX_HISTORY", "0"))
 TARGET_MEDIA_INDEX_DELETE_DUPLICATES = env_bool("ROYELLS_TARGET_MEDIA_INDEX_DELETE_DUPLICATES", True)
+TARGET_DOCUMENT_CLEANUP_ENABLED = env_bool("ROYELLS_TARGET_DOCUMENT_CLEANUP", True)
+TARGET_DOCUMENT_CLEANUP_START_DELAY_SECONDS = max(10, env_int("ROYELLS_TARGET_DOCUMENT_CLEANUP_START_DELAY_SECONDS", "45"))
+TARGET_DOCUMENT_CLEANUP_INTERVAL_SECONDS = max(300, env_int("ROYELLS_TARGET_DOCUMENT_CLEANUP_INTERVAL_SECONDS", "1800"))
+TARGET_DOCUMENT_CLEANUP_MAX_HISTORY = max(0, env_int("ROYELLS_TARGET_DOCUMENT_CLEANUP_MAX_HISTORY", "0"))
 SOURCE_UPLOAD_AS_DOCUMENT = False
 SOURCE_VIDEO_UPLOAD_AS_DOCUMENT = False
 SOURCE_PHOTO_UPLOAD_AS_DOCUMENT = False
@@ -15510,6 +15514,62 @@ async def target_media_index_loop():
         await asyncio.sleep(max(3600, TARGET_MEDIA_INDEX_INTERVAL_SECONDS))
 
 
+def is_unwanted_target_document_message(msg):
+    return message_has_document_payload(msg)
+
+
+async def clean_target_document_messages(reason="target_document_cleanup", max_history=None, status_msg=None):
+    if not TARGET_CHAT_ID:
+        return {"scanned": 0, "deleted": 0}
+    scanned = 0
+    deleted = 0
+    to_delete = []
+    limit = TARGET_DOCUMENT_CLEANUP_MAX_HISTORY if max_history is None else int(max_history or 0)
+    last_update = time.time()
+    log_event(f"Target document cleanup started: {reason}.")
+    async for msg in iter_chat_history_paged(TARGET_CHAT_ID, reason):
+        scanned += 1
+        if limit and scanned > limit:
+            break
+        if is_unwanted_target_document_message(msg):
+            to_delete.append(msg.id)
+        if len(to_delete) >= DEEP_CLEAN_DELETE_BATCH:
+            deleted += await delete_target_messages(to_delete)
+            to_delete = []
+            await asyncio.sleep(0.25)
+        now = time.time()
+        if status_msg and now - last_update > 3.5:
+            last_update = now
+            await safe_edit(
+                status_msg,
+                f"Cleaning target document files...\nScanned: {scanned}\nDeleted: {deleted}",
+            )
+        await asyncio.sleep(0)
+    if to_delete:
+        deleted += await delete_target_messages(to_delete)
+    if deleted:
+        log_event(f"Target document cleanup deleted {deleted} file/document message(s); scanned={scanned}.")
+    else:
+        log_event(f"Target document cleanup complete: no file/document messages found; scanned={scanned}.")
+    return {"scanned": scanned, "deleted": deleted}
+
+
+async def target_document_cleanup_loop():
+    if QUEUE_WORKER_MODE or not TARGET_DOCUMENT_CLEANUP_ENABLED:
+        log_event("Target document cleanup loop disabled.")
+        await asyncio.Event().wait()
+    await asyncio.sleep(TARGET_DOCUMENT_CLEANUP_START_DELAY_SECONDS)
+    while True:
+        try:
+            await wait_while_session_invalid("target document cleanup")
+            await clean_target_document_messages(reason="scheduled_target_document_cleanup")
+        except Exception as e:
+            if should_reconnect_telegram_error(e):
+                schedule_userbot_reconnect(f"target document cleanup: {e}")
+            log_event(f"Target document cleanup error: {e}")
+        await asyncio.sleep(TARGET_DOCUMENT_CLEANUP_INTERVAL_SECONDS)
+
+
 async def run_full_deep_cleaner_locked(status_msg):
     log_event("Starting full target channel deep clean.")
     seen_uids = {}
@@ -17513,6 +17573,7 @@ async def main():
     workers.append(asyncio.create_task(supervise_loop("diagnostic_report", diagnostic_report_loop)))
     workers.append(asyncio.create_task(supervise_loop("session_validator", session_validator_loop)))
     workers.append(asyncio.create_task(supervise_loop("watchdog", watchdog_loop)))
+    workers.append(asyncio.create_task(supervise_loop("target_document_cleanup", target_document_cleanup_loop)))
     workers.append(asyncio.create_task(supervise_loop("target_media_index", target_media_index_loop)))
     if STARTUP_CATCHUP_ENABLED and not ADAPTIVE_INTAKE_ENABLED:
         workers.append(asyncio.create_task(run_once_supervised("startup_source_scan", startup_source_scan_loop)))
