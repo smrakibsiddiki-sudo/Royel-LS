@@ -8,9 +8,8 @@ import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-os.environ.setdefault("ROYELLS_HUGGINGFACE_SPACE", "0")
-os.environ.setdefault("ROYELLS_E2_MICRO_PROFILE", "1")
-os.environ.setdefault("ROYELLS_KEEPALIVE_HTTP", "0")
+os.environ["ROYELLS_HUGGINGFACE_SPACE"] = "1"
+os.environ["ROYELLS_KEEPALIVE_HTTP"] = "0"
 
 import royells_media_bot_ready as bot
 
@@ -24,9 +23,12 @@ BOT_STATUS = {
 
 
 def status_snapshot():
+    architecture = bot.v20_health_snapshot()
+    readiness = architecture.get("readiness") or {}
     return {
-        "ok": True,
+        "ok": bool(readiness.get("ok", architecture.get("ok", False))),
         "service": "royells-mirror-bot",
+        "architecture": architecture,
         "state": BOT_STATUS.get("state") or "unknown",
         "started_at": BOT_STATUS.get("started_at") or "starting",
         "restart_count": int(BOT_STATUS.get("restart_count") or 0),
@@ -92,7 +94,15 @@ def render_html(snapshot):
 
 class RoyellsStatusHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path not in ("/", "/health", "/ping"):
+        if self.path not in (
+            "/",
+            "/health",
+            "/ping",
+            "/live",
+            "/ready",
+            "/startup",
+            "/metrics",
+        ):
             self.send_response(404)
             self.end_headers()
             return
@@ -100,10 +110,23 @@ class RoyellsStatusHandler(BaseHTTPRequestHandler):
         if self.path == "/":
             body = render_html(snapshot).encode("utf-8")
             content_type = "text/html; charset=utf-8"
+            status = 200
         else:
-            body = json.dumps(snapshot, ensure_ascii=False).encode("utf-8")
+            architecture = snapshot.get("architecture") or {}
+            if self.path in ("/ping", "/live"):
+                payload = architecture.get("liveness") or {"ok": True}
+            elif self.path == "/ready":
+                payload = architecture.get("readiness") or {"ok": False}
+            elif self.path == "/startup":
+                payload = architecture.get("startup") or {"ok": False}
+            elif self.path == "/metrics":
+                payload = architecture.get("metrics") or snapshot.get("metrics") or {}
+            else:
+                payload = snapshot
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             content_type = "application/json; charset=utf-8"
-        self.send_response(200)
+            status = 200 if self.path in ("/ping", "/live", "/metrics") or bool(payload.get("ok")) else 503
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -137,6 +160,13 @@ def stop_client_safely(client):
 if __name__ == "__main__":
     BOT_STATUS["started_at"] = bot.format_display_datetime(seconds=True)
     BOT_STATUS["state"] = "starting"
+    try:
+        bot.validate_build_manifest_before_startup()
+    except bot.BuildManifestError as exc:
+        BOT_STATUS["state"] = "build manifest failed"
+        BOT_STATUS["last_error"] = str(exc)[:1200]
+        print(str(exc), flush=True)
+        raise
     status_thread = threading.Thread(target=main, name="royells-status-http", daemon=True)
     status_thread.start()
     bot.bootstrap_log("app.py wrapper reached; running bot in main thread")
@@ -144,6 +174,19 @@ if __name__ == "__main__":
         BOT_STATUS["state"] = "running"
         BOT_STATUS["last_error"] = ""
         bot.app.run(bot.main())
+        exit_code = bot.shutdown_exit_code()
+        lifecycle_requested = bool(
+            bot.V20_SERVICES
+            and bot.V20_SERVICES.lifecycle.requested()
+        )
+        if lifecycle_requested:
+            BOT_STATUS["state"] = (
+                "controlled restart" if exit_code else "stopped"
+            )
+            BOT_STATUS["last_error"] = ""
+            if exit_code:
+                raise SystemExit(exit_code)
+            raise SystemExit(0)
         BOT_STATUS["state"] = "returned unexpectedly"
         BOT_STATUS["last_error"] = "Royells main loop returned without a shutdown request."
         print("Royells main loop returned unexpectedly.", flush=True)
