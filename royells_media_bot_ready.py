@@ -267,6 +267,7 @@ def env_url_list(*names):
 
 
 IS_HUGGINGFACE_SPACE = env_bool("ROYELLS_HUGGINGFACE_SPACE") or bool(os.getenv("SPACE_ID") or os.getenv("SPACE_HOST"))
+E2_MICRO_SAFE_PROFILE = env_bool("ROYELLS_E2_MICRO_PROFILE", False)
 
 # Sensitive values must come from environment variables or Hugging Face Secrets.
 API_ID = env_int("ROYELLS_API_ID", "0")
@@ -326,9 +327,13 @@ UPLOAD_WORKERS = 1
 LINK_WORKERS = 1
 BUTTON_WORKERS = max(1, min(2, BUTTON_WORKERS))
 ADAPTIVE_MEDIA_WORKERS_ENABLED = env_bool("ROYELLS_ADAPTIVE_MEDIA_WORKERS", True)
+_adaptive_download_cap = 1 if E2_MICRO_SAFE_PROFILE else 2
 ADAPTIVE_DOWNLOAD_WORKERS_MAX = min(
-    2,
-    max(DOWNLOAD_WORKERS, env_int("ROYELLS_ADAPTIVE_DOWNLOAD_WORKERS_MAX", "2")),
+    _adaptive_download_cap,
+    max(
+        DOWNLOAD_WORKERS,
+        env_int("ROYELLS_ADAPTIVE_DOWNLOAD_WORKERS_MAX", str(_adaptive_download_cap)),
+    ),
 )
 ADAPTIVE_UPLOAD_WORKERS_MAX = 1
 ADAPTIVE_DOWNLOAD_QUEUE_PER_WORKER = max(
@@ -376,19 +381,28 @@ SOURCE_PERMANENT_RETRY_LIMIT = max(
     1,
     env_int("ROYELLS_SOURCE_PERMANENT_RETRY_LIMIT", "24"),
 )
-MAIN_LOCAL_QUEUE_SOFT_LIMIT = 48
-MAIN_LOCAL_QUEUE_HARD_LIMIT = 64
-_download_queue_requested = env_int("ROYELLS_IN_MEMORY_QUEUE_MAX", "64")
-_upload_queue_requested = env_int("ROYELLS_UPLOAD_READY_QUEUE_MAX", "8")
+MAIN_LOCAL_QUEUE_SOFT_LIMIT = 16 if E2_MICRO_SAFE_PROFILE else 48
+MAIN_LOCAL_QUEUE_HARD_LIMIT = 24 if E2_MICRO_SAFE_PROFILE else 64
+_download_queue_requested = env_int(
+    "ROYELLS_IN_MEMORY_QUEUE_MAX",
+    "24" if E2_MICRO_SAFE_PROFILE else "64",
+)
+_upload_queue_requested = env_int(
+    "ROYELLS_UPLOAD_READY_QUEUE_MAX",
+    "4" if E2_MICRO_SAFE_PROFILE else "8",
+)
 # A zero used to mean unlimited.  Keep descriptors durable and backpressure the
 # producer instead; unlimited in-memory Pyrogram jobs amplify long Telegram stalls.
 IN_MEMORY_QUEUE_MAX = max(
     1,
-    min(64, _download_queue_requested if _download_queue_requested > 0 else 64),
+    min(
+        MAIN_LOCAL_QUEUE_HARD_LIMIT,
+        _download_queue_requested if _download_queue_requested > 0 else MAIN_LOCAL_QUEUE_HARD_LIMIT,
+    ),
 )
 UPLOAD_READY_QUEUE_MAX = max(
     1,
-    min(8, _upload_queue_requested if _upload_queue_requested > 0 else 8),
+    min(4 if E2_MICRO_SAFE_PROFILE else 8, _upload_queue_requested if _upload_queue_requested > 0 else (4 if E2_MICRO_SAFE_PROFILE else 8)),
 )
 MEDIA_ADMISSION_BACKPRESSURE_RETRY_SECONDS = max(
     5,
@@ -671,19 +685,34 @@ IMMEDIATE_RESCUE_SCAN_DELAY_SECONDS = max(5, int(os.getenv("ROYELLS_IMMEDIATE_RE
 IMMEDIATE_RESCUE_ENABLED = env_bool("ROYELLS_IMMEDIATE_RESCUE_ENABLED", False)
 ADAPTIVE_INTAKE_ENABLED = env_bool("ROYELLS_ADAPTIVE_INTAKE", True)
 ADAPTIVE_INTAKE_START_DELAY_SECONDS = max(5, env_int("ROYELLS_ADAPTIVE_INTAKE_START_DELAY_SECONDS", "45"))
-ADAPTIVE_INTAKE_INTERVAL_SECONDS = max(10, env_int("ROYELLS_ADAPTIVE_INTAKE_INTERVAL_SECONDS", "45" if IS_HUGGINGFACE_SPACE else "15"))
+ADAPTIVE_INTAKE_INTERVAL_SECONDS = max(
+    120 if E2_MICRO_SAFE_PROFILE else 10,
+    env_int(
+        "ROYELLS_ADAPTIVE_INTAKE_INTERVAL_SECONDS",
+        "120" if E2_MICRO_SAFE_PROFILE else ("45" if IS_HUGGINGFACE_SPACE else "15"),
+    ),
+)
 ADAPTIVE_INTAKE_TIMEOUT_SECONDS = max(120, env_int("ROYELLS_ADAPTIVE_INTAKE_TIMEOUT_SECONDS", "900"))
-ADAPTIVE_INTAKE_MAX_PIPELINE_JOBS = 120
-ADAPTIVE_INTAKE_BACKLOG_SLEEP_SECONDS = 30
+ADAPTIVE_INTAKE_MAX_PIPELINE_JOBS = 24 if E2_MICRO_SAFE_PROFILE else 120
+ADAPTIVE_INTAKE_BACKLOG_SLEEP_SECONDS = 120 if E2_MICRO_SAFE_PROFILE else 30
 STARTUP_HOT_SCAN_LIMIT = max(
     0,
-    env_int("ROYELLS_STARTUP_HOT_SCAN_LIMIT", "40" if IS_HUGGINGFACE_SPACE else "100"),
+    min(
+        10 if E2_MICRO_SAFE_PROFILE else 1000000,
+        env_int(
+            "ROYELLS_STARTUP_HOT_SCAN_LIMIT",
+            "10" if E2_MICRO_SAFE_PROFILE else ("40" if IS_HUGGINGFACE_SPACE else "100"),
+        ),
+    ),
 )
 STARTUP_HOT_SCAN_HISTORY_LIMIT = max(
     0,
-    env_int(
-        "ROYELLS_STARTUP_HOT_SCAN_HISTORY_LIMIT",
-        str(max(100, STARTUP_HOT_SCAN_LIMIT * 5) if STARTUP_HOT_SCAN_LIMIT else 200),
+    min(
+        50 if E2_MICRO_SAFE_PROFILE else 1000000,
+        env_int(
+            "ROYELLS_STARTUP_HOT_SCAN_HISTORY_LIMIT",
+            "50" if E2_MICRO_SAFE_PROFILE else str(max(100, STARTUP_HOT_SCAN_LIMIT * 5) if STARTUP_HOT_SCAN_LIMIT else 200),
+        ),
     ),
 )
 STARTUP_DEEP_SCAN_EVERY_BOOT = env_bool("ROYELLS_STARTUP_DEEP_SCAN_EVERY_BOOT", False)
@@ -747,7 +776,10 @@ KEEPALIVE_ERROR_BACKOFF_SECONDS = max(
 DIALOG_REFRESH_INTERVAL_SECONDS = int(os.getenv("ROYELLS_DIALOG_REFRESH_INTERVAL_SECONDS", "900"))
 STARTUP_SOURCE_PEER_WARMUP_LIMIT = max(
     0,
-    env_int("ROYELLS_STARTUP_SOURCE_PEER_WARMUP_LIMIT", "0" if IS_HUGGINGFACE_SPACE else "20"),
+    env_int(
+        "ROYELLS_STARTUP_SOURCE_PEER_WARMUP_LIMIT",
+        "20" if E2_MICRO_SAFE_PROFILE else ("0" if IS_HUGGINGFACE_SPACE else "20"),
+    ),
 )
 SOURCE_DIALOG_SCAN_ON_CACHE_MISS = env_bool(
     "ROYELLS_SOURCE_DIALOG_SCAN_ON_CACHE_MISS",
@@ -786,7 +818,10 @@ PURGE_DOWNLOADS_ON_BOOT = env_bool("ROYELLS_PURGE_DOWNLOADS_ON_BOOT", True)
 V21_STALE_TEMP_SECONDS = 0
 V21_BACKPRESSURE_UPLOAD_QUEUE_HIGH = max(
     1,
-    env_int("ROYELLS_V21_BACKPRESSURE_UPLOAD_QUEUE_HIGH", "6"),
+    min(
+        3 if E2_MICRO_SAFE_PROFILE else 8,
+        env_int("ROYELLS_V21_BACKPRESSURE_UPLOAD_QUEUE_HIGH", "3" if E2_MICRO_SAFE_PROFILE else "6"),
+    ),
 )
 HEALTH_MANIFEST_REFRESH_SECONDS = max(15, env_int("ROYELLS_HEALTH_MANIFEST_REFRESH_SECONDS", "60"))
 INCIDENT_MANIFEST_MAX_BYTES = max(
