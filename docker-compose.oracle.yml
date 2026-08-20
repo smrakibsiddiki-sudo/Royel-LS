@@ -1,0 +1,22 @@
+services:
+  royells-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: royells-bot:oracle
+    container_name: royells-bot
+    restart: unless-stopped
+    stop_grace_period: 90s
+    env_file:
+      - .env
+    environment:
+      ROYELLS_ORACLE_PROFILE_LOCK: "1"
+    volumes:
+      - ./data:/data/royells_media_bot
+    ports:
+      - "127.0.0.1:7860:7860"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"

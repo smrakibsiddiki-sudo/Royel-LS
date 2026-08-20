@@ -7,9 +7,22 @@ pinned: false
 
 # Royells Telegram Mirror Bot v21.0.0
 
-Production-ready Hugging Face Docker Space package for the main Royells Telegram media mirror bot.
+Production-ready Docker package for the main Royells Telegram media mirror bot.
 
-This is a main-bot-only build. Never run the same `ROYELLS_USER_SESSION_STRING` in another Space or process.
+This is a main-bot-only build. Never run the same `ROYELLS_USER_SESSION_STRING` in another VM, Space, container, or process.
+
+## Oracle VM profiles
+
+The release defaults to the safe `oracle-e2-micro` profile: one downloader, one
+ordered publisher, bounded queues, SQLite WAL, and low-memory backpressure. Use
+`.env.oracle-e2-micro.example` with `docker-compose.oracle.yml`. When moving to an
+Ampere A1 VM, stop E2 first and use `.env.oracle-a1.example`; A1 may scale downloads
+to two, but upload/publish remains one. See `docs/ORACLE_VM_DEPLOYMENT.md` for the
+command-by-command deployment, diagnostics, backup, and migration runbook.
+
+The 4,092-line Oracle incident analysis and r11 change ledger are in
+`ROYELLS_V21_ORACLE_E2_20260820_FORENSIC_AUDIT.md` and
+`ROYELLS_V21_ORACLE_R11_RELEASE_NOTES.md`.
 
 ## v21.0.0 Micro Worker Engine
 
@@ -24,8 +37,8 @@ This is a main-bot-only build. Never run the same `ROYELLS_USER_SESSION_STRING` 
 
 ## 2026-08-12 Final Delivery and Recovery Profile
 
-- The production shape is one ordered target publisher, one base downloader, and at most one adaptive second downloader. Uploading two independent jobs at once is intentionally prohibited because it breaks target ordering and amplifies Telegram `FILE_PART_X_MISSING` upload-session failures.
-- Active in-memory windows are bounded to 64 download descriptors and 8 upload-ready descriptors. When capacity is pressured, a complete descriptor is persisted as `retry_later` before its processing reservation can be released; source cursors cannot skip media just because the local queue is full.
+- The production shape is one ordered target publisher and one base downloader. The E2 profile remains at one downloader; the A1 profile may add one adaptive second downloader. Uploading two independent jobs at once is intentionally prohibited because it breaks target ordering and amplifies Telegram `FILE_PART_X_MISSING` upload-session failures.
+- Active in-memory windows are profile-bounded: E2 uses 24 download / 4 upload-ready descriptors and A1 uses 48 / 8. When capacity is pressured, a complete descriptor is persisted as `retry_later` before its processing reservation can be released; source cursors cannot skip media just because the local queue is full.
 - `FILE_PART_X_MISSING`, local missing/temp artifacts, `MEDIA_EMPTY`, and `CHAT_FORWARDS_RESTRICTED` are separate failure domains. They never create a permanent dead-media record merely from an upload response.
 - A protected/forward-restricted source is capability-cached and routed to fresh source download, validation, and ordered re-upload. Telegram's server-side no-forward rule cannot be bypassed by adding workers.
 - After the normal fresh-download retry budget, every source-owned job (not only a manual link) retains a durable file-free descriptor and renews recovery at 10, 30, then 90-minute capped intervals. A source scan can accelerate recovery but is never required to prevent a media miss.

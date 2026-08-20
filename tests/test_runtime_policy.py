@@ -16,15 +16,15 @@ from royells_v20_core.downloads import HybridDownloadError
 ROOT = Path(__file__).resolve().parents[1]
 BOT = (ROOT / "royells_media_bot_ready.py").read_text(encoding="utf-8")
 DOCKERFILE = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+BOT_TREE = ast.parse(BOT, filename=str(ROOT / "royells_media_bot_ready.py"))
 
 
 def load_bot_function(name, namespace=None):
     """Compile one pure/runtime helper without importing the production bot."""
 
-    tree = ast.parse(BOT)
     node = next(
         item
-        for item in tree.body
+        for item in BOT_TREE.body
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
         and item.name == name
     )
@@ -47,14 +47,14 @@ def test_process_restart_disabled_but_transport_recovery_enabled():
 
 
 def test_media_queues_are_bounded_while_descriptors_remain_durable():
-    assert "MAIN_LOCAL_QUEUE_SOFT_LIMIT = 48" in BOT
-    assert "MAIN_LOCAL_QUEUE_HARD_LIMIT = 64" in BOT
-    assert "min(64, _download_queue_requested" in BOT
-    assert "min(8, _upload_queue_requested" in BOT
+    assert "MAIN_LOCAL_QUEUE_SOFT_LIMIT = 20 if IS_ORACLE_E2_MICRO else 48" in BOT
+    assert "MAIN_LOCAL_QUEUE_HARD_LIMIT = 24 if IS_ORACLE_E2_MICRO else 64" in BOT
+    assert "min(MAIN_LOCAL_QUEUE_HARD_LIMIT, _download_queue_requested" in BOT
+    assert "4 if IS_ORACLE_E2_MICRO else 8" in BOT
     assert "maxsize=IN_MEMORY_QUEUE_MAX" in BOT
     assert "maxsize=UPLOAD_READY_QUEUE_MAX" in BOT
-    assert "ROYELLS_IN_MEMORY_QUEUE_MAX=64" in DOCKERFILE
-    assert "ROYELLS_UPLOAD_READY_QUEUE_MAX=8" in DOCKERFILE
+    assert "ROYELLS_IN_MEMORY_QUEUE_MAX=24" in DOCKERFILE
+    assert "ROYELLS_UPLOAD_READY_QUEUE_MAX=4" in DOCKERFILE
 
 
 def test_queue_recovery_owner_status_is_durable_coalesced_and_editable():
@@ -201,7 +201,7 @@ def test_source_scan_backpressure_is_enabled_before_bounded_queues_fill():
     )
 
     assert enabled() is True
-    assert "ROYELLS_SCAN_PREFETCH_PRESSURE_TARGET=48" in DOCKERFILE
+    assert "ROYELLS_SCAN_PREFETCH_PRESSURE_TARGET=20" in DOCKERFILE
     assert "ROYELLS_MEDIA_ADMISSION_BACKPRESSURE_RETRY_SECONDS=10" in DOCKERFILE
     assert "SCAN_PREFETCH_PRESSURE_TARGET = max(" in BOT
     assert "return IN_MEMORY_QUEUE_MAX > 0 and UPLOAD_READY_QUEUE_MAX > 0" in BOT
@@ -274,16 +274,16 @@ def test_production_concurrency_defaults_are_stable():
     assert "ROYELLS_TELEGRAM_API_CONCURRENCY=1" in DOCKERFILE
     assert "telegram_download_semaphore = asyncio.Semaphore(TELEGRAM_DOWNLOAD_CONCURRENCY)" in BOT
     assert "if telegram_call_uses_download_lane(label)" in BOT
-    assert "ROYELLS_TELEGRAM_DOWNLOAD_CONCURRENCY=2" in DOCKERFILE
+    assert "ROYELLS_TELEGRAM_DOWNLOAD_CONCURRENCY=1" in DOCKERFILE
     assert "ROYELLS_TELEGRAM_MEDIA_CONCURRENCY=1" in DOCKERFILE
     assert "ROYELLS_UPLOAD_ALBUM_CONCURRENCY=1" in DOCKERFILE
-    assert "ROYELLS_MAX_CONCURRENT_TRANSMISSIONS=2" in DOCKERFILE
+    assert "ROYELLS_MAX_CONCURRENT_TRANSMISSIONS=1" in DOCKERFILE
     assert "DOWNLOAD_WORKERS = 1" in BOT
     assert "UPLOAD_WORKERS = 1" in BOT
     assert "ADAPTIVE_UPLOAD_WORKERS_MAX = 1" in BOT
     assert "TELEGRAM_API_CONCURRENCY = 1" in BOT
     assert "TELEGRAM_MEDIA_CONCURRENCY = 1" in BOT
-    assert "MAX_CONCURRENT_TRANSMISSIONS = 2" in BOT
+    assert "MAX_CONCURRENT_TRANSMISSIONS = 1 if IS_ORACLE_E2_MICRO else 2" in BOT
 
 
 def test_download_lane_and_flood_wait_helpers_execute_behaviorally():
@@ -426,28 +426,31 @@ def test_stalled_upload_worker_is_cancelled_and_requeued():
 
 
 def test_adaptive_media_worker_scaler_is_enabled():
-    assert 'ADAPTIVE_MEDIA_WORKERS_ENABLED = env_bool("ROYELLS_ADAPTIVE_MEDIA_WORKERS", True)' in BOT
+    assert 'env_bool("ROYELLS_ADAPTIVE_MEDIA_WORKERS", True)' in BOT
+    assert "and not IS_ORACLE_E2_MICRO" in BOT
     assert "async def adaptive_media_worker_scaler_loop():" in BOT
     assert '"adaptive_media_worker_scaler"' in BOT
     assert "Adaptive media worker scaler started" in BOT
     assert "Adaptive media worker scaler stopped idle" in BOT
     assert "telegram_flood_gate_remaining_seconds()" in BOT
     assert "holding base capacity while Telegram FloodWait gate is active" in BOT
-    assert "ROYELLS_ADAPTIVE_MEDIA_WORKERS=1" in DOCKERFILE
-    assert "ROYELLS_ADAPTIVE_DOWNLOAD_WORKERS_MAX=2" in DOCKERFILE
+    assert "ROYELLS_ADAPTIVE_MEDIA_WORKERS=0" in DOCKERFILE
+    assert "ROYELLS_ADAPTIVE_DOWNLOAD_WORKERS_MAX=1" in DOCKERFILE
     assert "ROYELLS_ADAPTIVE_UPLOAD_WORKERS_MAX=1" in DOCKERFILE
     assert "ROYELLS_ADAPTIVE_DOWNLOAD_QUEUE_PER_WORKER=4" in DOCKERFILE
     assert "ROYELLS_ADAPTIVE_WORKER_LOW_WATERMARK=2" in DOCKERFILE
 
 
 def test_saved_runtime_settings_cannot_reenable_unsafe_parallelism():
-    limits, scope = load_bot_function("runtime_worker_limits")
+    limits, scope = load_bot_function(
+        "runtime_worker_limits", {"IS_ORACLE_E2_MICRO": True}
+    )
     clamp, _ = load_bot_function("clamp_runtime_worker_value", {"runtime_worker_limits": limits})
 
-    assert limits() == {"download": 1, "upload": 1, "link": 1, "button": 2}
+    assert limits() == {"download": 1, "upload": 1, "link": 1, "button": 1}
     assert clamp("download", 99) == 1
     assert clamp("upload", 3) == 1
-    assert clamp("button", 99) == 2
+    assert clamp("button", 99) == 1
     assert "media_queue_limits=download:{IN_MEMORY_QUEUE_MAX}/upload:{UPLOAD_READY_QUEUE_MAX}" in BOT
 
 
@@ -890,7 +893,10 @@ def test_active_media_rpc_heartbeat_protects_only_bounded_transfer_window():
         "active_media_rpc": "download media item 1/1",
         "active_media_rpc_started_at": 100.0,
         "active_media_rpc_deadline_at": 1_000.0,
+        "active_media_rpc_started_monotonic": 100.0,
+        "active_media_rpc_deadline_monotonic": 1_000.0,
         "last_progress_at": 999.0,
+        "last_progress_monotonic": 999.0,
     }
     assert has_active_rpc(item, now_ts=1_000.0) is True
     assert has_active_rpc(item, now_ts=1_001.0) is False
@@ -1531,6 +1537,298 @@ def test_retry_scheduler_deduplicates_each_live_job_generation():
     assert namespace["RETRY_GENERATIONS"] == {"download:one-only": 1}
     assert wakeup.is_set() is True
     assert metrics == ["download_retries", "retry_deduplications"]
+
+
+def test_partial_download_generation_replacement_releases_only_old_path(tmp_path):
+    """A fresh artifact for the same source key must replace, not append/ignore."""
+
+    old_path = tmp_path / "old.mp4"
+    new_path = tmp_path / "new.mp4"
+    old_path.write_bytes(b"o" * 600)
+    new_path.write_bytes(b"n" * 600)
+    message = SimpleNamespace(chat=SimpleNamespace(id=-100123), id=77)
+    untracked = []
+    deferred = []
+    dirty = []
+
+    meta_key, _ = load_bot_function("source_message_key_from_meta")
+    message_key, _ = load_bot_function("source_message_key")
+    remember, _ = load_bot_function(
+        "remember_partial_download",
+        {
+            "media_path_is_complete_enough": lambda _message, path: Path(path).stat().st_size >= 513,
+            "source_message_key": message_key,
+            "source_message_key_from_meta": meta_key,
+            "message_meta": lambda msg: {
+                "chat_id": msg.chat.id,
+                "message_id": msg.id,
+            },
+            "untrack_download_files": lambda paths: untracked.extend(paths),
+            "defer_download_cleanup": lambda paths, reason: deferred.append(
+                (list(paths), reason)
+            ),
+            "mark_runtime_checkpoint_dirty": dirty.append,
+        },
+    )
+    job = {
+        "_partial_download_files": [str(old_path)],
+        "_partial_download_message_metas": [
+            {"chat_id": message.chat.id, "message_id": message.id}
+        ],
+        "partial_download_files": [str(old_path)],
+        "partial_download_messages": [
+            {"chat_id": message.chat.id, "message_id": message.id}
+        ],
+    }
+
+    assert remember(job, message, str(new_path)) is True
+    assert job["_partial_download_files"] == [str(new_path)]
+    assert job["partial_download_files"] == [str(new_path)]
+    assert job["_partial_download_message_metas"] == [
+        {"chat_id": message.chat.id, "message_id": message.id}
+    ]
+    assert untracked == [str(old_path)]
+    assert deferred == [
+        ([str(old_path)], f"partial generation replaced for {message.chat.id}:{message.id}")
+    ]
+    assert str(new_path) not in untracked
+    assert dirty == ["partial download generation replaced"]
+
+    # Re-recording the exact same generation is a no-op and cannot enqueue its
+    # live path for cleanup.
+    assert remember(job, message, str(new_path)) is False
+    assert untracked == [str(old_path)]
+
+
+def test_checkpoint_hydration_keeps_partial_meta_path_pairs_atomic(tmp_path):
+    """Dropping a missing middle path must not shift path 3 onto message 2."""
+
+    first_path = tmp_path / "first.mp4"
+    missing_path = tmp_path / "missing.mp4"
+    third_path = tmp_path / "third.mp4"
+    for path in (first_path, third_path):
+        path.write_bytes(b"v" * 600)
+    messages = [
+        SimpleNamespace(chat=SimpleNamespace(id=-100555), id=message_id)
+        for message_id in (1, 2, 3)
+    ]
+
+    async def fetch_messages(_metas):
+        return messages
+
+    namespace = {
+        "SOURCE_FRESH_DOWNLOAD_DEFERRED_RETRY_DELAYS_SECONDS": (600, 1800, 5400),
+        "MANUAL_FRESH_DOWNLOAD_DEFERRED_RETRY_DELAYS_SECONDS": (600, 1800, 5400),
+        "fetch_messages_from_meta": fetch_messages,
+        "media_path_is_complete_enough": lambda _message, path: Path(path).is_file()
+        and Path(path).stat().st_size >= 513,
+        "make_job_id": lambda *_args: "generated-job",
+        "stamp_queue_job": lambda job, _queue_name: job,
+    }
+    hydrate, _ = load_bot_function("hydrate_runtime_job_from_checkpoint", namespace)
+    descriptor = {
+        "job_id": "paired-partials",
+        "type": "album",
+        "source": "startup_hot",
+        "messages": [
+            {"chat_id": -100555, "message_id": message_id}
+            for message_id in (1, 2, 3)
+        ],
+        "partial_download_messages": [
+            {"chat_id": -100555, "message_id": message_id}
+            for message_id in (1, 2, 3)
+        ],
+        "partial_download_files": [
+            str(first_path),
+            str(missing_path),
+            str(third_path),
+        ],
+    }
+
+    restored = asyncio.run(hydrate(descriptor, "download"))
+    assert restored["_partial_download_files"] == [str(first_path), str(third_path)]
+    assert [
+        meta["message_id"] for meta in restored["_partial_download_message_metas"]
+    ] == [1, 3]
+
+    meta_key, _ = load_bot_function("source_message_key_from_meta")
+    message_key, _ = load_bot_function("source_message_key")
+    lookup, _ = load_bot_function(
+        "partial_download_file_for_message",
+        {
+            "source_message_key": message_key,
+            "source_message_key_from_meta": meta_key,
+            "media_path_is_complete_enough": namespace["media_path_is_complete_enough"],
+        },
+    )
+    assert lookup(restored, messages[1]) == ""
+    assert lookup(restored, messages[2]) == str(third_path)
+
+    # A recovered upload already owns a complete canonical file list; older
+    # partial generations are deliberately not carried into that lane.
+    upload_descriptor = {
+        **descriptor,
+        "files": [str(first_path), str(first_path), str(third_path)],
+    }
+    upload_restored = asyncio.run(hydrate(upload_descriptor, "upload"))
+    assert upload_restored["_partial_download_files"] == []
+    assert upload_restored["_partial_download_message_metas"] == []
+
+
+def test_explicit_empty_partial_checkpoint_clears_persisted_old_generation():
+    """The durable recorder must not resurrect old lists through truthy fallback."""
+
+    state = {
+        "download_queue": {
+            "items": {
+                "job-1": {
+                    "partial_download_files": ["old.mp4"],
+                    "partial_download_messages": [
+                        {"chat_id": -1001, "message_id": 1}
+                    ],
+                }
+            }
+        }
+    }
+    record, _ = load_bot_function(
+        "record_download_job",
+        {
+            "STATE": state,
+            "state_mutex": threading.RLock(),
+            "QUEUE_TERMINAL_STATUSES": set(),
+            "message_meta": lambda _message: {},
+            "now_iso": lambda: "2026-08-20T00:00:00Z",
+            "save_state": lambda _name: None,
+            "refresh_persisted_queue_reservation": lambda _job_id: None,
+            "queue_job_state_db": lambda *_args: None,
+        },
+    )
+    record(
+        {
+            "job_id": "job-1",
+            "type": "album",
+            "messages": [],
+            "_partial_download_files": [],
+            "_partial_download_message_metas": [],
+        },
+        "retry_later",
+        files=[],
+    )
+    persisted = state["download_queue"]["items"]["job-1"]
+    assert persisted["files"] == []
+    assert persisted["partial_download_files"] == []
+    assert persisted["partial_download_messages"] == []
+
+    upload_state = {
+        "upload_queue": {
+            "items": {
+                "job-1": {
+                    "partial_download_files": ["older-upload-part.mp4"],
+                    "partial_download_messages": [
+                        {"chat_id": -1001, "message_id": 1}
+                    ],
+                }
+            }
+        }
+    }
+    record_upload, _ = load_bot_function(
+        "record_upload_job",
+        {
+            "STATE": upload_state,
+            "state_mutex": threading.RLock(),
+            "QUEUE_TERMINAL_STATUSES": set(),
+            "message_meta": lambda _message: {},
+            "now_iso": lambda: "2026-08-20T00:00:00Z",
+            "save_state": lambda _name: None,
+            "refresh_persisted_queue_reservation": lambda _job_id: None,
+            "queue_job_state_db": lambda *_args: None,
+        },
+    )
+    record_upload(
+        {
+            "job_id": "job-1",
+            "type": "album",
+            "messages": [],
+            "files": ["complete-upload.mp4"],
+        },
+        "queued_upload",
+    )
+    persisted_upload = upload_state["upload_queue"]["items"]["job-1"]
+    assert persisted_upload["files"] == ["complete-upload.mp4"]
+    assert persisted_upload["partial_download_files"] == []
+    assert persisted_upload["partial_download_messages"] == []
+
+
+def test_media_invalid_generic_retry_clears_old_partials_but_preserves_live_files():
+    """The fallback retry is file-free while the active upload keeps its ownership."""
+
+    untracked = []
+    deferred = []
+    dirty = []
+    recorded_downloads = []
+    queued = []
+    clear_partial, _ = load_bot_function(
+        "clear_partial_download_checkpoint",
+        {
+            "Path": Path,
+            "untrack_download_files": lambda paths: untracked.extend(paths),
+            "defer_download_cleanup": lambda paths, reason: deferred.append(
+                (list(paths), reason)
+            ),
+            "mark_runtime_checkpoint_dirty": dirty.append,
+        },
+    )
+    clean_policy, _ = load_bot_function("source_retry_requires_clean_download")
+    schedule, _ = load_bot_function(
+        "schedule_source_job_retry_later",
+        {
+            "source_job_retry_forever": lambda _job: True,
+            "SOURCE_PERMANENT_RETRY_LIMIT": 24,
+            "source_retry_requires_clean_download": clean_policy,
+            "clear_partial_download_checkpoint": clear_partial,
+            "source_job_retry_delay_seconds": lambda *_args: 600,
+            "record_download_job": lambda *args, **kwargs: recorded_downloads.append(
+                (args, kwargs)
+            ),
+            "record_total_job": lambda *_args: None,
+            "record_sync_item": lambda *_args: None,
+            "schedule_queue_retry": lambda queue, job, delay, reason: queued.append(
+                (queue, deepcopy(job), delay, reason)
+            )
+            or True,
+            "is_retryable_hybrid_download_timeout": lambda _reason: False,
+        },
+    )
+    job = {
+        "job_id": "invalid-album",
+        "type": "album",
+        "source": "startup_hot",
+        "files": ["current-1.mp4", "current-2.mp4"],
+        "_partial_download_files": ["old-1.mp4", "current-2.mp4"],
+        "_partial_download_message_metas": [
+            {"chat_id": -1001, "message_id": 1},
+            {"chat_id": -1001, "message_id": 2},
+        ],
+    }
+
+    reason = RuntimeError(
+        "grouped album upload failed: Telegram says [400 MEDIA_INVALID] - The media is invalid"
+    )
+    assert schedule(job, reason) is True
+    retry_job = queued[0][1]
+    assert "files" not in retry_job
+    assert retry_job["_partial_download_files"] == []
+    assert retry_job["_partial_download_message_metas"] == []
+    assert untracked == ["old-1.mp4"]
+    assert "current-1.mp4" not in untracked
+    assert "current-2.mp4" not in untracked
+    assert deferred[0][0] == ["old-1.mp4"]
+    assert recorded_downloads[0][1]["files"] == []
+    transition = BOT.split("downloaded_files = kept_files", 1)[1].split(
+        "upload_job = {**job", 1
+    )[0]
+    assert "clear_partial_download_checkpoint(" in transition
+    assert "preserve_paths=downloaded_files" in transition
 
 
 def test_optional_compute_helper_isolated_from_telegram_delivery_authority():

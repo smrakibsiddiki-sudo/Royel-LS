@@ -264,6 +264,27 @@ def latest_postgres_migration(root: Path) -> int:
     return max(versions or [0])
 
 
+def runtime_profile_from_environment(env: Mapping[str, str]) -> str:
+    """Return the canonical build/deployment profile without reading secret values."""
+
+    raw_profile = str(env.get("ROYELLS_RUNTIME_PROFILE") or "").strip().lower().replace("_", "-")
+    if parse_bool(env.get("ROYELLS_ORACLE_PROFILE_LOCK"), False) and raw_profile not in {
+        "oracle-a1",
+        "a1",
+        "oracle-a1-flex",
+    }:
+        raw_profile = "oracle-e2-micro"
+    if raw_profile in {"oracle-e2", "e2", "oracle-e2-micro", "oracle-e2.1-micro"}:
+        return "oracle-e2-micro"
+    if raw_profile in {"oracle-a1", "a1", "oracle-a1-flex"}:
+        return "oracle-a1"
+    if raw_profile in {"huggingface", "huggingface-space", "hf", "space"}:
+        return "huggingface"
+    if raw_profile:
+        return raw_profile
+    return "huggingface" if parse_bool(env.get("ROYELLS_HUGGINGFACE_SPACE"), False) else "local"
+
+
 def build_environment(environ: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     env = dict(os.environ if environ is None else environ)
     items: list[dict[str, Any]] = []
@@ -356,6 +377,12 @@ def generate_manifest(
     root_path = Path(root).resolve()
     ctx = dict(context or {})
     env = dict(os.environ if environ is None else environ)
+    runtime_profile = runtime_profile_from_environment(env)
+    container_profile = runtime_profile in {
+        "huggingface",
+        "oracle-e2-micro",
+        "oracle-a1",
+    }
     repository = git_state(root_path)
     build_id, build_number = build_numbers(ctx, repository)
     python_version = platform.python_version()
@@ -375,9 +402,9 @@ def generate_manifest(
         "operating_system": platform.system().lower(),
         "architecture": platform.machine(),
         "cpu_architecture": platform.machine(),
-        "container_type": str(context_value(ctx, "container_type", "docker" if parse_bool(env.get("ROYELLS_HUGGINGFACE_SPACE"), False) else "local")),
+        "container_type": str(context_value(ctx, "container_type", "docker" if container_profile else "local")),
         "docker_image": str(context_value(ctx, "docker_image", env.get("ROYELLS_DOCKER_IMAGE", ""))),
-        "deployment_target": str(context_value(ctx, "deployment_target", "huggingface-space" if parse_bool(env.get("ROYELLS_HUGGINGFACE_SPACE"), False) else "local")),
+        "deployment_target": str(context_value(ctx, "deployment_target", runtime_profile)),
         "repository_state": repository,
         "migration_epoch": str(context_value(ctx, "migration_epoch", env.get("ROYELLS_MIGRATION_EPOCH", "legacy-v1"))),
         "database_version": str(context_value(ctx, "database_version", "sqlite-v1")),
@@ -403,7 +430,7 @@ def generate_manifest(
             context_value(
                 ctx,
                 "deployment_profile",
-                "huggingface-space" if parse_bool(env.get("ROYELLS_HUGGINGFACE_SPACE"), False) else "local",
+                runtime_profile,
             )
         ),
         "supported_platforms": list(SUPPORTED_PLATFORMS),

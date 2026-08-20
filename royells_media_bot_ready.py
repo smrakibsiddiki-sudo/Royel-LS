@@ -129,10 +129,11 @@ with contextlib.suppress(Exception):
 import requests
 try:
     from PIL import Image
-    import imagehash
 except Exception:
     Image = None
-    imagehash = None
+# Perceptual-hash filtering is permanently outside the delivery pipeline.  Importing
+# ImageHash also imports NumPy, wasting scarce E2 RAM for unreachable functionality.
+imagehash = None
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, MessageNotModified
@@ -267,6 +268,28 @@ def env_url_list(*names):
 
 
 IS_HUGGINGFACE_SPACE = env_bool("ROYELLS_HUGGINGFACE_SPACE") or bool(os.getenv("SPACE_ID") or os.getenv("SPACE_HOST"))
+_runtime_profile_raw = os.getenv("ROYELLS_RUNTIME_PROFILE", "auto").strip().lower().replace("_", "-")
+if env_bool("ROYELLS_ORACLE_PROFILE_LOCK", False) and _runtime_profile_raw not in (
+    "oracle-a1",
+    "a1",
+    "oracle-a1-flex",
+):
+    # The Oracle release must not inherit a stale `generic`/Space profile from an
+    # old .env. A1 is the only permitted override; all other values fail safely
+    # to the conservative E2 shape.
+    _runtime_profile_raw = "oracle-e2-micro"
+if _runtime_profile_raw in ("", "auto"):
+    RUNTIME_PROFILE = "huggingface" if IS_HUGGINGFACE_SPACE else "generic"
+elif _runtime_profile_raw in ("oracle-e2", "e2", "oracle-e2-micro", "oracle-e2.1-micro"):
+    RUNTIME_PROFILE = "oracle-e2-micro"
+elif _runtime_profile_raw in ("oracle-a1", "a1", "oracle-a1-flex"):
+    RUNTIME_PROFILE = "oracle-a1"
+elif _runtime_profile_raw in ("huggingface", "hf", "space"):
+    RUNTIME_PROFILE = "huggingface"
+else:
+    RUNTIME_PROFILE = "generic"
+IS_ORACLE_E2_MICRO = RUNTIME_PROFILE == "oracle-e2-micro"
+IS_ORACLE_A1 = RUNTIME_PROFILE == "oracle-a1"
 
 # Sensitive values must come from environment variables or Hugging Face Secrets.
 API_ID = env_int("ROYELLS_API_ID", "0")
@@ -310,7 +333,13 @@ DEFAULT_API_CONCURRENCY = "1" if IS_HUGGINGFACE_SPACE else "2"
 
 POST_DELAY = int(os.getenv("ROYELLS_POST_DELAY", "1" if IS_HUGGINGFACE_SPACE else "2"))
 ALBUM_WAIT = int(os.getenv("ROYELLS_ALBUM_WAIT", "5"))
-WORKERS = int(os.getenv("ROYELLS_BOT_HANDLER_WORKERS", DEFAULT_BOT_WORKERS))
+WORKERS = max(
+    1,
+    min(
+        1 if IS_ORACLE_E2_MICRO else 4,
+        int(os.getenv("ROYELLS_BOT_HANDLER_WORKERS", DEFAULT_BOT_WORKERS)),
+    ),
+)
 DOWNLOAD_WORKERS = max(1, int(os.getenv("ROYELLS_DOWNLOAD_WORKERS", DEFAULT_DOWNLOAD_WORKERS)))
 UPLOAD_WORKERS = max(1, int(os.getenv("ROYELLS_UPLOAD_WORKERS", DEFAULT_UPLOAD_WORKERS)))
 LINK_WORKERS = max(1, int(os.getenv("ROYELLS_LINK_WORKERS", "1")))
@@ -324,10 +353,13 @@ BUTTON_WORKERS = int(os.getenv("ROYELLS_BUTTON_WORKERS", "6" if IS_HUGGINGFACE_S
 DOWNLOAD_WORKERS = 1
 UPLOAD_WORKERS = 1
 LINK_WORKERS = 1
-BUTTON_WORKERS = max(1, min(2, BUTTON_WORKERS))
-ADAPTIVE_MEDIA_WORKERS_ENABLED = env_bool("ROYELLS_ADAPTIVE_MEDIA_WORKERS", True)
+BUTTON_WORKERS = max(1, min(1 if IS_ORACLE_E2_MICRO else 2, BUTTON_WORKERS))
+ADAPTIVE_MEDIA_WORKERS_ENABLED = (
+    env_bool("ROYELLS_ADAPTIVE_MEDIA_WORKERS", True)
+    and not IS_ORACLE_E2_MICRO
+)
 ADAPTIVE_DOWNLOAD_WORKERS_MAX = min(
-    2,
+    1 if IS_ORACLE_E2_MICRO else 2,
     max(DOWNLOAD_WORKERS, env_int("ROYELLS_ADAPTIVE_DOWNLOAD_WORKERS_MAX", "2")),
 )
 ADAPTIVE_UPLOAD_WORKERS_MAX = 1
@@ -376,19 +408,19 @@ SOURCE_PERMANENT_RETRY_LIMIT = max(
     1,
     env_int("ROYELLS_SOURCE_PERMANENT_RETRY_LIMIT", "24"),
 )
-MAIN_LOCAL_QUEUE_SOFT_LIMIT = 48
-MAIN_LOCAL_QUEUE_HARD_LIMIT = 64
+MAIN_LOCAL_QUEUE_SOFT_LIMIT = 20 if IS_ORACLE_E2_MICRO else 48
+MAIN_LOCAL_QUEUE_HARD_LIMIT = 24 if IS_ORACLE_E2_MICRO else 64
 _download_queue_requested = env_int("ROYELLS_IN_MEMORY_QUEUE_MAX", "64")
 _upload_queue_requested = env_int("ROYELLS_UPLOAD_READY_QUEUE_MAX", "8")
 # A zero used to mean unlimited.  Keep descriptors durable and backpressure the
 # producer instead; unlimited in-memory Pyrogram jobs amplify long Telegram stalls.
 IN_MEMORY_QUEUE_MAX = max(
     1,
-    min(64, _download_queue_requested if _download_queue_requested > 0 else 64),
+    min(MAIN_LOCAL_QUEUE_HARD_LIMIT, _download_queue_requested if _download_queue_requested > 0 else MAIN_LOCAL_QUEUE_HARD_LIMIT),
 )
 UPLOAD_READY_QUEUE_MAX = max(
     1,
-    min(8, _upload_queue_requested if _upload_queue_requested > 0 else 8),
+    min(4 if IS_ORACLE_E2_MICRO else 8, _upload_queue_requested if _upload_queue_requested > 0 else (4 if IS_ORACLE_E2_MICRO else 8)),
 )
 MEDIA_ADMISSION_BACKPRESSURE_RETRY_SECONDS = max(
     5,
@@ -445,9 +477,16 @@ VIDEO_META_PROBE_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_VIDEO_META_PROBE_TIMEO
 TELEGRAM_API_CONCURRENCY = 1
 TELEGRAM_DOWNLOAD_CONCURRENCY = max(
     1,
-    min(2, env_int("ROYELLS_TELEGRAM_DOWNLOAD_CONCURRENCY", "2")),
+    min(1 if IS_ORACLE_E2_MICRO else 2, env_int("ROYELLS_TELEGRAM_DOWNLOAD_CONCURRENCY", "2")),
 )
 TELEGRAM_MEDIA_CONCURRENCY = 1
+TELEGRAM_CONTROL_CONCURRENCY = max(
+    1,
+    min(
+        2 if IS_ORACLE_E2_MICRO else 4,
+        env_int("ROYELLS_TELEGRAM_CONTROL_CONCURRENCY", "2" if IS_ORACLE_E2_MICRO else "4"),
+    ),
+)
 TELEGRAM_CALL_RETRIES = int(os.getenv("ROYELLS_TELEGRAM_CALL_RETRIES", "5"))
 TELEGRAM_CALL_TIMEOUT_SECONDS = int(os.getenv("ROYELLS_TELEGRAM_CALL_TIMEOUT_SECONDS", "90" if IS_HUGGINGFACE_SPACE else "120"))
 TELEGRAM_CONTROL_TIMEOUT_SECONDS = max(
@@ -461,7 +500,7 @@ TELEGRAM_CONTROL_RETRIES = max(
 SUB_PROFILE_CACHE_SECONDS = max(60, env_int("ROYELLS_SUB_PROFILE_CACHE_SECONDS", "900"))
 SUB_PROFILE_REFRESH_LIMIT = max(1, env_int("ROYELLS_SUB_PROFILE_REFRESH_LIMIT", "60"))
 TELEGRAM_RECONNECT_COOLDOWN_SECONDS = int(os.getenv("ROYELLS_TELEGRAM_RECONNECT_COOLDOWN_SECONDS", "300" if IS_HUGGINGFACE_SPACE else "120"))
-TELEGRAM_RECONNECT_DEFER_ON_PIPELINE = env_bool("ROYELLS_TELEGRAM_RECONNECT_DEFER_ON_PIPELINE", False)
+TELEGRAM_RECONNECT_DEFER_ON_PIPELINE = env_bool("ROYELLS_TELEGRAM_RECONNECT_DEFER_ON_PIPELINE", True)
 TELEGRAM_RECONNECT_DEFER_MAX_SECONDS = int(os.getenv("ROYELLS_TELEGRAM_RECONNECT_DEFER_MAX_SECONDS", "300"))
 FLOOD_WAIT_BACKOFF_MULTIPLIER = float(os.getenv("ROYELLS_FLOOD_WAIT_BACKOFF_MULTIPLIER", "1.5"))
 FLOOD_WAIT_JITTER_SECONDS = float(os.getenv("ROYELLS_FLOOD_WAIT_JITTER_SECONDS", "3"))
@@ -525,7 +564,7 @@ UPLOAD_TIMEOUT_BASE_SECONDS = max(120, env_int("ROYELLS_UPLOAD_TIMEOUT_BASE_SECO
 UPLOAD_TIMEOUT_SECONDS_PER_MB = max(1, env_int("ROYELLS_UPLOAD_TIMEOUT_SECONDS_PER_MB", "5"))
 # Two connections permit one bounded download plus one ordered publish; more turns
 # FILE_PART_X_MISSING into a self-amplifying retry storm on the target runtime.
-MAX_CONCURRENT_TRANSMISSIONS = 2
+MAX_CONCURRENT_TRANSMISSIONS = 1 if IS_ORACLE_E2_MICRO else 2
 WORKER_QUEUE_GROUP_ID = 0
 WORKER_QUEUE_SECRET = ""
 WORKER_BOT_USERNAME = ""
@@ -586,6 +625,10 @@ WORKER_STALL_SECONDS = max(
     MEDIA_RPC_HARD_TIMEOUT_SECONDS + WORKER_MEDIA_TIMEOUT_MARGIN_SECONDS,
     min(3600, int(os.getenv("ROYELLS_WORKER_STALL_SECONDS", "1800"))),
 )
+WORKER_STALL_RESUME_GRACE_SECONDS = max(
+    60,
+    min(600, env_int("ROYELLS_WORKER_STALL_RESUME_GRACE_SECONDS", "180")),
+)
 SOURCE_CIRCUIT_BREAKER_ENABLED = env_bool("ROYELLS_SOURCE_CIRCUIT_BREAKER", True)
 SOURCE_CIRCUIT_FAILURE_THRESHOLD = max(2, int(os.getenv("ROYELLS_SOURCE_CIRCUIT_FAILURE_THRESHOLD", "3")))
 SOURCE_CIRCUIT_COOLDOWN_SECONDS = max(600, int(os.getenv("ROYELLS_SOURCE_CIRCUIT_COOLDOWN_SECONDS", "3600")))
@@ -613,6 +656,9 @@ MEDIA_VALIDATOR_SCHEMA_VERSION = 3
 # them with fresh bytes instead.
 LEGACY_FALSE_ZERO_BYTE_MIGRATION_ID = "target_upload_verdict_false_dead_v4_20260812"
 PREVIOUS_FALSE_ZERO_BYTE_MIGRATION_ID = "video_metadata_false_zero_byte_v3_20260810"
+LEGACY_GROUPED_MEDIA_INVALID_RETRY_MIGRATION_ID = (
+    "grouped_media_invalid_retry_budget_v1_20260820"
+)
 VALIDATOR_REPAIR_SCAN_MAX = 300
 VALIDATOR_REPAIR_HISTORY_MAX = 2000
 SOURCE_ACCESS_FAILURE_RETIRE_ENABLED = env_bool("ROYELLS_RETIRE_ACCESS_FAILURES", False)
@@ -777,7 +823,13 @@ DOWNLOAD_ATTEMPT_CLEANUP_GRACE_SECONDS = max(
     env_int("ROYELLS_DOWNLOAD_ATTEMPT_CLEANUP_GRACE_SECONDS", "300"),
 )
 V21_MICRO_WORKERS_ENABLED = env_bool("ROYELLS_V21_MICRO_WORKERS", True)
-V21_EVENT_QUEUE_SIZE = max(100, env_int("ROYELLS_V21_EVENT_QUEUE_SIZE", "2000"))
+V21_EVENT_QUEUE_SIZE = max(
+    100,
+    min(
+        512 if IS_ORACLE_E2_MICRO else (1000 if IS_ORACLE_A1 else 2000),
+        env_int("ROYELLS_V21_EVENT_QUEUE_SIZE", "512" if IS_ORACLE_E2_MICRO else "2000"),
+    ),
+)
 V21_CLEANUP_STALE_TEMP_ON_BOOT = env_bool(
     "ROYELLS_V21_CLEANUP_STALE_TEMP_ON_BOOT",
     True,
@@ -801,6 +853,16 @@ HARD_WATCHDOG_HEARTBEAT_SECONDS = int(os.getenv("ROYELLS_HARD_WATCHDOG_HEARTBEAT
 HARD_WATCHDOG_STALL_SECONDS = int(os.getenv("ROYELLS_HARD_WATCHDOG_STALL_SECONDS", "900" if IS_HUGGINGFACE_SPACE else "420"))
 HARD_WATCHDOG_STARTUP_GRACE_SECONDS = int(os.getenv("ROYELLS_HARD_WATCHDOG_STARTUP_GRACE_SECONDS", "600"))
 HARD_WATCHDOG_EXIT_CODE = int(os.getenv("ROYELLS_HARD_WATCHDOG_EXIT_CODE", "75"))
+MEMORY_SOFT_LIMIT_MB = max(
+    0,
+    env_int("ROYELLS_MEMORY_SOFT_LIMIT_MB", "480" if IS_ORACLE_E2_MICRO else "0"),
+)
+MEMORY_CRITICAL_LIMIT_MB = max(
+    MEMORY_SOFT_LIMIT_MB,
+    env_int("ROYELLS_MEMORY_CRITICAL_LIMIT_MB", "620" if IS_ORACLE_E2_MICRO else "0"),
+)
+# Memory pressure pauses intake and drains the ordered publisher.  It must never
+# delete queue ownership or force-restart in the middle of an ambiguous delivery.
 MEMORY_RESTART_LIMIT_MB = 0
 WORKER_STALL_FORCE_RESTART = False
 AUTO_RESTART_MAX_PER_WINDOW = 0
@@ -829,7 +891,11 @@ SLOW_LOG_RATE_LIMIT_SECONDS = max(
 )
 DB_HEALTH_CHECK_INTERVAL_SECONDS = max(
     30,
-    env_int("ROYELLS_DB_HEALTH_CHECK_INTERVAL_SECONDS", "120"),
+    env_int("ROYELLS_DB_HEALTH_CHECK_INTERVAL_SECONDS", "900" if IS_ORACLE_E2_MICRO else "120"),
+)
+DB_STATS_REFRESH_INTERVAL_SECONDS = max(
+    60,
+    env_int("ROYELLS_DB_STATS_REFRESH_INTERVAL_SECONDS", "900" if IS_ORACLE_E2_MICRO else "300"),
 )
 DB_ONLINE_RECOVERY_COOLDOWN_SECONDS = max(
     30,
@@ -1155,12 +1221,34 @@ class ThreadSafeReservationMap:
             return len(self._owners)
 
 
+def bounded_executor_workers(env_name, default, general_cap=8):
+    """Keep stale deployment variables from oversubscribing the 1/8-OCPU E2 VM."""
+
+    requested = max(1, env_int(env_name, str(default)))
+    return 1 if IS_ORACLE_E2_MICRO else min(max(1, int(general_cap)), requested)
+
+
 EXECUTOR_POOLS = {
-    "db": concurrent.futures.ThreadPoolExecutor(max_workers=max(1, env_int("ROYELLS_DB_EXECUTOR_WORKERS", "1")), thread_name_prefix="royells-db"),
-    "persistence": concurrent.futures.ThreadPoolExecutor(max_workers=max(1, env_int("ROYELLS_PERSISTENCE_EXECUTOR_WORKERS", "2")), thread_name_prefix="royells-persist"),
-    "media": concurrent.futures.ThreadPoolExecutor(max_workers=max(1, env_int("ROYELLS_MEDIA_EXECUTOR_WORKERS", "2")), thread_name_prefix="royells-media"),
-    "control": concurrent.futures.ThreadPoolExecutor(max_workers=max(1, env_int("ROYELLS_CONTROL_EXECUTOR_WORKERS", "2")), thread_name_prefix="royells-control"),
-    "cpu": concurrent.futures.ThreadPoolExecutor(max_workers=max(1, env_int("ROYELLS_CPU_EXECUTOR_WORKERS", "1")), thread_name_prefix="royells-cpu"),
+    "db": concurrent.futures.ThreadPoolExecutor(
+        max_workers=bounded_executor_workers("ROYELLS_DB_EXECUTOR_WORKERS", 1),
+        thread_name_prefix="royells-db",
+    ),
+    "persistence": concurrent.futures.ThreadPoolExecutor(
+        max_workers=bounded_executor_workers("ROYELLS_PERSISTENCE_EXECUTOR_WORKERS", 1 if IS_ORACLE_E2_MICRO else 2),
+        thread_name_prefix="royells-persist",
+    ),
+    "media": concurrent.futures.ThreadPoolExecutor(
+        max_workers=bounded_executor_workers("ROYELLS_MEDIA_EXECUTOR_WORKERS", 1 if IS_ORACLE_E2_MICRO else 2),
+        thread_name_prefix="royells-media",
+    ),
+    "control": concurrent.futures.ThreadPoolExecutor(
+        max_workers=bounded_executor_workers("ROYELLS_CONTROL_EXECUTOR_WORKERS", 1 if IS_ORACLE_E2_MICRO else 2),
+        thread_name_prefix="royells-control",
+    ),
+    "cpu": concurrent.futures.ThreadPoolExecutor(
+        max_workers=bounded_executor_workers("ROYELLS_CPU_EXECUTOR_WORKERS", 1, general_cap=4),
+        thread_name_prefix="royells-cpu",
+    ),
 }
 EXECUTOR_INFLIGHT = {name: 0 for name in EXECUTOR_POOLS}
 EXECUTOR_LOCK = threading.RLock()
@@ -1386,7 +1474,9 @@ auto_album_buffer = defaultdict(list)
 auto_album_tasks = {}
 auto_album_lock = asyncio.Lock()
 auto_album_deadlines = {}
-EVENT_LOOP_HEARTBEAT_TS = time.time()
+EVENT_LOOP_HEARTBEAT_TS = time.monotonic()
+GLOBAL_EVENT_LOOP_STALL_ACTIVE = False
+WORKER_STALL_SUPPRESS_UNTIL_MONOTONIC = 0.0
 HARD_WATCHDOG_STARTED = False
 deep_clean_lock = asyncio.Lock()
 target_index_lock = asyncio.Lock()
@@ -1419,7 +1509,7 @@ telegram_api_semaphore = asyncio.Semaphore(max(1, TELEGRAM_API_CONCURRENCY))
 # Long-running media downloads have their own bounded lane so a slow transfer cannot
 # starve get_messages/get_chat and other control-plane Telegram RPCs.
 telegram_download_semaphore = asyncio.Semaphore(TELEGRAM_DOWNLOAD_CONCURRENCY)
-telegram_control_semaphore = asyncio.Semaphore(max(2, env_int("ROYELLS_TELEGRAM_CONTROL_CONCURRENCY", "4")))
+telegram_control_semaphore = asyncio.Semaphore(TELEGRAM_CONTROL_CONCURRENCY)
 telegram_media_semaphore = asyncio.Semaphore(TELEGRAM_MEDIA_CONCURRENCY)
 telegram_album_upload_semaphore = asyncio.Semaphore(UPLOAD_ALBUM_CONCURRENCY)
 source_link_check_semaphore = asyncio.Semaphore(1)
@@ -1797,21 +1887,20 @@ def v21_runtime_health_provider():
         max(float(value or 0.0) for value in TELEGRAM_FLOOD_UNTIL_BY_ROLE.values())
         - time.monotonic(),
     )
-    memory_mb = current_memory_mb()
+    memory_mb = effective_runtime_memory_mb()
     return {
         "db_busy": bool(DB_RECOVERY_ACTIVE or DB_DEGRADED),
         "checkpoint_delayed": bool(
             RUNTIME_CHECKPOINT_DIRTY
             and checkpoint_age > max(60, RUNTIME_CHECKPOINT_INTERVAL_SECONDS * 4)
         ),
-        "memory_pressure": bool(
-            MEMORY_RESTART_LIMIT_MB > 0 and memory_mb > MEMORY_RESTART_LIMIT_MB * 0.90
-        ),
+        "memory_pressure": runtime_memory_pressure(),
         "telegram_flood_wait": flood_remaining > 0,
         "upload_queue": upload_queue.qsize(),
         "upload_queue_high": V21_BACKPRESSURE_UPLOAD_QUEUE_HIGH,
         "download_queue": channel_download_queue.qsize(),
-        "pipeline_jobs": pipeline_job_count() if "pipeline_job_count" in globals() else 0,
+        "pipeline_jobs": runnable_pipeline_job_count() if "runnable_pipeline_job_count" in globals() else 0,
+        "owned_pipeline_jobs": pipeline_job_count() if "pipeline_job_count" in globals() else 0,
         "memory_mb": memory_mb,
         "flood_wait_remaining": flood_remaining,
     }
@@ -1851,7 +1940,7 @@ def build_manifest_context():
         "sqlite_schema_version": SQLITE_SCHEMA_VERSION,
         "postgres_schema_version": POSTGRES_SCHEMA_VERSION,
         "delivery_intent_schema_version": DELIVERY_INTENT_SCHEMA_VERSION,
-        "deployment_profile": "huggingface-space" if IS_HUGGINGFACE_SPACE else "local",
+        "deployment_profile": RUNTIME_PROFILE,
         "queue_backend": "legacy_composite",
         "runtime_backend": "legacy_json",
         "checkpoint_backend": "legacy_json",
@@ -2194,7 +2283,7 @@ def record_production_incident(
                     "phase": PIPELINE_SCAN_STATUS.get("phase", ""),
                 },
                 "configuration_snapshot": {
-                    "deployment_profile": "huggingface-space" if IS_HUGGINGFACE_SPACE else "local",
+                    "deployment_profile": RUNTIME_PROFILE,
                     "features": build_manifest_context(),
                 },
             },
@@ -2700,12 +2789,14 @@ upload_queue = FairJobQueue(
     maxsize=UPLOAD_READY_QUEUE_MAX,
     name="upload",
 )
-button_queue = asyncio.Queue(maxsize=0)
-link_process_queue = asyncio.Queue(maxsize=0)
-job_state_db_queue = asyncio.Queue(maxsize=max(100, env_int("ROYELLS_JOB_STATE_DB_QUEUE_LIMIT", "5000")))
-critical_db_write_queue = asyncio.Queue(maxsize=max(100, env_int("ROYELLS_CRITICAL_DB_WRITE_QUEUE_LIMIT", "5000")))
+button_queue = asyncio.Queue(maxsize=max(8, min(64 if IS_ORACLE_E2_MICRO else 256, env_int("ROYELLS_BUTTON_QUEUE_LIMIT", "64"))))
+link_process_queue = asyncio.Queue(maxsize=max(8, min(32 if IS_ORACLE_E2_MICRO else 128, env_int("ROYELLS_LINK_QUEUE_LIMIT", "32"))))
+job_state_db_queue = asyncio.Queue(maxsize=max(100, min(512 if IS_ORACLE_E2_MICRO else 5000, env_int("ROYELLS_JOB_STATE_DB_QUEUE_LIMIT", "512" if IS_ORACLE_E2_MICRO else "2000"))))
+critical_db_write_queue = asyncio.Queue(maxsize=max(100, min(512 if IS_ORACLE_E2_MICRO else 5000, env_int("ROYELLS_CRITICAL_DB_WRITE_QUEUE_LIMIT", "512" if IS_ORACLE_E2_MICRO else "2000"))))
 DB_WRITE_BATCH_SIZE = max(1, min(500, env_int("ROYELLS_DB_WRITE_BATCH_SIZE", "100")))
-retry_admission_queue = asyncio.PriorityQueue(maxsize=0)
+retry_admission_queue = asyncio.PriorityQueue(
+    maxsize=max(32, min(256 if IS_ORACLE_E2_MICRO else 1024, env_int("ROYELLS_RETRY_ADMISSION_QUEUE_LIMIT", "256")))
+)
 RETRY_SEQUENCE = itertools.count()
 RETRY_GENERATIONS = {}
 RETRY_LOCK = asyncio.Lock()
@@ -4788,7 +4879,7 @@ async def db_maintenance_loop():
     await asyncio.sleep(DB_MAINTENANCE_START_DELAY_SECONDS)
     while True:
         try:
-            pipeline_idle = pipeline_job_count() == 0
+            pipeline_idle = runnable_pipeline_job_count() == 0
             await run_blocking(
                 "db",
                 run_db_maintenance_sync,
@@ -5246,7 +5337,7 @@ def generate_daily_diagnostic_report():
     build_number = str(manifest.get("build_number") or os.getenv("ROYELLS_BUILD_NUMBER") or APP_VERSION)
     manifest_status = str(manifest_validation.get("status") or "not_validated")
     runtime_identity = (
-        f"boot {str(BOOT_ID or 'unknown')[:20]} | workers D{DOWNLOAD_WORKERS}/U{UPLOAD_WORKERS}/"
+        f"boot {str(BOOT_ID or 'unknown')[:20]} | profile {RUNTIME_PROFILE} | workers D{DOWNLOAD_WORKERS}/U{UPLOAD_WORKERS}/"
         f"L{LINK_WORKERS}/B{BUTTON_WORKERS} | Telegram API {TELEGRAM_API_CONCURRENCY}, "
         f"media {TELEGRAM_MEDIA_CONCURRENCY} | queue caps D{IN_MEMORY_QUEUE_MAX}/U{UPLOAD_READY_QUEUE_MAX}"
     )
@@ -5532,18 +5623,34 @@ async def wait_global_flood_gate(label="telegram", client_role=None):
         await asyncio.sleep(min(remaining, 30.0))
 
 
-def begin_telegram_inflight(label, kind="api"):
+def begin_telegram_inflight(label, kind="api", client_role=None):
+    """Register one live RPC with the client role needed for safe reconnects."""
+
     token = uuid.uuid4().hex
+    role = telegram_client_role(label, client_role)
     with TELEGRAM_INFLIGHT_LOCK:
         TELEGRAM_INFLIGHT[token] = {
             "token": token,
             "label": str(label)[:200],
             "kind": str(kind)[:40],
+            "client_role": role,
             "started_at": time.time(),
             "started_iso": now_iso(),
         }
     mark_runtime_checkpoint_dirty(f"telegram inflight {kind}")
     return token
+
+
+def active_userbot_media_rpc_count():
+    """Return live userbot transfers that must drain before transport restart."""
+
+    with TELEGRAM_INFLIGHT_LOCK:
+        return sum(
+            1
+            for entry in TELEGRAM_INFLIGHT.values()
+            if str(entry.get("client_role") or "") == "userbot"
+            and str(entry.get("kind") or "") in {"download", "media"}
+        )
 
 
 def end_telegram_inflight(token, status="done", error=""):
@@ -5670,6 +5777,8 @@ def is_invalid_media_upload_error(exc):
         for marker in [
             "media_empty",
             "media empty",
+            "media_invalid",
+            "media is invalid",
             "invalid media",
             "media invalid",
             "file must be non-empty",
@@ -6407,7 +6516,33 @@ async def recover_userbot_connection(reason):
                 interval_seconds=120,
             )
             return
-        last_telegram_reconnect = now
+        if TELEGRAM_RECONNECT_DEFER_ON_PIPELINE:
+            # A healthy transfer is allowed to use its complete bounded RPC
+            # window. Broken transports release their inflight token early, so
+            # this ceiling does not delay a genuinely failed connection.
+            transfer_drain_seconds = max(
+                0,
+                int(TELEGRAM_RECONNECT_DEFER_MAX_SECONDS),
+                int(MEDIA_RPC_HARD_TIMEOUT_SECONDS) + 30,
+            )
+            defer_deadline = time.monotonic() + transfer_drain_seconds
+            while active_userbot_media_rpc_count() > 0:
+                remaining = defer_deadline - time.monotonic()
+                if remaining <= 0:
+                    log_event(
+                        "Telegram transport recovery reached its bounded transfer-drain "
+                        "deadline; restarting the failed userbot transport now."
+                    )
+                    break
+                log_event_rate_limited(
+                    "telegram_transport_recovery_active_media_defer",
+                    "Telegram transport recovery is waiting for "
+                    f"{active_userbot_media_rpc_count()} active userbot media RPC(s) "
+                    f"to drain; bounded wait remaining={int(remaining)}s.",
+                    interval_seconds=30,
+                )
+                await asyncio.sleep(min(2.0, remaining))
+        last_telegram_reconnect = time.time()
         previous_generation = TELEGRAM_TRANSPORT_GENERATION
         log_event(
             f"Telegram transport recovery generation {previous_generation}: "
@@ -6436,9 +6571,21 @@ async def wait_for_telegram_client(context="telegram"):
             f"and stop every other process using the old session. Reason: {SESSION_AUTH_INVALID_REASON}"
         )
     waited = 0
-    while telegram_reconnect_lock.locked() and waited < 60:
+    # A reconnect may legitimately hold the gate while one bounded media RPC
+    # drains.  New callers must not time out before that same safety window.
+    max_wait = max(
+        180,
+        int(TELEGRAM_RECONNECT_DEFER_MAX_SECONDS) + 150,
+        int(MEDIA_RPC_HARD_TIMEOUT_SECONDS) + 180,
+    )
+    while telegram_reconnect_lock.locked() and waited < max_wait:
         await asyncio.sleep(1)
         waited += 1
+    if telegram_reconnect_lock.locked():
+        raise TimeoutError(
+            f"{context} could not safely enter while Telegram reconnect remained active "
+            f"for {waited}s"
+        )
     if waited:
         log_event(f"{context} waited {waited}s for Telegram reconnect.")
 
@@ -6567,9 +6714,15 @@ async def start_telegram_client_safely(client, label, max_attempts=3):
                 await asyncio.sleep(min(15, 2 * attempt))
                 continue
             if is_session_auth_error(e):
-                mark_session_auth_invalid(e)
-                with contextlib.suppress(Exception):
-                    await notify_session_problem(e)
+                if str(label).strip().lower() == "userbot":
+                    mark_session_auth_invalid(e)
+                    with contextlib.suppress(Exception):
+                        await notify_session_problem(e)
+                else:
+                    log_event(
+                        f"Bot Telegram authorization failed without invalidating the "
+                        f"user session: {str(e)[:160]}"
+                    )
             raise
     raise RuntimeError(f"{label} could not start after startup retries. Last error: {last_error!r}")
 
@@ -6601,6 +6754,11 @@ async def session_validator_loop():
                 retries=1,
                 _client_role="bot",
             )
+        except Exception as e:
+            # Bot-token/control-plane faults must never invalidate or restart the
+            # separate user-session transport used by the no-loss media pipeline.
+            log_event(f"Bot session validator warning: {str(e)[:160]}")
+        try:
             await tg_call(
                 "session validate userbot",
                 userbot.get_me,
@@ -6636,7 +6794,13 @@ async def telegram_gateway_await(label, factory, timeout_seconds=None, retries=N
         started = time.monotonic()
         inflight_token = ""
         try:
-            inflight_token = begin_telegram_inflight(label, "control")
+            if client_role == "userbot":
+                await wait_for_telegram_client(label)
+            inflight_token = begin_telegram_inflight(
+                label,
+                "control",
+                client_role=client_role,
+            )
             try:
                 await wait_global_flood_gate(label, client_role)
                 async with telegram_control_semaphore:
@@ -6673,9 +6837,10 @@ async def telegram_gateway_await(label, factory, timeout_seconds=None, retries=N
         except Exception as exc:
             last_error = exc
             if is_session_auth_error(exc):
-                mark_session_auth_invalid(exc)
+                if client_role == "userbot":
+                    mark_session_auth_invalid(exc)
                 raise
-            if should_reconnect_telegram_error(exc):
+            if client_role == "userbot" and should_reconnect_telegram_error(exc):
                 schedule_userbot_reconnect(f"gateway {label}: {exc}")
             if not is_temporary_network_error(exc) or attempt >= retries:
                 raise
@@ -6693,10 +6858,18 @@ async def tg_call(label, func, *args, retries=None, **kwargs):
     for attempt in range(1, retries + 1):
         inflight_token = ""
         try:
-            inflight_token = begin_telegram_inflight(label, "api")
             if client_role == "userbot":
                 await wait_for_telegram_client(label)
             await wait_global_flood_gate(label, client_role)
+            if client_role == "userbot":
+                # The flood gate can sleep longer than a full transport recovery;
+                # re-check immediately before registering/starting the actual RPC.
+                await wait_for_telegram_client(label)
+            inflight_token = begin_telegram_inflight(
+                label,
+                "download" if telegram_call_uses_download_lane(label) else "api",
+                client_role=client_role,
+            )
             try:
                 call_semaphore = (
                     telegram_download_semaphore
@@ -7151,6 +7324,72 @@ def current_memory_mb():
     return 0
 
 
+RUNTIME_RESOURCE_CACHE = {"loaded_at": 0.0, "snapshot": {}}
+
+
+def _read_linux_runtime_value(path):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return ""
+
+
+def linux_runtime_resource_snapshot(force=False):
+    """Return cheap cgroup-v2 and host-pressure telemetry for Linux containers."""
+
+    now_mono = time.monotonic()
+    if (
+        not force
+        and now_mono - float(RUNTIME_RESOURCE_CACHE.get("loaded_at") or 0.0) < 5.0
+    ):
+        return dict(RUNTIME_RESOURCE_CACHE.get("snapshot") or {})
+
+    snapshot = {"available": False, "rss_mb": round(current_memory_mb(), 2)}
+    current_raw = _read_linux_runtime_value("/sys/fs/cgroup/memory.current")
+    max_raw = _read_linux_runtime_value("/sys/fs/cgroup/memory.max")
+    if current_raw.isdigit():
+        snapshot["cgroup_memory_current_mb"] = round(int(current_raw) / (1024 * 1024), 2)
+        snapshot["available"] = True
+    if max_raw.isdigit():
+        snapshot["cgroup_memory_max_mb"] = round(int(max_raw) / (1024 * 1024), 2)
+
+    for source_path, prefix in (
+        ("/sys/fs/cgroup/memory.events", "memory_event_"),
+        ("/sys/fs/cgroup/cpu.stat", "cpu_"),
+    ):
+        for line in _read_linux_runtime_value(source_path).splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                snapshot[prefix + parts[0]] = int(parts[1])
+
+    for line in _read_linux_runtime_value("/proc/meminfo").splitlines():
+        key, _sep, value = line.partition(":")
+        if key not in {"MemAvailable", "SwapTotal", "SwapFree"}:
+            continue
+        parts = value.strip().split()
+        if parts and parts[0].isdigit():
+            snapshot[key.lower() + "_mb"] = round(int(parts[0]) / 1024, 2)
+
+    RUNTIME_RESOURCE_CACHE["loaded_at"] = now_mono
+    RUNTIME_RESOURCE_CACHE["snapshot"] = dict(snapshot)
+    return snapshot
+
+
+def effective_runtime_memory_mb():
+    snapshot = linux_runtime_resource_snapshot()
+    return max(
+        float(snapshot.get("rss_mb") or 0.0),
+        float(snapshot.get("cgroup_memory_current_mb") or 0.0),
+    )
+
+
+def runtime_memory_pressure():
+    return bool(
+        MEMORY_SOFT_LIMIT_MB > 0
+        and effective_runtime_memory_mb() >= MEMORY_SOFT_LIMIT_MB
+    )
+
+
 def request_automatic_process_restart(reason):
     """Automatic full-process restart is permanently disabled to protect queue ownership."""
     reason_text = str(reason or "automatic recovery")[:500]
@@ -7159,7 +7398,8 @@ def request_automatic_process_restart(reason):
 
 
 async def event_loop_heartbeat_loop():
-    global EVENT_LOOP_HEARTBEAT_TS
+    global EVENT_LOOP_HEARTBEAT_TS, GLOBAL_EVENT_LOOP_STALL_ACTIVE
+    global WORKER_STALL_SUPPRESS_UNTIL_MONOTONIC
     interval = max(1, HARD_WATCHDOG_HEARTBEAT_SECONDS)
     expected = time.monotonic()
     while True:
@@ -7174,7 +7414,17 @@ async def event_loop_heartbeat_loop():
                 "event_loop_latency",
                 f"Event loop latency warning: {lag:.3f}s",
             )
-        EVENT_LOOP_HEARTBEAT_TS = time.time()
+        if GLOBAL_EVENT_LOOP_STALL_ACTIVE or lag >= max(30.0, interval * 3.0):
+            # A whole-VM scheduling pause makes every worker timestamp look stale at
+            # once.  Grant a bounded post-resume window so the normal RPC timeout or
+            # a fresh worker heartbeat—not the host pause—decides cancellation.
+            WORKER_STALL_SUPPRESS_UNTIL_MONOTONIC = max(
+                WORKER_STALL_SUPPRESS_UNTIL_MONOTONIC,
+                now_mono + WORKER_STALL_RESUME_GRACE_SECONDS,
+            )
+            GLOBAL_EVENT_LOOP_STALL_ACTIVE = False
+            metric_increment("event_loop_host_pause_recoveries")
+        EVENT_LOOP_HEARTBEAT_TS = now_mono
         expected = now_mono + interval
         await asyncio.sleep(interval)
 
@@ -7185,17 +7435,23 @@ def start_hard_watchdog(label="main"):
     if HARD_WATCHDOG_STARTED or not HARD_WATCHDOG_ENABLED:
         return False
     HARD_WATCHDOG_STARTED = True
-    EVENT_LOOP_HEARTBEAT_TS = time.time()
-    started_at = time.time()
+    EVENT_LOOP_HEARTBEAT_TS = time.monotonic()
+    started_at = time.monotonic()
 
     def watchdog_runner():
+        global GLOBAL_EVENT_LOOP_STALL_ACTIVE, WORKER_STALL_SUPPRESS_UNTIL_MONOTONIC
         memory_over_count = 0
         stall_reported = False
         while True:
             time.sleep(max(5, HARD_WATCHDOG_HEARTBEAT_SECONDS))
-            now = time.time()
+            now = time.monotonic()
             stalled_for = now - EVENT_LOOP_HEARTBEAT_TS
             if now - started_at > HARD_WATCHDOG_STARTUP_GRACE_SECONDS and stalled_for > HARD_WATCHDOG_STALL_SECONDS:
+                GLOBAL_EVENT_LOOP_STALL_ACTIVE = True
+                WORKER_STALL_SUPPRESS_UNTIL_MONOTONIC = max(
+                    WORKER_STALL_SUPPRESS_UNTIL_MONOTONIC,
+                    now + WORKER_STALL_RESUME_GRACE_SECONDS,
+                )
                 if not stall_reported:
                     stall_reported = True
                     print(f"Hard watchdog alert: {label} event loop stalled for {int(stalled_for)}s.", flush=True)
@@ -7292,8 +7548,8 @@ async def runtime_resource_guard_loop():
     while True:
         try:
             deleted, freed = await run_blocking("media", cleanup_download_dir_if_needed)
-            cache_prune = prune_runtime_caches()
-            history_prune = prune_runtime_state_history()
+            cache_prune = await run_blocking("control", prune_runtime_caches)
+            history_prune = await run_blocking("control", prune_runtime_state_history)
             if deleted:
                 log_event(f"Storage guard cleaned {deleted} download file(s), freed {freed // (1024 * 1024)} MB.")
             if (
@@ -7307,10 +7563,30 @@ async def runtime_resource_guard_loop():
                     interval_seconds=300,
                 )
             diagnostic_update_queue_peak()
-            gc.collect()
-            mem = current_memory_mb()
+            resources = linux_runtime_resource_snapshot(force=True)
+            mem = max(
+                float(resources.get("rss_mb") or 0.0),
+                float(resources.get("cgroup_memory_current_mb") or 0.0),
+            )
+            if (
+                (MEMORY_SOFT_LIMIT_MB > 0 and mem >= MEMORY_SOFT_LIMIT_MB)
+                or runnable_pipeline_job_count() == 0
+            ):
+                await run_blocking("control", gc.collect)
+            metric_set("runtime_memory_mb", round(mem, 2))
+            metric_set(
+                "runtime_memory_critical",
+                int(MEMORY_CRITICAL_LIMIT_MB > 0 and mem >= MEMORY_CRITICAL_LIMIT_MB),
+            )
+            metric_set("cgroup_memory_oom", int(resources.get("memory_event_oom") or 0))
+            metric_set("cgroup_memory_oom_kill", int(resources.get("memory_event_oom_kill") or 0))
+            metric_set("cgroup_cpu_throttled_usec", int(resources.get("cpu_throttled_usec") or 0))
             if mem:
-                log_event(f"Runtime guard: memory {mem:.0f} MB, download queue {channel_download_queue.qsize()}, upload queue {upload_queue.qsize()}.")
+                log_event(
+                    f"Runtime guard: memory {mem:.0f} MB, download queue {channel_download_queue.qsize()}, "
+                    f"upload queue {upload_queue.qsize()}, profile={RUNTIME_PROFILE}, "
+                    f"oom_kill={int(resources.get('memory_event_oom_kill') or 0)}."
+                )
         except Exception as e:
             log_event(f"Runtime guard error: {e}")
         await asyncio.sleep(max(60, min(STORAGE_MONITOR_INTERVAL_SECONDS, MEMORY_GC_INTERVAL_SECONDS)))
@@ -10072,7 +10348,11 @@ async def refresh_userbot_dialog_cache(force=False):
         count = 0
         by_id = {}
         by_username = {}
-        inflight_token = begin_telegram_inflight("userbot dialog refresh", "control")
+        inflight_token = begin_telegram_inflight(
+            "userbot dialog refresh",
+            "control",
+            client_role="userbot",
+        )
         try:
             await wait_global_flood_gate("userbot dialog refresh", "userbot")
             async with telegram_api_semaphore:
@@ -11649,7 +11929,7 @@ def runtime_checkpoint_payload(reason="periodic"):
         "delivery_intents": intents,
         "semaphores": {
             "api_capacity": TELEGRAM_API_CONCURRENCY,
-            "control_capacity": max(2, env_int("ROYELLS_TELEGRAM_CONTROL_CONCURRENCY", "4")),
+            "control_capacity": TELEGRAM_CONTROL_CONCURRENCY,
             "media_capacity": TELEGRAM_MEDIA_CONCURRENCY,
             "leases_reset_on_boot": True,
         },
@@ -11836,9 +12116,54 @@ def restore_runtime_checkpoint_sync(payload):
 
 
 def checkpoint_job_descriptor(entry):
+    """Return a checkpoint job after applying durable queue migration fences."""
+
     if isinstance(entry, dict) and isinstance(entry.get("job"), dict):
-        return entry.get("job") or {}
-    return entry if isinstance(entry, dict) else {}
+        descriptor = entry.get("job") or {}
+    else:
+        descriptor = entry if isinstance(entry, dict) else {}
+    job_id = str(descriptor.get("job_id") or "")
+    if not job_id:
+        return descriptor
+
+    repaired = False
+    with state_mutex:
+        for state_name in ("download_queue", "upload_queue"):
+            state = STATE.get(state_name, {})
+            items = state.get("items", {}) if isinstance(state, dict) else {}
+            record = items.get(job_id, {}) if isinstance(items, dict) else {}
+            if (
+                isinstance(record, dict)
+                and str(record.get("legacy_retry_migration") or "")
+                == LEGACY_GROUPED_MEDIA_INVALID_RETRY_MIGRATION_ID
+            ):
+                repaired = True
+                break
+    if not repaired:
+        return descriptor
+
+    # The JSON queue is the durable authority for this one migrated job. An old
+    # checkpoint generation must not restore its exhausted counter or rejected
+    # local bytes before queue recovery can fetch pristine source media.
+    descriptor = deepcopy(descriptor)
+    descriptor.update(
+        {
+            "attempt": 1,
+            "permanent_retry_count": 0,
+            "fresh_download_recovery_count": 0,
+            "source_fresh_download_deferred_count": 0,
+            "source_fresh_download_deferred_due_at": 0.0,
+            "source_fresh_download_deferred_reason": "",
+            "manual_fresh_download_deferred_count": 0,
+            "manual_fresh_download_deferred_due_at": 0.0,
+            "manual_fresh_download_deferred_reason": "",
+            "files": [],
+            "partial_download_files": [],
+            "partial_download_messages": [],
+            "legacy_retry_migration": LEGACY_GROUPED_MEDIA_INVALID_RETRY_MIGRATION_ID,
+        }
+    )
+    return descriptor
 
 
 async def hydrate_runtime_job_from_checkpoint(descriptor, queue_name="download"):
@@ -11877,6 +12202,43 @@ async def hydrate_runtime_job_from_checkpoint(descriptor, queue_name="download")
         not files or len(files) != len(messages) or len(raw_files) != len(messages)
     ):
         return None
+
+    # Partial artifacts are a keyed checkpoint, not two independent lists.  A
+    # missing middle file used to be filtered out while its metadata remained,
+    # shifting every later path onto the wrong source message after restart.
+    # Rebuild the two lists from validated pairs so their indices stay atomic.
+    live_messages_by_key = {}
+    for message in messages:
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        message_id = getattr(message, "id", None)
+        if chat_id not in (None, "") and message_id not in (None, ""):
+            live_messages_by_key[f"{chat_id}:{message_id}"] = message
+    partial_files = []
+    partial_message_metas = []
+    seen_partial_keys = set()
+    if queue_name != "upload":
+        for meta, path in zip(
+            descriptor.get("partial_download_messages", []) or [],
+            descriptor.get("partial_download_files", []) or [],
+        ):
+            if not isinstance(meta, dict) or not path:
+                continue
+            chat_id = meta.get("chat_id")
+            message_id = meta.get("message_id")
+            if chat_id in (None, "") or message_id in (None, ""):
+                continue
+            source_key = f"{chat_id}:{message_id}"
+            live_message = live_messages_by_key.get(source_key)
+            if (
+                live_message is None
+                or source_key in seen_partial_keys
+                or not media_path_is_complete_enough(live_message, path)
+            ):
+                continue
+            seen_partial_keys.add(source_key)
+            partial_message_metas.append(dict(meta))
+            partial_files.append(str(path))
     job = {
         "job_id": str(descriptor.get("job_id") or make_job_id(messages, descriptor.get("type") or "single")),
         "post_uid": str(descriptor.get("post_uid") or descriptor.get("job_id") or ""),
@@ -11944,16 +12306,11 @@ async def hydrate_runtime_job_from_checkpoint(descriptor, queue_name="download")
             for item in descriptor.get("album_terminal_failures", []) or []
             if item
         ],
-        "_partial_download_files": [
-            str(path)
-            for path in descriptor.get("partial_download_files", []) or []
-            if path and os.path.exists(path) and os.path.getsize(path) >= 513
-        ],
-        "_partial_download_message_metas": [
-            dict(item)
-            for item in descriptor.get("partial_download_messages", []) or []
-            if isinstance(item, dict)
-        ],
+        # A complete upload descriptor already owns its canonical ``files``;
+        # carrying older partial generations into the upload lane only protects
+        # stale spool files from cleanup.
+        "_partial_download_files": partial_files,
+        "_partial_download_message_metas": partial_message_metas,
     }
     if files:
         job["files"] = files
@@ -12614,6 +12971,140 @@ def release_legacy_false_zero_byte_quarantine():
     return repair_count, sorted(affected_sources)
 
 
+def migrate_legacy_grouped_media_invalid_retries():
+    """Reopen only nonterminal albums poisoned by the legacy classifier bug.
+
+    Older builds did not recognize Telegram's exact ``MEDIA_INVALID`` spelling.
+    They aggregated ``messages.SendMultiMedia`` failures into a generic grouped
+    error and consumed the source job's permanent-retry budget. This one-time
+    repair keeps the original message descriptors/reservations, discards only
+    stale local artifacts, and resets the affected retry counters. Explicit
+    source deletion/unavailability and every terminal queue record are excluded.
+    """
+
+    migration_time = now_iso()
+    repaired_job_ids = set()
+    changed_states = set()
+    with state_mutex:
+        runtime_config = STATE.setdefault(
+            "runtime_config",
+            default_state("runtime_config"),
+        )
+        migrations = runtime_config.setdefault("migrations", {})
+        if LEGACY_GROUPED_MEDIA_INVALID_RETRY_MIGRATION_ID in migrations:
+            return 0
+
+        records_by_job = defaultdict(list)
+        for state_name in ("download_queue", "upload_queue"):
+            items = STATE.setdefault(state_name, default_state(state_name)).setdefault(
+                "items",
+                {},
+            )
+            for job_id, record in items.items():
+                if not isinstance(record, dict):
+                    continue
+                if str(record.get("status") or "") not in QUEUE_STUCK_STATUSES:
+                    continue
+                records_by_job[str(job_id)].append((state_name, record))
+
+        for job_id, records in records_by_job.items():
+            combined_error = " | ".join(
+                str(record.get("last_error") or "").lower()
+                for _state_name, record in records
+            )
+            album_evidence = any(
+                str(record.get("type") or "").lower() == "album"
+                for _state_name, record in records
+            )
+            if not album_evidence:
+                for _state_name, record in records:
+                    try:
+                        if int(record.get("message_count") or 0) > 1:
+                            album_evidence = True
+                            break
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+            legacy_group_error = "grouped album upload failed" in combined_error
+            invalid_rpc_error = (
+                "media_invalid" in combined_error
+                or "media is invalid" in combined_error
+                or (
+                    "sendmultimedia" in combined_error
+                    and "invalid" in combined_error
+                )
+            )
+            explicit_source_absence = any(
+                marker in combined_error
+                for marker in (
+                    "message_id_invalid",
+                    "message id invalid",
+                    "source message deleted",
+                    "source media no longer available",
+                    "source media unavailable",
+                )
+            )
+            if (
+                not album_evidence
+                or not legacy_group_error
+                or not invalid_rpc_error
+                or explicit_source_absence
+            ):
+                continue
+
+            repaired_job_ids.add(job_id)
+            for state_name, record in records:
+                # Clear local upload/download artifacts so recovery is forced to
+                # fetch pristine source bytes. Message metadata is intentionally
+                # retained and remains protected by the durable reservation map.
+                record.update(
+                    {
+                        "status": "retry_later",
+                        "attempt": 1,
+                        "permanent_retry_count": 0,
+                        "fresh_download_recovery_count": 0,
+                        "source_fresh_download_deferred_count": 0,
+                        "source_fresh_download_deferred_due_at": 0.0,
+                        "source_fresh_download_deferred_reason": "",
+                        "manual_fresh_download_deferred_count": 0,
+                        "manual_fresh_download_deferred_due_at": 0.0,
+                        "manual_fresh_download_deferred_reason": "",
+                        "files": [],
+                        "partial_download_files": [],
+                        "partial_download_messages": [],
+                        "last_error": (
+                            "legacy grouped MEDIA_INVALID retry budget repaired; "
+                            "fresh source download required"
+                        ),
+                        "legacy_retry_migration": (
+                            LEGACY_GROUPED_MEDIA_INVALID_RETRY_MIGRATION_ID
+                        ),
+                        "updated_at": migration_time,
+                    }
+                )
+                changed_states.add(state_name)
+
+        migrations[LEGACY_GROUPED_MEDIA_INVALID_RETRY_MIGRATION_ID] = {
+            "completed_at": migration_time,
+            "repaired_jobs": len(repaired_job_ids),
+            "scope": "nonterminal grouped album MEDIA_INVALID only",
+        }
+        runtime_config.setdefault("events", []).append(
+            {
+                "time": migration_time,
+                "action": "repair_grouped_media_invalid_retry_budget",
+                "migration": LEGACY_GROUPED_MEDIA_INVALID_RETRY_MIGRATION_ID,
+                "repaired_jobs": len(repaired_job_ids),
+            }
+        )
+        runtime_config["events"] = runtime_config["events"][-1000:]
+
+        for state_name in changed_states:
+            save_state(state_name)
+        save_state("runtime_config")
+
+    return len(repaired_job_ids)
+
+
 def is_dead_media_uid(uid):
     if not uid:
         return False
@@ -12709,6 +13200,8 @@ def remove_processing_keys(channel_id, msg):
 
 
 def pipeline_job_count():
+    """Count every owned job, including future durable retry descriptors."""
+
     with active_worker_jobs_lock:
         active_count = len(active_worker_jobs)
     return (
@@ -12716,6 +13209,31 @@ def pipeline_job_count():
         + upload_queue.qsize()
         + link_process_queue.qsize()
         + retry_admission_queue.qsize()
+        + active_count
+    )
+
+
+def runnable_retry_job_count(now_monotonic=None):
+    """Count retry descriptors whose due time has arrived without removing them."""
+
+    now_monotonic = float(now_monotonic or time.monotonic())
+    return sum(
+        1
+        for entry in list(retry_admission_queue._queue)
+        if len(entry) >= 1 and float(entry[0]) <= now_monotonic
+    )
+
+
+def runnable_pipeline_job_count():
+    """Return current executable pressure; parked retries retain ownership only."""
+
+    with active_worker_jobs_lock:
+        active_count = len(active_worker_jobs)
+    return (
+        channel_download_queue.qsize()
+        + upload_queue.qsize()
+        + link_process_queue.qsize()
+        + runnable_retry_job_count()
         + active_count
     )
 
@@ -12754,6 +13272,8 @@ def mark_worker_job(worker_name, job):
             "attempt": int(job.get("attempt") or 1),
             "started_at": time.time(),
             "last_progress_at": time.time(),
+            "started_monotonic": time.monotonic(),
+            "last_progress_monotonic": time.monotonic(),
             "started_iso": now_iso(),
             "job": serialize_runtime_job(job),
         }
@@ -12767,6 +13287,7 @@ def touch_worker_job(worker_name, job=None):
         if item is None:
             return
         item["last_progress_at"] = time.time()
+        item["last_progress_monotonic"] = time.monotonic()
         if job is not None:
             item["attempt"] = int(job.get("attempt") or item.get("attempt") or 1)
             item["job"] = serialize_runtime_job(job)
@@ -12776,17 +13297,24 @@ def _set_worker_media_rpc_state(worker_name, job, operation):
     """Record bounded external media work without writing a checkpoint every tick."""
 
     now_ts = time.time()
+    now_mono = time.monotonic()
     operation = str(operation or "telegram media RPC")[:160]
     with active_worker_jobs_lock:
         item = active_worker_jobs.get(worker_name)
         if item is None:
             return False
         item["last_progress_at"] = now_ts
+        item["last_progress_monotonic"] = now_mono
         item["active_media_rpc"] = operation
         item.setdefault("active_media_rpc_started_at", now_ts)
+        item.setdefault("active_media_rpc_started_monotonic", now_mono)
         item.setdefault(
             "active_media_rpc_deadline_at",
             now_ts + MEDIA_RPC_HARD_TIMEOUT_SECONDS,
+        )
+        item.setdefault(
+            "active_media_rpc_deadline_monotonic",
+            now_mono + MEDIA_RPC_HARD_TIMEOUT_SECONDS,
         )
         item["active_media_rpc_heartbeat_at"] = now_ts
         if job is not None:
@@ -12809,8 +13337,11 @@ def _clear_worker_media_rpc_state(worker_name, operation=""):
         item.pop("active_media_rpc", None)
         item.pop("active_media_rpc_started_at", None)
         item.pop("active_media_rpc_deadline_at", None)
+        item.pop("active_media_rpc_started_monotonic", None)
+        item.pop("active_media_rpc_deadline_monotonic", None)
         item.pop("active_media_rpc_heartbeat_at", None)
         item["last_progress_at"] = time.time()
+        item["last_progress_monotonic"] = time.monotonic()
 
 
 @contextlib.asynccontextmanager
@@ -12857,15 +13388,15 @@ def worker_has_active_bounded_media_rpc(item, now_ts=None):
 
     if not isinstance(item, dict) or not item.get("active_media_rpc"):
         return False
-    now_ts = float(now_ts or time.time())
-    started_at = float(item.get("active_media_rpc_started_at") or 0)
+    now_ts = float(now_ts or time.monotonic())
+    started_at = float(item.get("active_media_rpc_started_monotonic") or 0)
     if started_at <= 0:
         return False
     # This is an additional guard against a race between watchdog inspection and
     # heartbeat scheduling, not an unlimited watchdog exemption.  Once the media
     # hard deadline expires, the watchdog evaluates the worker from RPC start time.
     deadline_at = float(
-        item.get("active_media_rpc_deadline_at")
+        item.get("active_media_rpc_deadline_monotonic")
         or (started_at + MEDIA_RPC_HARD_TIMEOUT_SECONDS)
     )
     return now_ts <= deadline_at
@@ -12875,17 +13406,17 @@ def worker_effective_progress_at(item, now_ts=None):
     """Return watchdog-safe progress time; expired RPC heartbeats cannot mask a stall."""
 
     if not isinstance(item, dict):
-        return float(now_ts or time.time())
-    now_ts = float(now_ts or time.time())
-    fallback = float(item.get("started_at") or now_ts)
-    progress_at = float(item.get("last_progress_at") or fallback)
+        return float(now_ts or time.monotonic())
+    now_ts = float(now_ts or time.monotonic())
+    fallback = float(item.get("started_monotonic") or now_ts)
+    progress_at = float(item.get("last_progress_monotonic") or fallback)
     if not item.get("active_media_rpc"):
         return progress_at
-    started_at = float(item.get("active_media_rpc_started_at") or 0)
+    started_at = float(item.get("active_media_rpc_started_monotonic") or 0)
     if started_at <= 0:
         return progress_at
     deadline_at = float(
-        item.get("active_media_rpc_deadline_at")
+        item.get("active_media_rpc_deadline_monotonic")
         or (started_at + MEDIA_RPC_HARD_TIMEOUT_SECONDS)
     )
     return progress_at if now_ts <= deadline_at else started_at
@@ -12900,8 +13431,21 @@ def clear_worker_job(worker_name):
 
 
 def stalled_worker_jobs(max_age=None):
+    global WORKER_STALL_SUPPRESS_UNTIL_MONOTONIC
     max_age = max(60, int(max_age or WORKER_STALL_SECONDS))
-    now_ts = time.time()
+    now_ts = time.monotonic()
+    heartbeat_gap = max(0.0, now_ts - float(EVENT_LOOP_HEARTBEAT_TS or now_ts))
+    if heartbeat_gap > max(30.0, HARD_WATCHDOG_HEARTBEAT_SECONDS * 3.0):
+        WORKER_STALL_SUPPRESS_UNTIL_MONOTONIC = max(
+            WORKER_STALL_SUPPRESS_UNTIL_MONOTONIC,
+            now_ts + WORKER_STALL_RESUME_GRACE_SECONDS,
+        )
+        return []
+    if (
+        GLOBAL_EVENT_LOOP_STALL_ACTIVE
+        or now_ts < float(WORKER_STALL_SUPPRESS_UNTIL_MONOTONIC or 0.0)
+    ):
+        return []
     with active_worker_jobs_lock:
         items = list(active_worker_jobs.values())
     return [
@@ -13537,14 +14081,15 @@ async def wait_for_local_media_capacity(source, max_wait_seconds=None):
         else:
             storage_pressured = current_bytes >= storage_high
         database_pressure = bool(DB_RECOVERY_ACTIVE or DB_DEGRADED)
-        if not (upload_pressure or storage_pressured or database_pressure):
+        memory_pressure = runtime_memory_pressure()
+        if not (upload_pressure or storage_pressured or database_pressure or memory_pressure):
             return True
         metric_increment("v21_backpressure_pauses")
         log_event_rate_limited(
             f"local_media_backpressure:{source}",
             f"Local media backpressure: source={source} upload_queue={upload_queue.qsize()} "
             f"download_mb={int(current_bytes) // (1024 * 1024)} "
-            f"db_pressure={database_pressure}.",
+            f"db_pressure={database_pressure} memory_pressure={memory_pressure}.",
             interval_seconds=60,
         )
         if time.monotonic() >= deadline:
@@ -13667,12 +14212,17 @@ def clear_processing_cache_if_idle(reason=""):
 
 
 def source_job_retry_forever(job):
+    """Keep unreconciled durable source jobs renewable until an explicit terminal verdict.
+
+    ``SOURCE_PERMANENT_RETRY_LIMIT`` now saturates the persisted telemetry counter;
+    it is not a data-loss boundary. Source-deleted, retired, duplicate, and other
+    deterministic outcomes are handled before this generic pressure-managed path.
+    """
+
     return (
         SOURCE_PERMANENT_RETRY_ENABLED
         and pressure_managed_source(job.get("source", ""))
         and not job.get("is_fallback")
-        and int(job.get("_permanent_retry_count") or 0)
-        < SOURCE_PERMANENT_RETRY_LIMIT
     )
 
 
@@ -13728,15 +14278,46 @@ def source_job_retry_delay_seconds(job, reason, retry_count=None):
     return min(SOURCE_FAILED_RETRY_MAX_DELAY_SECONDS, exponential_delay + jitter)
 
 
+def source_retry_requires_clean_download(reason):
+    """Return whether a generic source retry must not reuse local upload bytes."""
+
+    text = f"{type(reason).__name__} {reason}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "media_invalid",
+            "media is invalid",
+            "invalid media",
+            "media invalid",
+            "media_empty",
+            "media empty",
+            "grouped album upload failed",
+        )
+    )
+
+
 async def delayed_source_retry(job, reason):
     retry_job = {k: v for k, v in job.items() if k != "files"}
+    clean_download = source_retry_requires_clean_download(reason)
+    if clean_download:
+        clear_partial_download_checkpoint(
+            retry_job,
+            preserve_paths=job.get("files", []),
+            reason="media rejection source retry cleared partial checkpoint",
+        )
     retry_job["attempt"] = 1
-    retry_count = int(
-        job.get("_permanent_retry_count") or 0
-    ) + 1
+    retry_count = min(
+        SOURCE_PERMANENT_RETRY_LIMIT,
+        int(job.get("_permanent_retry_count") or 0) + 1,
+    )
     retry_job["_permanent_retry_count"] = retry_count
     delay = source_job_retry_delay_seconds(retry_job, reason, retry_count)
-    record_download_job(retry_job, "retry_later", reason)
+    record_download_job(
+        retry_job,
+        "retry_later",
+        reason,
+        files=[] if clean_download else None,
+    )
     record_total_job(retry_job, "retry_later", reason)
     record_sync_item(retry_job, "retry_later", reason)
     scheduled = schedule_queue_retry("download", retry_job, delay, reason)
@@ -13749,13 +14330,26 @@ def schedule_source_job_retry_later(job, reason):
     if not source_job_retry_forever(job):
         return False
     retry_job = {k: v for k, v in job.items() if k != "files"}
+    clean_download = source_retry_requires_clean_download(reason)
+    if clean_download:
+        clear_partial_download_checkpoint(
+            retry_job,
+            preserve_paths=job.get("files", []),
+            reason="media rejection source retry cleared partial checkpoint",
+        )
     retry_job["attempt"] = 1
-    retry_count = int(
-        job.get("_permanent_retry_count") or 0
-    ) + 1
+    retry_count = min(
+        SOURCE_PERMANENT_RETRY_LIMIT,
+        int(job.get("_permanent_retry_count") or 0) + 1,
+    )
     retry_job["_permanent_retry_count"] = retry_count
     delay = source_job_retry_delay_seconds(retry_job, reason, retry_count)
-    record_download_job(retry_job, "retry_later", reason)
+    record_download_job(
+        retry_job,
+        "retry_later",
+        reason,
+        files=[] if clean_download else None,
+    )
     record_total_job(retry_job, "retry_later", reason)
     record_sync_item(retry_job, "retry_later", reason)
     scheduled = schedule_queue_retry("download", retry_job, delay, reason)
@@ -13786,16 +14380,30 @@ def record_download_job(job, status, error=None, files=None):
             if terminal
             else (files if files is not None else old.get("files", []))
         )
-        partial_files = [] if terminal else list(
-            job.get("_partial_download_files")
-            or old.get("partial_download_files", [])
-            or []
-        )
-        partial_messages = [] if terminal else list(
-            job.get("_partial_download_message_metas")
-            or old.get("partial_download_messages", [])
-            or []
-        )
+        if terminal:
+            partial_files = []
+            partial_messages = []
+        else:
+            # Presence, not truthiness, is authoritative: an explicit empty
+            # runtime list means an obsolete generation was cleared.  Falling
+            # back through ``or old[...]`` resurrected those stale paths.
+            if "_partial_download_files" in job:
+                partial_files = list(job.get("_partial_download_files") or [])
+            elif "partial_download_files" in job:
+                partial_files = list(job.get("partial_download_files") or [])
+            else:
+                partial_files = list(old.get("partial_download_files") or [])
+            if "_partial_download_message_metas" in job:
+                partial_messages = list(
+                    job.get("_partial_download_message_metas") or []
+                )
+            elif "partial_download_messages" in job:
+                partial_messages = list(job.get("partial_download_messages") or [])
+            else:
+                partial_messages = list(old.get("partial_download_messages") or [])
+            pair_count = min(len(partial_files), len(partial_messages))
+            partial_files = partial_files[:pair_count]
+            partial_messages = partial_messages[:pair_count]
         unavailable_item_retries = {}
         if not terminal:
             raw_unavailable_item_retries = (
@@ -13915,6 +14523,10 @@ def record_upload_job(job, status, error=None):
             "manual_link_url": job.get("manual_link_url", old.get("manual_link_url", "")),
             "status_chat_id": job.get("status_chat_id", old.get("status_chat_id", 0)),
             "status_message_id": job.get("status_message_id", old.get("status_message_id", 0)),
+            # The upload lane owns the complete canonical ``files`` list.  Do
+            # not retain legacy partial generations through the ``**old`` merge.
+            "partial_download_files": [],
+            "partial_download_messages": [],
             "last_error": str(error)[:500] if error else "",
             "created_at": old.get("created_at", now_iso()),
             "updated_at": now_iso(),
@@ -14104,25 +14716,131 @@ def partial_download_file_for_message(job, msg):
     return ""
 
 
+def clear_partial_download_checkpoint(job, preserve_paths=None, reason="partial checkpoint cleared"):
+    """Drop obsolete partial generations without deleting currently owned files.
+
+    Paths still present in ``preserve_paths`` remain owned by the caller (usually
+    the complete upload generation).  Every other former partial is untracked
+    and handed to the deferred cleanup engine, whose protected-path check keeps
+    it safe if another live/recovered job still references the same file.
+    """
+
+    if not isinstance(job, dict):
+        return []
+    old_paths = []
+    seen_paths = set()
+    for field in ("_partial_download_files", "partial_download_files"):
+        for raw_path in job.get(field, []) or []:
+            if not raw_path:
+                continue
+            path_text = str(raw_path)
+            try:
+                path_key = str(Path(path_text).resolve())
+            except (OSError, RuntimeError, TypeError, ValueError):
+                path_key = path_text
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            old_paths.append((path_key, path_text))
+
+    preserved_keys = set()
+    for raw_path in preserve_paths or []:
+        if not raw_path:
+            continue
+        path_text = str(raw_path)
+        try:
+            preserved_keys.add(str(Path(path_text).resolve()))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            preserved_keys.add(path_text)
+
+    had_checkpoint = bool(
+        job.get("_partial_download_files")
+        or job.get("partial_download_files")
+        or job.get("_partial_download_message_metas")
+        or job.get("partial_download_messages")
+    )
+    job["_partial_download_files"] = []
+    job["partial_download_files"] = []
+    job["_partial_download_message_metas"] = []
+    job["partial_download_messages"] = []
+
+    obsolete_paths = [path for key, path in old_paths if key not in preserved_keys]
+    if obsolete_paths:
+        untrack_download_files(obsolete_paths)
+        defer_download_cleanup(obsolete_paths, str(reason or "partial checkpoint cleared")[:120])
+    if had_checkpoint:
+        mark_runtime_checkpoint_dirty(str(reason or "partial checkpoint cleared")[:120])
+    return obsolete_paths
+
+
 def remember_partial_download(job, msg, path):
     if not media_path_is_complete_enough(msg, path):
         return False
     key = source_message_key(msg)
     if not key:
         return False
-    metas = job.setdefault("_partial_download_message_metas", [])
-    files = job.setdefault("_partial_download_files", [])
-    existing = {
-        source_message_key_from_meta(meta)
-        for meta in metas
-        if isinstance(meta, dict)
-    }
-    if key not in existing:
-        metas.append(message_meta(msg))
-        files.append(str(path))
-        mark_runtime_checkpoint_dirty("partial download remembered")
-        return True
-    return False
+    new_path = str(path)
+    old_metas = list(
+        job.get("_partial_download_message_metas")
+        or job.get("partial_download_messages")
+        or []
+    )
+    old_files = list(
+        job.get("_partial_download_files")
+        or job.get("partial_download_files")
+        or []
+    )
+    new_metas = []
+    new_files = []
+    obsolete_paths = []
+    replaced = False
+    changed = len(old_metas) != len(old_files)
+
+    for meta, old_path in zip(old_metas, old_files):
+        old_key = source_message_key_from_meta(meta)
+        if not old_key or not old_path:
+            changed = True
+            continue
+        old_path_text = str(old_path)
+        if old_key == key:
+            if replaced:
+                if old_path_text != new_path:
+                    obsolete_paths.append(old_path_text)
+                changed = True
+                continue
+            replaced = True
+            new_metas.append(message_meta(msg))
+            new_files.append(new_path)
+            if old_path_text != new_path:
+                obsolete_paths.append(old_path_text)
+                changed = True
+            continue
+        new_metas.append(dict(meta))
+        new_files.append(old_path_text)
+
+    if not replaced:
+        new_metas.append(message_meta(msg))
+        new_files.append(new_path)
+        changed = True
+
+    # Keep both legacy/checkpoint spellings synchronized.  A stale plain field
+    # otherwise remains visible to cleanup protection after the underscored
+    # runtime list has moved to a newer generation.
+    job["_partial_download_message_metas"] = new_metas
+    job["partial_download_messages"] = [dict(meta) for meta in new_metas]
+    job["_partial_download_files"] = new_files
+    job["partial_download_files"] = list(new_files)
+    if obsolete_paths:
+        untrack_download_files(obsolete_paths)
+        defer_download_cleanup(
+            obsolete_paths,
+            f"partial generation replaced for {key}"[:120],
+        )
+    if changed:
+        mark_runtime_checkpoint_dirty(
+            "partial download generation replaced" if replaced else "partial download remembered"
+        )
+    return changed
 
 
 def retain_media_job_for_admission_backpressure(job, messages, ch_name, reason):
@@ -14560,7 +15278,7 @@ async def try_copy_message_fast_path(job, msg, ch_name):
                         confirmed=True,
                     )
                     return False
-                if should_reconnect_telegram_error(e):
+                if label == "userbot" and should_reconnect_telegram_error(e):
                     schedule_userbot_reconnect(f"copyMessage {label}: {e}")
     if last_error:
         log_event(f"copyMessage fallback to download for {ch_name}: {str(last_error)[:140]}")
@@ -14774,7 +15492,7 @@ async def try_copy_album_items_fast_path(job, messages, ch_name):
                         confirmed=True,
                     )
                     return False
-                if should_reconnect_telegram_error(e):
+                if label == "userbot" and should_reconnect_telegram_error(e):
                     schedule_userbot_reconnect(f"copy album {label}: {e}")
 
     if last_error:
@@ -14934,16 +15652,46 @@ async def prepare_source_upload_items(messages, files, worker_id, ch_name):
     return prepared, generated_files
 
 
+def sanitized_source_video_upload_metadata(message):
+    """Return safe Telegram-origin video metadata for re-upload.
+
+    Pyrogram cannot always probe a downloaded file inside the slim production
+    image. The source message already carries Telegram-validated metadata, so
+    preserve it while rejecting booleans, negatives, and non-integer values.
+    """
+
+    video = getattr(message, "video", None)
+    metadata = {}
+    for field in ("width", "height", "duration"):
+        raw_value = getattr(video, field, None) if video is not None else None
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if isinstance(raw_value, bool) or value <= 0:
+            continue
+        metadata[field] = min(value, 2_147_483_647)
+    supports_streaming = (
+        getattr(video, "supports_streaming", None)
+        if video is not None
+        else None
+    )
+    if isinstance(supports_streaming, bool):
+        metadata["supports_streaming"] = supports_streaming
+    return metadata
+
+
 async def build_source_media_group(prepared_items):
     media_group = []
     for m, fp in prepared_items:
         if m.photo:
             media_group.append(InputMediaPhoto(media=fp))
         elif m.video:
+            video_metadata = sanitized_source_video_upload_metadata(m)
             media_group.append(
                 InputMediaVideo(
                     media=fp,
-                    supports_streaming=True,
+                    **video_metadata,
                 )
             )
     return media_group
@@ -14963,13 +15711,20 @@ def upload_timeout_for_files(files):
 
 async def telegram_media_call(label, awaitable_or_factory, timeout_seconds, client_role=None):
     client_role = telegram_client_role(label, client_role)
-    inflight_token = begin_telegram_inflight(label, "media")
+    inflight_token = ""
     try:
         effective_timeout = max(30, min(int(timeout_seconds), TELEGRAM_MEDIA_CALL_HARD_TIMEOUT_SECONDS))
         await wait_global_flood_gate(label, client_role)
+        if client_role == "userbot":
+            await wait_for_telegram_client(label)
+        inflight_token = begin_telegram_inflight(
+            label,
+            "media",
+            client_role=client_role,
+        )
         async with telegram_media_semaphore:
             global EVENT_LOOP_HEARTBEAT_TS
-            EVENT_LOOP_HEARTBEAT_TS = time.time()
+            EVENT_LOOP_HEARTBEAT_TS = time.monotonic()
             started = time.monotonic()
             awaitable = awaitable_or_factory() if callable(awaitable_or_factory) else awaitable_or_factory
             result = await asyncio.wait_for(awaitable, timeout=effective_timeout)
@@ -14981,7 +15736,7 @@ async def telegram_media_call(label, awaitable_or_factory, timeout_seconds, clie
                     f"slow_media:{label}",
                     f"Slow Telegram media call: {label} duration={duration:.2f}s",
                 )
-            EVENT_LOOP_HEARTBEAT_TS = time.time()
+            EVENT_LOOP_HEARTBEAT_TS = time.monotonic()
             await asyncio.sleep(0)
             return result
     except asyncio.TimeoutError:
@@ -14993,8 +15748,9 @@ async def telegram_media_call(label, awaitable_or_factory, timeout_seconds, clie
         raise
     except Exception as exc:
         if is_session_auth_error(exc):
-            mark_session_auth_invalid(exc)
-        elif should_reconnect_telegram_error(exc):
+            if client_role == "userbot":
+                mark_session_auth_invalid(exc)
+        elif client_role == "userbot" and should_reconnect_telegram_error(exc):
             schedule_userbot_reconnect(f"media {label}: {exc}")
         raise
     finally:
@@ -15191,10 +15947,11 @@ async def send_prepared_source_single(m, fp, protect_content=True, job=None, ch_
                 operation=operation or "single_photo",
             )
         if m.video:
+            video_metadata = sanitized_source_video_upload_metadata(m)
             return await target_send_video(
                 "send_video",
                 fp,
-                supports_streaming=True,
+                **video_metadata,
                 protect_content=protect_content,
                 job=job,
                 messages=[m],
@@ -15258,6 +16015,8 @@ async def send_source_album_chunk_resilient(prepared_items, worker_id, ch_name, 
         except Exception as e:
             if isinstance(e, (UploadSessionRecoveryError, MediaArtifactRefreshRequired)):
                 raise
+            if is_flood_wait_error(e):
+                raise
             if is_media_empty_upload_error(e) or is_invalid_media_upload_error(e):
                 log_event(
                     f"[UP W{worker_id}] Single album fallback received a target media rejection "
@@ -15294,6 +16053,10 @@ async def send_source_album_chunk_resilient(prepared_items, worker_id, ch_name, 
                     return [(m, sent[idx]) for idx, (m, _) in enumerate(prepared_items)]
                 except Exception as exc:
                     if isinstance(exc, (UploadSessionRecoveryError, MediaArtifactRefreshRequired)):
+                        raise
+                    if is_flood_wait_error(exc):
+                        # The global role gate owns this protocol backoff. Never
+                        # hide FloodWait inside an aggregate MEDIA_INVALID retry.
                         raise
                     if is_media_empty_upload_error(exc):
                         # A target-side MEDIA_EMPTY reply cannot identify a bad
@@ -15382,7 +16145,7 @@ async def send_source_album_chunk_resilient(prepared_items, worker_id, ch_name, 
                 job=job,
             )
         raise RuntimeError(
-            "grouped album upload failed; album kept intact for whole-job retry/quarantine: "
+            "grouped album upload failed; album kept intact for delayed whole-job retry: "
             + " | ".join(errors[-4:])
         )
 
@@ -15399,6 +16162,8 @@ async def send_source_album_chunk_resilient(prepared_items, worker_id, ch_name, 
         return [(m, sent[idx] if sent and idx < len(sent) else None) for idx, (m, _) in enumerate(prepared_items)]
     except Exception as first_error:
         if isinstance(first_error, (UploadSessionRecoveryError, MediaArtifactRefreshRequired)):
+            raise
+        if is_flood_wait_error(first_error):
             raise
         if is_media_empty_upload_error(first_error):
             log_event(
@@ -15438,6 +16203,8 @@ async def send_source_album_chunk_resilient(prepared_items, worker_id, ch_name, 
             return [(m, sent[idx] if sent and idx < len(sent) else None) for idx, (m, _) in enumerate(prepared_items)]
         except Exception as second_error:
             if isinstance(second_error, (UploadSessionRecoveryError, MediaArtifactRefreshRequired)):
+                raise
+            if is_flood_wait_error(second_error):
                 raise
             if is_media_empty_upload_error(second_error):
                 log_event(
@@ -15486,6 +16253,8 @@ async def send_source_items_individually(prepared_items, worker_id, ch_name, job
         except Exception as protected_error:
             if isinstance(protected_error, (UploadSessionRecoveryError, MediaArtifactRefreshRequired)):
                 raise
+            if is_flood_wait_error(protected_error):
+                raise
             if is_media_empty_upload_error(protected_error):
                 log_event(
                     f"[UP W{worker_id}] Album item {index} received MEDIA_EMPTY for {ch_name}; "
@@ -15515,6 +16284,8 @@ async def send_source_items_individually(prepared_items, worker_id, ch_name, job
                     sent_msg = await send_prepared_source_single(m, fp, protect_content=False, job=job, ch_name=ch_name, operation="album_item_plain")
                 except Exception as plain_error:
                     if isinstance(plain_error, (UploadSessionRecoveryError, MediaArtifactRefreshRequired)):
+                        raise
+                    if is_flood_wait_error(plain_error):
                         raise
                     if is_media_empty_upload_error(plain_error):
                         log_event(
@@ -17175,25 +17946,28 @@ def mark_posted(channel_id, msg, channel_name="", target_msg=None, post_uid=None
 
 def get_db_stats(force=False):
     now_mono = time.monotonic()
+    # The canonical target UID set is maintained on every ledger/index commit, so
+    # its length is O(1).  Re-counting ~150k SQLite rows every 15 seconds consumed
+    # most of an E2.1.Micro's fractional CPU and blocked the single DB executor.
+    posted = len(target_media_full_index)
+    DB_STATS_CACHE["posted"] = posted
     if (
         not force
         and (
             threading.get_ident() == MAIN_LOOP_THREAD_ID
-            or now_mono - float(DB_STATS_CACHE.get("loaded_at") or 0.0) < 15
+            or now_mono - float(DB_STATS_CACHE.get("loaded_at") or 0.0)
+            < DB_STATS_REFRESH_INTERVAL_SECONDS
         )
     ):
         return (
             int(DB_STATS_CACHE.get("subscriptions") or 0),
-            int(DB_STATS_CACHE.get("posted") or 0),
+            posted,
         )
     try:
         with db_mutex:
             conn = db_connect()
             try:
                 subs = conn.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0]
-                posted = conn.execute(
-                    "SELECT COUNT(*) FROM target_media_full_index"
-                ).fetchone()[0]
             finally:
                 conn.close()
         DB_STATS_CACHE.update(
@@ -17222,7 +17996,7 @@ async def db_stats_refresh_loop():
                 f"Dashboard DB statistics refresh deferred: {str(exc)[:160]}",
                 interval_seconds=120,
             )
-        await asyncio.sleep(15)
+        await asyncio.sleep(DB_STATS_REFRESH_INTERVAL_SECONDS)
 
 
 def short_dt(value):
@@ -18062,7 +18836,12 @@ def get_queue_menu_text():
 
 
 def runtime_worker_limits():
-    return {"download": 1, "upload": 1, "link": 1, "button": 2}
+    return {
+        "download": 1,
+        "upload": 1,
+        "link": 1,
+        "button": 1 if IS_ORACLE_E2_MICRO else 2,
+    }
 
 
 def runtime_queue_limits():
@@ -18971,7 +19750,7 @@ async def refresh_members_cache():
             return members, ""
         except Exception as e:
             last_error = e
-            if should_reconnect_telegram_error(e):
+            if label == "userbot" and should_reconnect_telegram_error(e):
                 schedule_userbot_reconnect(f"member fetch {label}: {e}")
             log_event(f"Member fetch via {label} failed: {e}")
     MEMBERS_CACHE["error"] = str(last_error)[:180] if last_error else "unknown member fetch error"
@@ -20427,6 +21206,14 @@ async def channel_download_worker_loop(worker_id):
                 job["type"] = "single"
 
             job["messages"] = downloaded_messages
+            # Every remaining member now has a complete canonical artifact.
+            # Retire checkpoint generations from earlier attempts while the
+            # current files stay owned by the upload job.
+            clear_partial_download_checkpoint(
+                job,
+                preserve_paths=downloaded_files,
+                reason="complete source download replaced partial checkpoint",
+            )
             upload_job = {**job, "files": downloaded_files, "attempt": 1}
             if V21_ENGINE is not None and isinstance(upload_job.get("_v21_context"), dict):
                 upload_job["_v21_queue"] = "upload"
@@ -23121,7 +23908,7 @@ async def adaptive_source_intake_loop():
     while True:
         try:
             await wait_while_session_invalid("adaptive source intake")
-            pipeline_jobs = pipeline_job_count()
+            pipeline_jobs = runnable_pipeline_job_count()
             if (
                 ADAPTIVE_INTAKE_MAX_PIPELINE_JOBS
                 and pipeline_jobs >= ADAPTIVE_INTAKE_MAX_PIPELINE_JOBS
@@ -23322,9 +24109,9 @@ async def immediate_startup_rescue_scan_loop():
         if not active_source_channels():
             log_event("Immediate startup rescue skipped: no active source channels.")
             return
-        if pipeline_job_count() > max(0, AUTO_SYNC_MAX_QUEUE):
+        if runnable_pipeline_job_count() > max(0, AUTO_SYNC_MAX_QUEUE):
             log_event(
-                f"Immediate startup rescue skipped: pipeline already has {pipeline_job_count()} job(s)."
+                f"Immediate startup rescue skipped: pipeline already has {runnable_pipeline_job_count()} runnable job(s)."
             )
             return
         if sync_scan_lock.locked():
@@ -23377,7 +24164,7 @@ async def auto_recovery_loop():
     while True:
         try:
             await wait_while_session_invalid("auto recovery")
-            if active_source_channels() and pipeline_job_count() == 0:
+            if active_source_channels() and runnable_pipeline_job_count() == 0:
                 clear_processing_cache_if_idle("auto recovery")
                 if not sync_scan_lock.locked():
                     log_event("Auto recovery: idle pipeline detected, scanning recent source history.")
@@ -23917,7 +24704,7 @@ async def target_media_index_loop():
     await asyncio.sleep(max(10, TARGET_MEDIA_INDEX_START_DELAY_SECONDS))
     while True:
         try:
-            while pipeline_job_count() > 0:
+            while runnable_pipeline_job_count() > 0:
                 stalled = stalled_worker_jobs()
                 if stalled:
                     job = stalled[0]
@@ -23929,7 +24716,10 @@ async def target_media_index_loop():
                 last_log = float(source_pressure_log_cache.get("target_index_wait") or 0)
                 if time.time() - last_log > 600:
                     source_pressure_log_cache["target_index_wait"] = time.time()
-                    log_event(f"Target media index waiting for idle pipeline; jobs={pipeline_job_count()}.")
+                    log_event(
+                        "Target media index waiting for runnable pipeline to drain; "
+                        f"runnable={runnable_pipeline_job_count()} owned={pipeline_job_count()}."
+                    )
                 await asyncio.sleep(120)
             await wait_while_session_invalid("target media index")
             await build_target_media_index(
@@ -25955,6 +26745,14 @@ def initialize_runtime_state_sync():
             f"legacy false upload-verdict UID(s) across {len(released_sources)} source(s); "
             "affected startup source scans were reopened."
         )
+    repaired_grouped_invalid = migrate_legacy_grouped_media_invalid_retries()
+    if repaired_grouped_invalid:
+        log_event(
+            "Reopened "
+            f"{repaired_grouped_invalid} nonterminal grouped-album job(s) whose "
+            "MEDIA_INVALID retries were consumed by the legacy classifier; "
+            "fresh source downloads will resume under the corrected item fallback."
+        )
     init_db()
     replayed = replay_media_delivery_ledger_sync()
     if replayed:
@@ -26053,7 +26851,7 @@ async def main():
     log_event(f"Data folder: {DATA_DIR}")
     log_event(f"Runtime folder: {RUNTIME_DIR}")
     log_event(
-        f"Workers: bot={WORKERS}, button={BUTTON_WORKERS}, download={DOWNLOAD_WORKERS}, "
+        f"Runtime profile={RUNTIME_PROFILE}. Workers: bot={WORKERS}, button={BUTTON_WORKERS}, download={DOWNLOAD_WORKERS}, "
         f"upload={UPLOAD_WORKERS}, link={LINK_WORKERS}, "
         f"api_concurrency={TELEGRAM_API_CONCURRENCY}, "
         f"download_concurrency={TELEGRAM_DOWNLOAD_CONCURRENCY}, "

@@ -5,11 +5,14 @@ import contextlib
 import asyncio
 import inspect
 import threading
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-os.environ["ROYELLS_HUGGINGFACE_SPACE"] = "1"
-os.environ["ROYELLS_KEEPALIVE_HTTP"] = "0"
+# Runtime identity is deployment-owned.  Forcing the Hugging Face profile here made
+# Oracle VMs use Space-specific SQLite, queue, and resource settings even when the
+# operator supplied an Oracle profile.
+os.environ.setdefault("ROYELLS_KEEPALIVE_HTTP", "0")
 
 import royells_media_bot_ready as bot
 
@@ -25,6 +28,10 @@ BOT_STATUS = {
 def status_snapshot():
     architecture = bot.v20_health_snapshot()
     readiness = architecture.get("readiness") or {}
+    heartbeat_age = max(
+        0.0,
+        time.monotonic() - float(getattr(bot, "EVENT_LOOP_HEARTBEAT_TS", 0.0) or 0.0),
+    )
     return {
         "ok": bool(readiness.get("ok", architecture.get("ok", False))),
         "service": "royells-mirror-bot",
@@ -33,6 +40,7 @@ def status_snapshot():
         "started_at": BOT_STATUS.get("started_at") or "starting",
         "restart_count": int(BOT_STATUS.get("restart_count") or 0),
         "last_error": BOT_STATUS.get("last_error") or "",
+        "loop_heartbeat_age_seconds": round(heartbeat_age, 3),
         "queue": {
             "download": bot.channel_download_queue.qsize(),
             "upload": bot.upload_queue.qsize(),
@@ -114,7 +122,23 @@ class RoyellsStatusHandler(BaseHTTPRequestHandler):
         else:
             architecture = snapshot.get("architecture") or {}
             if self.path in ("/ping", "/live"):
-                payload = architecture.get("liveness") or {"ok": True}
+                payload = dict(architecture.get("liveness") or {"ok": True})
+                if self.path == "/live":
+                    heartbeat_limit = max(
+                        60,
+                        int(getattr(bot, "HARD_WATCHDOG_STALL_SECONDS", 420)),
+                    )
+                    main_running = snapshot.get("state") in {"starting", "running"}
+                    heartbeat_fresh = (
+                        float(snapshot.get("loop_heartbeat_age_seconds") or 0.0)
+                        <= heartbeat_limit
+                    )
+                    payload["main_running"] = main_running
+                    payload["heartbeat_fresh"] = heartbeat_fresh
+                    payload["heartbeat_age_seconds"] = snapshot.get(
+                        "loop_heartbeat_age_seconds", 0.0
+                    )
+                    payload["ok"] = bool(payload.get("ok") and main_running and heartbeat_fresh)
             elif self.path == "/ready":
                 payload = architecture.get("readiness") or {"ok": False}
             elif self.path == "/startup":
@@ -125,7 +149,7 @@ class RoyellsStatusHandler(BaseHTTPRequestHandler):
                 payload = snapshot
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             content_type = "application/json; charset=utf-8"
-            status = 200 if self.path in ("/ping", "/live", "/metrics") or bool(payload.get("ok")) else 503
+            status = 200 if self.path in ("/ping", "/metrics") or bool(payload.get("ok")) else 503
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -140,9 +164,38 @@ class RoyellsStatusHandler(BaseHTTPRequestHandler):
         return
 
 
+class BoundedStatusServer(ThreadingHTTPServer):
+    """Small bounded status server that cannot create unbounded request threads."""
+
+    daemon_threads = True
+    request_queue_size = 16
+
+    def __init__(self, server_address, handler_class, max_workers=4):
+        self._request_slots = threading.BoundedSemaphore(max(1, int(max_workers)))
+        super().__init__(server_address, handler_class)
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            request.close()
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 def main():
     port = int(os.getenv("PORT", "7860"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), RoyellsStatusHandler)
+    bind_host = os.getenv("ROYELLS_STATUS_BIND", "0.0.0.0").strip() or "0.0.0.0"
+    max_workers = max(1, min(16, int(os.getenv("ROYELLS_STATUS_MAX_WORKERS", "4"))))
+    server = BoundedStatusServer((bind_host, port), RoyellsStatusHandler, max_workers=max_workers)
     print(f"[ROYELLS APP] status server ready on port {port}", flush=True)
     try:
         server.serve_forever()
@@ -190,9 +243,10 @@ if __name__ == "__main__":
         BOT_STATUS["state"] = "returned unexpectedly"
         BOT_STATUS["last_error"] = "Royells main loop returned without a shutdown request."
         print("Royells main loop returned unexpectedly.", flush=True)
-        if not bot.request_automatic_process_restart(BOT_STATUS["last_error"]):
-            BOT_STATUS["state"] = "restart circuit open"
-            threading.Event().wait()
+        # The durable checkpoint/delivery-intent ledger owns crash recovery.  Exit
+        # non-zero so Docker's restart policy can recover a dead main loop instead
+        # of leaving only the status thread alive indefinitely.
+        raise SystemExit(75)
     except KeyboardInterrupt:
         BOT_STATUS["state"] = "stopped"
         print("Bot stopped by user.", flush=True)
@@ -211,11 +265,8 @@ if __name__ == "__main__":
                 flush=True,
             )
             threading.Event().wait()
-        if not bot.request_automatic_process_restart(f"app main crashed: {repr(exc)[:400]}"):
-            BOT_STATUS["state"] = "restart circuit open"
-            print(
-                "Automatic restart is disabled. Status server remains online; "
-                "inspect /health and logs before a manual Factory Restart.",
-                flush=True,
-            )
-            threading.Event().wait()
+        print(
+            "Main loop failed; exiting with code 75 for durable Docker recovery.",
+            flush=True,
+        )
+        raise SystemExit(75) from exc
